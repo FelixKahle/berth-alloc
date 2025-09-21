@@ -21,20 +21,50 @@
 
 use crate::{
     berth::berthocc::{BerthOccupancy, BerthRead, BerthWrite},
-    terminal::err::{BerthIdentifierNotFoundError, TerminalUpdateError},
+    terminal::{
+        delta::TerminalDelta,
+        err::{BerthIdentifierNotFoundError, TerminalApplyError, TerminalUpdateError},
+    },
 };
 use berth_alloc_core::prelude::TimeInterval;
 use berth_alloc_model::prelude::*;
 use std::collections::HashMap;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreeBerth<'b, T: Copy + Ord> {
+    interval: TimeInterval<T>,
+    berth: &'b Berth<T>,
+}
+
+impl<'b, T: Copy + Ord> FreeBerth<'b, T> {
+    fn new(interval: TimeInterval<T>, berth: &'b Berth<T>) -> Self {
+        Self { interval, berth }
+    }
+
+    pub fn interval(&self) -> TimeInterval<T> {
+        self.interval
+    }
+
+    pub fn berth(&self) -> &'b Berth<T> {
+        self.berth
+    }
+}
 
 pub trait TerminalRead<'b, T: Copy + Ord> {
     fn berths(&self) -> &[BerthOccupancy<'b, T>];
     fn berth(&self, id: BerthIdentifier) -> Option<&BerthOccupancy<'b, T>>;
     fn iter_free_within<'a>(
         &'a self,
-        berths: &'a [BerthIdentifier],
+        berths: &'a [&'b Berth<T>],
         window: TimeInterval<T>,
-    ) -> impl Iterator<Item = TimeInterval<T>> + 'a;
+    ) -> impl Iterator<Item = FreeBerth<'b, T>> + 'a;
+    fn iter_free_within_ids<'a>(
+        &'a self,
+        berth_ids: &'a [BerthIdentifier],
+        window: TimeInterval<T>,
+    ) -> impl Iterator<Item = FreeBerth<'a, T>> + 'a
+    where
+        T: 'a;
 }
 
 pub trait TerminalWrite<'b, T: Copy + Ord>: TerminalRead<'b, T> {
@@ -49,8 +79,11 @@ pub trait TerminalWrite<'b, T: Copy + Ord>: TerminalRead<'b, T> {
         berth_id: BerthIdentifier,
         interval: TimeInterval<T>,
     ) -> Result<(), TerminalUpdateError<T>>;
+
+    fn apply_delta(&mut self, delta: TerminalDelta<'b, T>) -> Result<(), TerminalApplyError<T>>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalOccupancy<'b, T: Copy + Ord> {
     berths: Vec<BerthOccupancy<'b, T>>,
     index_map: HashMap<BerthIdentifier, usize>,
@@ -86,19 +119,46 @@ impl<'b, T: Copy + Ord> TerminalRead<'b, T> for TerminalOccupancy<'b, T> {
     #[inline]
     fn iter_free_within<'a>(
         &'a self,
-        berths: &'a [BerthIdentifier],
+        berths: &'a [&'b Berth<T>],
         window: TimeInterval<T>,
-    ) -> impl Iterator<Item = TimeInterval<T>> + 'a {
+    ) -> impl Iterator<Item = FreeBerth<'b, T>> + 'a {
         std::iter::once(window)
             .filter(|w| !w.is_empty())
             .flat_map(move |w| {
-                let (b0, b1) = w.into_inner();
-                let win = move || TimeInterval::new(b0, b1);
                 berths
                     .iter()
-                    .filter_map(move |id| self.index_map.get(id).copied())
-                    .map(move |ix| &self.berths[ix])
-                    .flat_map(move |occ| occ.iter_free_within(win()))
+                    .filter_map(move |b| {
+                        let id = b.id();
+                        self.index_map.get(&id).copied().map(|ix| (*b, ix))
+                    })
+                    .flat_map(move |(b, ix)| {
+                        let occ = &self.berths[ix];
+                        occ.iter_free_within(w).map(move |iv| FreeBerth::new(iv, b))
+                    })
+            })
+    }
+
+    #[inline]
+    fn iter_free_within_ids<'a>(
+        &'a self,
+        berth_ids: &'a [BerthIdentifier],
+        window: TimeInterval<T>,
+    ) -> impl Iterator<Item = FreeBerth<'a, T>> + 'a
+    where
+        T: 'a,
+    {
+        std::iter::once(window)
+            .filter(|w| !w.is_empty())
+            .flat_map(move |w| {
+                berth_ids
+                    .iter()
+                    .filter_map(move |&id| self.index_map.get(&id).copied())
+                    .flat_map(move |ix| {
+                        let berth_ref = self.berths[ix].berth();
+                        self.berths[ix]
+                            .iter_free_within(w)
+                            .map(move |iv| FreeBerth::new(iv, berth_ref))
+                    })
             })
     }
 }
@@ -142,6 +202,25 @@ impl<'b, T: Copy + Ord> TerminalWrite<'b, T> for TerminalOccupancy<'b, T> {
             .ok_or_else(|| BerthIdentifierNotFoundError::new(berth_id))?;
 
         occ.release(interval).map_err(Into::into)
+    }
+
+    #[inline]
+    fn apply_delta(&mut self, delta: TerminalDelta<'b, T>) -> Result<(), TerminalApplyError<T>> {
+        for (id, free) in delta.into_iter() {
+            let ix = self
+                .index_map
+                .get(&id)
+                .copied()
+                .ok_or_else(|| BerthIdentifierNotFoundError::new(id))?;
+
+            let bocc = self
+                .berths
+                .get_mut(ix)
+                .ok_or_else(|| BerthIdentifierNotFoundError::new(id))?;
+
+            bocc.apply(free)?;
+        }
+        Ok(())
     }
 }
 
@@ -192,9 +271,12 @@ mod tests {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
-        // Select berth 1 then 3, expect concatenation of their free windows
-        let ids = [bid(1), bid(3)];
-        let v: Vec<_> = term.iter_free_within(&ids, iv(-20, 60)).collect();
+        // Select berth 1 then 3 (by reference), expect concatenation of their free windows
+        let sel = [&base[0], &base[2]];
+        let v: Vec<_> = term
+            .iter_free_within(&sel, iv(-20, 60))
+            .map(|fb| fb.interval())
+            .collect();
         assert_eq!(v, vec![iv(0, 10), iv(20, 30), iv(-10, -5), iv(40, 50)]);
     }
 
@@ -204,8 +286,11 @@ mod tests {
         let term = TerminalOccupancy::new(&base);
 
         // Window [8,25) clamps berth 1’s [0,10) to [8,10) and [20,30) to [20,25)
-        let ids = [bid(1)];
-        let v: Vec<_> = term.iter_free_within(&ids, iv(8, 25)).collect();
+        let sel = [&base[0]];
+        let v: Vec<_> = term
+            .iter_free_within(&sel, iv(8, 25))
+            .map(|fb| fb.interval())
+            .collect();
         assert_eq!(v, vec![iv(8, 10), iv(20, 25)]);
     }
 
@@ -214,19 +299,8 @@ mod tests {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
-        let ids = [bid(1), bid(2), bid(3)];
-        assert!(term.iter_free_within(&ids, iv(10, 10)).next().is_none());
-    }
-
-    #[test]
-    fn iter_free_within_ignores_unknown_ids() {
-        let base = mk_berths();
-        let term = TerminalOccupancy::new(&base);
-
-        // 999 doesn’t exist; iterator should just skip it silently.
-        let ids = [bid(999), bid(2)];
-        let v: Vec<_> = term.iter_free_within(&ids, iv(0, 100)).collect();
-        assert_eq!(v, vec![iv(5, 15)]);
+        let sel = [&base[0], &base[1], &base[2]];
+        assert!(term.iter_free_within(&sel, iv(10, 10)).next().is_none());
     }
 
     #[test]
@@ -238,12 +312,18 @@ mod tests {
         term.occupy(bid(10), iv(3, 7)).unwrap();
 
         // Now free must be [0,3) and [7,10)
-        let v: Vec<_> = term.iter_free_within(&[bid(10)], iv(0, 10)).collect();
+        let v: Vec<_> = term
+            .iter_free_within(&[&base[0]], iv(0, 10))
+            .map(|fb| fb.interval())
+            .collect();
         assert_eq!(v, vec![iv(0, 3), iv(7, 10)]);
 
         // Release [5,8) — merges with the [7,10) tail, yielding [5,10)
         term.release(bid(10), iv(5, 8)).unwrap();
-        let v2: Vec<_> = term.iter_free_within(&[bid(10)], iv(0, 10)).collect();
+        let v2: Vec<_> = term
+            .iter_free_within(&[&base[0]], iv(0, 10))
+            .map(|fb| fb.interval())
+            .collect();
         assert_eq!(v2, vec![iv(0, 3), iv(5, 10)]);
     }
 
@@ -308,15 +388,24 @@ mod tests {
         term.occupy(bid(2), iv(5, 15)).unwrap();
 
         // Berth 1 remains intact.
-        let v1: Vec<_> = term.iter_free_within(&[bid(1)], iv(-100, 100)).collect();
+        let v1: Vec<_> = term
+            .iter_free_within(&[&base[0]], iv(-100, 100))
+            .map(|fb| fb.interval())
+            .collect();
         assert_eq!(v1, vec![iv(0, 10), iv(20, 30)]);
 
         // Berth 2 becomes empty within its window.
-        let v2: Vec<_> = term.iter_free_within(&[bid(2)], iv(-100, 100)).collect();
+        let v2: Vec<_> = term
+            .iter_free_within(&[&base[1]], iv(-100, 100))
+            .map(|fb| fb.interval())
+            .collect();
         assert!(v2.is_empty());
 
         // Berth 3 remains intact.
-        let v3: Vec<_> = term.iter_free_within(&[bid(3)], iv(-100, 100)).collect();
+        let v3: Vec<_> = term
+            .iter_free_within(&[&base[2]], iv(-100, 100))
+            .map(|fb| fb.interval())
+            .collect();
         assert_eq!(v3, vec![iv(-10, -5), iv(40, 50)]);
     }
 
@@ -329,7 +418,10 @@ mod tests {
         term.occupy(bid(77), iv(5, 5)).unwrap();
         term.release(bid(77), iv(7, 7)).unwrap();
 
-        let v: Vec<_> = term.iter_free_within(&[bid(77)], iv(0, 10)).collect();
+        let v: Vec<_> = term
+            .iter_free_within(&[&base[0]], iv(0, 10))
+            .map(|fb| fb.interval())
+            .collect();
         assert_eq!(v, vec![iv(0, 10)]);
     }
 
@@ -338,14 +430,48 @@ mod tests {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
-        // Note the mixed order: 3, 1, 2
-        let ids = [bid(3), bid(1), bid(2)];
-        let v: Vec<_> = term.iter_free_within(&ids, iv(-20, 60)).collect();
+        // Note the mixed order: 3, 1, 2 – using references
+        let sel = [&base[2], &base[0], &base[1]];
+        let v: Vec<_> = term
+            .iter_free_within(&sel, iv(-20, 60))
+            .map(|fb| fb.interval())
+            .collect();
 
         // Expect windows from 3, then 1, then 2.
         assert_eq!(
             v,
             vec![iv(-10, -5), iv(40, 50), iv(0, 10), iv(20, 30), iv(5, 15)]
         );
+    }
+
+    #[test]
+    fn iter_free_within_ids_respects_order_and_window() {
+        let base = mk_berths();
+        let term = TerminalOccupancy::new(&base);
+
+        // order: 3, 1, 999 (unknown), 2
+        let ids = [bid(3), bid(1), bid(999), bid(2)];
+        let v: Vec<_> = term
+            .iter_free_within_ids(&ids, iv(-20, 60))
+            .map(|fb| (fb.berth().id(), fb.interval()))
+            .collect();
+
+        assert_eq!(
+            v,
+            vec![
+                (bid(3), iv(-10, -5)),
+                (bid(3), iv(40, 50)),
+                (bid(1), iv(0, 10)),
+                (bid(1), iv(20, 30)),
+                (bid(2), iv(5, 15)),
+            ]
+        );
+
+        // clamp check
+        let v2: Vec<_> = term
+            .iter_free_within_ids(&[bid(1)], iv(8, 25))
+            .map(|fb| fb.interval())
+            .collect();
+        assert_eq!(v2, vec![iv(8, 10), iv(20, 25)]);
     }
 }

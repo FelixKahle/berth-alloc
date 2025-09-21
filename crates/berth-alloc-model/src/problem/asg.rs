@@ -404,6 +404,14 @@ where
         self.inner.remove(&rid)
     }
 
+    pub fn remove_assignment(&mut self, assignment: &V) -> Option<V>
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        let rid = assignment.request_id();
+        self.remove(rid)
+    }
+
     #[inline]
     pub fn get(&self, rid: RequestIdentifier) -> Option<&V> {
         self.inner.get(&rid)

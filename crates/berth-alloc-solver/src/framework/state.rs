@@ -19,6 +19,43 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod delta;
-pub mod err;
-pub mod terminalocc;
+use crate::{
+    registry::ledger::Ledger,
+    terminal::terminalocc::TerminalOccupancy,
+};
+
+#[derive(Debug, Clone)]
+pub struct SolverState<'p, T: Copy + Ord> {
+    ledger: Ledger<'p, T>,
+    terminal_occupancy: TerminalOccupancy<'p, T>,
+}
+
+impl<'p, T: Copy + Ord> SolverState<'p, T> {
+    pub fn new(ledger: Ledger<'p, T>, terminal_occupancy: TerminalOccupancy<'p, T>) -> Self {
+        Self {
+            ledger,
+            terminal_occupancy,
+        }
+    }
+
+    pub fn ledger(&self) -> &Ledger<'p, T> {
+        &self.ledger
+    }
+
+    pub fn ledger_mut(&mut self) -> &mut Ledger<'p, T> {
+        &mut self.ledger
+    }
+
+    pub fn terminal_occupancy(&self) -> &TerminalOccupancy<'p, T> {
+        &self.terminal_occupancy
+    }
+
+    pub fn terminal_occupancy_mut(&mut self) -> &mut TerminalOccupancy<'p, T> {
+        &mut self.terminal_occupancy
+    }
+
+    pub fn apply(&mut self, other: Self) {
+        self.ledger.apply(other.ledger);
+        //self.terminal_occupancy.apply(other.terminal_occupancy);
+    }
+}

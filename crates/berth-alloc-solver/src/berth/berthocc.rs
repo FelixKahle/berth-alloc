@@ -19,7 +19,10 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::berth::err::{BerthUpdateError, NotFreeError, OutsideAvailabilityError};
+use crate::berth::err::{
+    BerthApplyError, BerthUpdateError, FreeOutsideAvailabilityError, MismatchedBerthIdsError,
+    NotFreeError, OutsideAvailabilityError,
+};
 use berth_alloc_core::prelude::*;
 use berth_alloc_model::prelude::*;
 use rangemap::RangeSet;
@@ -34,6 +37,10 @@ pub trait BerthRead<T: Copy + Ord> {
 pub trait BerthWrite<T: Copy + Ord>: BerthRead<T> {
     fn occupy(&mut self, interval: TimeInterval<T>) -> Result<(), BerthUpdateError<T>>;
     fn release(&mut self, interval: TimeInterval<T>) -> Result<(), BerthUpdateError<T>>;
+    fn apply(&mut self, other: Self) -> Result<(), BerthApplyError<T>>;
+    fn replace(&mut self, other: Self) -> Result<Self, BerthApplyError<T>>
+    where
+        Self: Sized;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +124,50 @@ impl<'b, T: Copy + Ord> BerthWrite<T> for BerthOccupancy<'b, T> {
         self.free.insert(s..e);
         Ok(())
     }
+
+    #[inline]
+    fn apply(&mut self, other: Self) -> Result<(), BerthApplyError<T>> {
+        if self.berth.id() != other.berth.id() {
+            return Err(BerthApplyError::MismatchedBerthIds(
+                MismatchedBerthIdsError::new(self.berth.id(), other.berth.id()),
+            ));
+        }
+
+        for seg in other.free.iter() {
+            let iv = TimeInterval::new(seg.start, seg.end);
+            if !self.berth.covers(iv) {
+                return Err(BerthApplyError::FreeOutsideAvailability(
+                    FreeOutsideAvailabilityError::new(self.berth.id(), iv),
+                ));
+            }
+        }
+
+        self.free = other.free;
+        Ok(())
+    }
+
+    #[inline]
+    fn replace(&mut self, other: Self) -> Result<Self, BerthApplyError<T>>
+    where
+        Self: Sized,
+    {
+        if self.berth.id() != other.berth.id() {
+            return Err(BerthApplyError::MismatchedBerthIds(
+                MismatchedBerthIdsError::new(self.berth.id(), other.berth.id()),
+            ));
+        }
+
+        for seg in other.free.iter() {
+            let iv = TimeInterval::new(seg.start, seg.end);
+            if !self.berth.covers(iv) {
+                return Err(BerthApplyError::FreeOutsideAvailability(
+                    FreeOutsideAvailabilityError::new(self.berth.id(), iv),
+                ));
+            }
+        }
+
+        Ok(std::mem::replace(self, other))
+    }
 }
 
 #[cfg(test)]
@@ -161,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn release_outside_availability_errors_then_in_bounds_succeeds() {
+    fn test_release_outside_availability_errors_then_in_bounds_succeeds() {
         let b = Berth::from_windows(bid(3), vec![iv(10, 20)]);
         let mut occ = BerthOccupancy::new(&b);
 
@@ -196,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn occupy_not_free_errors() {
+    fn test_occupy_not_free_errors() {
         let b = Berth::from_windows(bid(1), vec![iv(0, 10)]);
         let mut occ = BerthOccupancy::new(&b);
 
@@ -214,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn occupy_outside_availability_errors() {
+    fn test_occupy_outside_availability_errors() {
         let b = Berth::from_windows(bid(2), vec![iv(0, 10)]);
         let mut occ = BerthOccupancy::new(&b);
 
@@ -228,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn release_outside_availability_errors() {
+    fn test_release_outside_availability_errors() {
         let b = Berth::from_windows(bid(3), vec![iv(10, 20)]);
         let mut occ = BerthOccupancy::new(&b);
 
@@ -240,4 +291,34 @@ mod tests {
             _ => panic!("expected OutsideAvailability"),
         }
     }
+
+    #[test]
+    fn test_apply_replacement_that_changes_occupancy_but_stays_within_availability_is_ok() {
+        let b = Berth::from_windows(bid(1), vec![iv(0, 10)]);
+        let mut a = BerthOccupancy::new(&b);
+        let mut c = BerthOccupancy::new(&b);
+        a.occupy(iv(2, 4)).unwrap(); // free: [0,2) ∪ [4,10)
+        c.occupy(iv(6, 8)).unwrap(); // free: [0,6) ∪ [8,10)
+
+        // Should be OK: both are subsets of availability, even though c is not ⊆ a.free.
+        a.apply(c).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod static_assertions {
+    use super::*;
+    use ::static_assertions::assert_impl_all;
+
+    macro_rules! test_integer_types {
+        ($($t:ty),*) => {
+            $(
+                assert_impl_all!(BerthOccupancy<'static, $t>: Send, Sync);
+            )*
+        };
+    }
+
+    test_integer_types!(
+        i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize
+    );
 }

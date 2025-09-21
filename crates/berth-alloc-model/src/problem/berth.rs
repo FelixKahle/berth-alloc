@@ -175,8 +175,8 @@ impl<T: Copy + Ord> BerthContainer<T> {
     }
 
     #[inline]
-    pub fn get(&self, id: &BerthIdentifier) -> Option<&Berth<T>> {
-        self.0.get(id)
+    pub fn get(&self, id: BerthIdentifier) -> Option<&Berth<T>> {
+        self.0.get(&id)
     }
 
     #[inline]
