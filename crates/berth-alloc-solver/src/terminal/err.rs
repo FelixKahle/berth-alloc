@@ -53,7 +53,7 @@ pub enum TerminalUpdateError<T> {
 
 impl<T> std::fmt::Display for TerminalUpdateError<T>
 where
-    T: std::fmt::Debug + std::fmt::Display,
+    T: std::fmt::Display,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

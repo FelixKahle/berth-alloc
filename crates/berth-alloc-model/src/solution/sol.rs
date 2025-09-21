@@ -19,7 +19,7 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use berth_alloc_core::prelude::TimePoint;
+use berth_alloc_core::prelude::{Cost, TimePoint};
 use num_traits::{CheckedAdd, CheckedSub};
 use rangemap::RangeSet;
 
@@ -37,7 +37,10 @@ use crate::{
     },
     solution::err::SolutionValidationError,
 };
-use std::{collections::BTreeMap, ops::Range};
+use std::{
+    collections::BTreeMap,
+    ops::{Mul, Range},
+};
 
 type StartIndex<T> = BTreeMap<TimePoint<T>, (TimePoint<T>, RequestIdentifier)>;
 
@@ -151,6 +154,15 @@ where
     }
     fn contains_flexible(&self, rid: RequestIdentifier) -> bool {
         self.flexible_assignments().get(rid).is_some()
+    }
+
+    fn cost(&self) -> Cost
+    where
+        T: Mul<Output = Cost> + CheckedAdd + CheckedSub + Into<Cost>,
+    {
+        let fixed_cost: Cost = self.fixed_assignments().iter().map(|a| a.cost()).sum();
+        let flex_cost: Cost = self.flexible_assignments().iter().map(|a| a.cost()).sum();
+        fixed_cost + flex_cost
     }
 
     #[inline]

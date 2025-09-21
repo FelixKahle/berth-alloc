@@ -27,14 +27,17 @@ use berth_alloc_core::prelude::*;
 use berth_alloc_model::prelude::*;
 use rangemap::RangeSet;
 
-pub trait BerthRead<T: Copy + Ord> {
+pub trait BerthRead<'b, T: Copy + Ord> {
     fn is_free(&self, interval: TimeInterval<T>) -> bool;
     fn is_occupied(&self, interval: TimeInterval<T>) -> bool;
-    fn berth(&self) -> &Berth<T>;
-    fn iter_free_within(&self, window: TimeInterval<T>) -> impl Iterator<Item = TimeInterval<T>>;
+    fn berth(&self) -> &'b Berth<T>;
+    fn iter_free_intervals_in(
+        &self,
+        window: TimeInterval<T>,
+    ) -> impl Iterator<Item = TimeInterval<T>>;
 }
 
-pub trait BerthWrite<T: Copy + Ord>: BerthRead<T> {
+pub trait BerthWrite<'b, T: Copy + Ord>: BerthRead<'b, T> {
     fn occupy(&mut self, interval: TimeInterval<T>) -> Result<(), BerthUpdateError<T>>;
     fn release(&mut self, interval: TimeInterval<T>) -> Result<(), BerthUpdateError<T>>;
     fn apply(&mut self, other: Self) -> Result<(), BerthApplyError<T>>;
@@ -59,7 +62,7 @@ impl<'b, T: Copy + Ord> BerthOccupancy<'b, T> {
     }
 }
 
-impl<'b, T: Copy + Ord> BerthRead<T> for BerthOccupancy<'b, T> {
+impl<'b, T: Copy + Ord> BerthRead<'b, T> for BerthOccupancy<'b, T> {
     #[inline]
     fn is_free(&self, interval: TimeInterval<T>) -> bool {
         if interval.is_empty() {
@@ -75,12 +78,15 @@ impl<'b, T: Copy + Ord> BerthRead<T> for BerthOccupancy<'b, T> {
     }
 
     #[inline]
-    fn berth(&self) -> &Berth<T> {
+    fn berth(&self) -> &'b Berth<T> {
         self.berth
     }
 
     #[inline]
-    fn iter_free_within(&self, window: TimeInterval<T>) -> impl Iterator<Item = TimeInterval<T>> {
+    fn iter_free_intervals_in(
+        &self,
+        window: TimeInterval<T>,
+    ) -> impl Iterator<Item = TimeInterval<T>> {
         std::iter::once(window)
             .filter(|w| !w.is_empty())
             .flat_map(move |w| {
@@ -94,7 +100,7 @@ impl<'b, T: Copy + Ord> BerthRead<T> for BerthOccupancy<'b, T> {
     }
 }
 
-impl<'b, T: Copy + Ord> BerthWrite<T> for BerthOccupancy<'b, T> {
+impl<'b, T: Copy + Ord> BerthWrite<'b, T> for BerthOccupancy<'b, T> {
     #[inline]
     fn occupy(&mut self, interval: TimeInterval<T>) -> Result<(), BerthUpdateError<T>> {
         if interval.is_empty() {
@@ -192,7 +198,7 @@ mod tests {
     fn test_free_starts_as_availability() {
         let b = Berth::from_windows(bid(1), vec![iv(0, 10), iv(20, 30)]);
         let occ = BerthOccupancy::new(&b);
-        let v: Vec<_> = occ.iter_free_within(iv(0, 50)).collect();
+        let v: Vec<_> = occ.iter_free_intervals_in(iv(0, 50)).collect();
         assert_eq!(v, vec![iv(0, 10), iv(20, 30)]);
         assert!(occ.is_free(iv(0, 10)));
         assert!(occ.is_free(iv(22, 25)));
@@ -204,7 +210,7 @@ mod tests {
         let b = Berth::from_windows(bid(2), vec![iv(0, 10)]);
         let mut occ = BerthOccupancy::new(&b);
         occ.occupy(iv(3, 7)).unwrap();
-        let v: Vec<_> = occ.iter_free_within(iv(0, 10)).collect();
+        let v: Vec<_> = occ.iter_free_intervals_in(iv(0, 10)).collect();
         assert_eq!(v, vec![iv(0, 3), iv(7, 10)]);
         assert!(occ.is_free(iv(0, 3)));
         assert!(occ.is_free(iv(7, 10)));
@@ -218,7 +224,7 @@ mod tests {
 
         // Occupy everything first.
         occ.occupy(iv(10, 20)).unwrap();
-        assert!(occ.iter_free_within(iv(0, 100)).next().is_none());
+        assert!(occ.iter_free_intervals_in(iv(0, 100)).next().is_none());
 
         // Releasing beyond availability now returns an error (no clamping).
         let err = occ.release(iv(5, 25)).unwrap_err();
@@ -231,7 +237,7 @@ mod tests {
 
         // Releasing inside availability succeeds and restores the window.
         occ.release(iv(10, 20)).unwrap();
-        let v: Vec<_> = occ.iter_free_within(iv(0, 100)).collect();
+        let v: Vec<_> = occ.iter_free_intervals_in(iv(0, 100)).collect();
         assert_eq!(v, vec![iv(10, 20)]);
     }
 
@@ -240,9 +246,9 @@ mod tests {
         let b = Berth::from_windows(bid(4), vec![iv(0, 10), iv(20, 30)]);
         let occ = BerthOccupancy::new(&b);
         // Query in the middle of the gap:
-        assert!(occ.iter_free_within(iv(12, 18)).next().is_none());
+        assert!(occ.iter_free_intervals_in(iv(12, 18)).next().is_none());
         // Query that spans end of first and gap:
-        let v: Vec<_> = occ.iter_free_within(iv(8, 15)).collect();
+        let v: Vec<_> = occ.iter_free_intervals_in(iv(8, 15)).collect();
         assert_eq!(v, vec![iv(8, 10)]);
     }
 

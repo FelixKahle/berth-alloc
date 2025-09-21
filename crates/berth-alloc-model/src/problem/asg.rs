@@ -319,7 +319,7 @@ impl<'r, 'b, K: Kind, T: Ord + Copy> AssignmentView<K, T> for AssignmentRef<'r, 
         self.request
     }
 
-    fn berth(&self) -> &Berth<T> {
+    fn berth(&self) -> &'b Berth<T> {
         self.berth
     }
 
