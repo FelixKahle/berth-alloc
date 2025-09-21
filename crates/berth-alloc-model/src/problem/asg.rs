@@ -177,16 +177,6 @@ impl<K: Kind, T: Ord + CheckedSub + Copy + CheckedAdd> Assignment<K, T> {
     }
 
     #[inline]
-    pub fn end_time(&self) -> TimePoint<T>
-    where
-        T: CheckedAdd,
-    {
-        self.start_time + self.request.processing_time_for(self.berth_id()).expect(
-            "The processing time for the assigned berth must be defined, as the assignment is only valid if so.",
-        )
-    }
-
-    #[inline]
     pub fn to_ref<'a>(&'a self) -> AssignmentRef<'a, 'a, K, T> {
         AssignmentRef {
             request: &self.request,
