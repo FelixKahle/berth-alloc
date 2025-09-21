@@ -23,7 +23,7 @@ use crate::common::{Identifier, IdentifierMarkerName};
 use berth_alloc_core::prelude::{TimeInterval, TimePoint};
 use num_traits::Zero;
 use rangemap::RangeSet;
-use std::{fmt::Debug, hash::Hash};
+use std::{collections::HashMap, fmt::Debug, hash::Hash};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BerthIdentifierMarker;
@@ -129,6 +129,80 @@ impl<T: Ord + Copy> Berth<T> {
     {
         self.horizon_opt()
             .unwrap_or_else(|| TimePoint::new(T::zero()))
+    }
+}
+
+#[repr(transparent)]
+#[derive(Debug, Clone)]
+pub struct BerthContainer<T: Copy + Ord>(HashMap<BerthIdentifier, Berth<T>>);
+
+impl<T: Copy + Ord> Default for BerthContainer<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Copy + Ord> BerthContainer<T> {
+    #[inline]
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    #[inline]
+    pub fn with_capacity(cap: usize) -> Self {
+        Self(HashMap::with_capacity(cap))
+    }
+
+    #[inline]
+    pub fn insert(&mut self, berth: Berth<T>) -> Option<Berth<T>> {
+        self.0.insert(berth.id(), berth)
+    }
+
+    #[inline]
+    pub fn remove(&mut self, id: BerthIdentifier) -> Option<Berth<T>> {
+        self.0.remove(&id)
+    }
+
+    #[inline]
+    pub fn contains_id(&self, id: BerthIdentifier) -> bool {
+        self.0.contains_key(&id)
+    }
+
+    #[inline]
+    pub fn contains_berth(&self, berth: &Berth<T>) -> bool {
+        let id = berth.id();
+        self.contains_id(id)
+    }
+
+    #[inline]
+    pub fn get(&self, id: &BerthIdentifier) -> Option<&Berth<T>> {
+        self.0.get(id)
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &Berth<T>> {
+        self.0.values()
+    }
+}
+
+impl<T: Copy + Ord> FromIterator<Berth<T>> for BerthContainer<T> {
+    #[inline]
+    fn from_iter<I: IntoIterator<Item = Berth<T>>>(iter: I) -> Self {
+        let mut c = Self::new();
+        for b in iter {
+            c.insert(b);
+        }
+        c
     }
 }
 

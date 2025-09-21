@@ -22,7 +22,8 @@
 pub mod affine;
 pub mod interval;
 
-pub use affine::*;
+use crate::prelude::affine::{Delta, MarkerName, Point};
+
 pub use interval::Interval;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -47,3 +48,5 @@ pub type TimeDelta<T> = Delta<T, TimeMarker>;
 pub type PositionDelta<T> = Delta<T, PositionMarker>;
 pub type TimeInterval<T> = Interval<TimePoint<T>>;
 pub type PositionInterval<T> = Interval<PositionPoint<T>>;
+
+pub type Cost = i64;

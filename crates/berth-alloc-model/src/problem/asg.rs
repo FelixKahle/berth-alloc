@@ -22,20 +22,93 @@
 use crate::{
     common::{FixedKind, FlexibleKind, Kind},
     problem::{
-        AssignmenStartsBeforeFeasibleWindowError, AssignmentEndsAfterFeasibleWindowError,
-        AssignmentError, IncomatibleBerthError,
         berth::{Berth, BerthIdentifier},
+        err::{
+            AssignmenStartsBeforeFeasibleWindowError, AssignmentEndsAfterFeasibleWindowError,
+            AssignmentError, IncomatibleBerthError,
+        },
         req::{Request, RequestIdentifier},
     },
 };
-use berth_alloc_core::prelude::{TimeInterval, TimePoint};
+use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval, TimePoint};
 use num_traits::{CheckedAdd, CheckedSub};
-use std::fmt::{Debug, Display};
+use std::{
+    collections::HashMap,
+    fmt::{Debug, Display},
+    ops::Mul,
+};
+
+pub trait AssignmentView<K, T>
+where
+    K: Kind,
+    T: Ord + Copy,
+{
+    fn request(&self) -> &Request<K, T>;
+
+    fn request_id(&self) -> RequestIdentifier
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        self.request().id()
+    }
+
+    fn berth(&self) -> &Berth<T>;
+
+    fn berth_id(&self) -> BerthIdentifier {
+        self.berth().id()
+    }
+
+    fn start_time(&self) -> TimePoint<T>;
+
+    fn processing_time(&self) -> TimeDelta<T>;
+
+    fn end_time(&self) -> TimePoint<T>
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        self.start_time() + self.request().processing_time_for(self.berth_id()).expect(
+            "The processing time for the assigned berth must be defined, as the assignment is only valid if so.",
+        )
+    }
+
+    fn interval(&self) -> TimeInterval<T>
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        TimeInterval::new(self.start_time(), self.end_time())
+    }
+
+    #[inline]
+    fn waiting_time(&self) -> TimeDelta<T>
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        self.start_time() - self.request().feasible_window().start()
+    }
+
+    #[inline]
+    fn turnaround_time(&self) -> TimeDelta<T>
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        self.processing_time() + self.waiting_time()
+    }
+
+    #[inline]
+    fn cost(&self) -> Cost
+    where
+        T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
+    {
+        let weight = self.request().weight();
+        self.turnaround_time().value().into() * weight
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Assignment<K: Kind, T: Ord + Copy> {
     request: Request<K, T>,
     berth: Berth<T>,
+    processing_time: TimeDelta<T>,
     start_time: TimePoint<T>,
     _phantom: std::marker::PhantomData<K>,
 }
@@ -98,51 +171,9 @@ impl<K: Kind, T: Ord + CheckedSub + Copy + CheckedAdd> Assignment<K, T> {
             request,
             berth,
             start_time,
+            processing_time,
             _phantom: std::marker::PhantomData,
         })
-    }
-
-    #[inline]
-    pub fn request(&self) -> &Request<K, T> {
-        &self.request
-    }
-
-    #[inline]
-    pub fn request_id(&self) -> RequestIdentifier {
-        self.request.id()
-    }
-
-    #[inline]
-    pub fn berth(&self) -> &Berth<T> {
-        &self.berth
-    }
-
-    #[inline]
-    pub fn berth_id(&self) -> BerthIdentifier {
-        self.berth.id()
-    }
-
-    #[inline]
-    pub fn start_time(&self) -> TimePoint<T> {
-        self.start_time
-    }
-
-    #[inline]
-    pub fn end_time(&self) -> TimePoint<T>
-    where
-        T: CheckedAdd,
-    {
-        self.start_time + self.request.processing_time_for(self.berth_id()).expect(
-            "The processing time for the assigned berth must be defined, as the assignment is only valid if so.",
-        )
-    }
-
-    #[inline]
-    pub fn interval(&self) -> TimeInterval<T>
-    where
-        T: CheckedAdd,
-    {
-        TimeInterval::new(self.start_time(), self.end_time())
     }
 
     #[inline]
@@ -151,8 +182,27 @@ impl<K: Kind, T: Ord + CheckedSub + Copy + CheckedAdd> Assignment<K, T> {
             request: &self.request,
             berth: &self.berth,
             start_time: self.start_time,
+            processing_time: self.processing_time,
             _phantom: std::marker::PhantomData,
         }
+    }
+}
+
+impl<K: Kind, T: Ord + Copy> AssignmentView<K, T> for Assignment<K, T> {
+    fn request(&self) -> &Request<K, T> {
+        &self.request
+    }
+
+    fn berth(&self) -> &Berth<T> {
+        &self.berth
+    }
+
+    fn start_time(&self) -> TimePoint<T> {
+        self.start_time
+    }
+
+    fn processing_time(&self) -> TimeDelta<T> {
+        self.processing_time
     }
 }
 
@@ -174,6 +224,7 @@ pub struct AssignmentRef<'r, 'b, K: Kind, T: Ord + Copy> {
     request: &'r Request<K, T>,
     berth: &'b Berth<T>,
     start_time: TimePoint<T>,
+    processing_time: TimeDelta<T>,
     _phantom: std::marker::PhantomData<K>,
 }
 
@@ -235,50 +286,9 @@ impl<'r, 'b, K: Kind, T: Ord + Copy + CheckedSub + CheckedAdd> AssignmentRef<'r,
             request,
             berth,
             start_time,
+            processing_time,
             _phantom: std::marker::PhantomData,
         })
-    }
-    #[inline]
-    pub fn request(&self) -> &'r Request<K, T> {
-        self.request
-    }
-
-    #[inline]
-    pub fn request_id(&self) -> RequestIdentifier {
-        self.request.id()
-    }
-
-    #[inline]
-    pub fn berth(&self) -> &'b Berth<T> {
-        self.berth
-    }
-
-    #[inline]
-    pub fn berth_id(&self) -> BerthIdentifier {
-        self.berth.id()
-    }
-
-    #[inline]
-    pub fn start_time(&self) -> TimePoint<T> {
-        self.start_time
-    }
-
-    #[inline]
-    pub fn end_time(&self) -> TimePoint<T>
-    where
-        T: CheckedAdd,
-    {
-        self.start_time + self.request.processing_time_for(self.berth_id()).expect(
-            "The processing time for the assigned berth must be defined, as the assignment is only valid if so.",
-        )
-    }
-
-    #[inline]
-    pub fn interval(&self) -> TimeInterval<T>
-    where
-        T: CheckedAdd,
-    {
-        TimeInterval::new(self.start_time(), self.end_time())
     }
 
     #[inline]
@@ -287,6 +297,7 @@ impl<'r, 'b, K: Kind, T: Ord + Copy + CheckedSub + CheckedAdd> AssignmentRef<'r,
             request: self.request.clone(),
             berth: self.berth.clone(),
             start_time: self.start_time,
+            processing_time: self.processing_time,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -297,8 +308,27 @@ impl<'r, 'b, K: Kind, T: Ord + Copy + CheckedSub + CheckedAdd> AssignmentRef<'r,
             request: self.request.clone(),
             berth: self.berth.clone(),
             start_time: self.start_time,
+            processing_time: self.processing_time,
             _phantom: std::marker::PhantomData,
         }
+    }
+}
+
+impl<'r, 'b, K: Kind, T: Ord + Copy> AssignmentView<K, T> for AssignmentRef<'r, 'b, K, T> {
+    fn request(&self) -> &Request<K, T> {
+        self.request
+    }
+
+    fn berth(&self) -> &Berth<T> {
+        self.berth
+    }
+
+    fn start_time(&self) -> TimePoint<T> {
+        self.start_time
+    }
+
+    fn processing_time(&self) -> TimeDelta<T> {
+        self.processing_time
     }
 }
 
@@ -314,6 +344,113 @@ impl<'r, 'b, K: Kind, T: Ord + Copy + CheckedSub + Display> std::fmt::Display
             self.berth.id(),
             self.start_time
         )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AssignmentContainer<K, T, V>
+where
+    K: Kind,
+    T: Copy + Ord,
+    V: AssignmentView<K, T>,
+{
+    inner: HashMap<RequestIdentifier, V>,
+    _phantom: std::marker::PhantomData<(K, T)>,
+}
+
+impl<K, T, V> Default for AssignmentContainer<K, T, V>
+where
+    K: Kind,
+    T: Copy + Ord,
+    V: AssignmentView<K, T>,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K, T, V> AssignmentContainer<K, T, V>
+where
+    K: Kind,
+    T: Copy + Ord,
+    V: AssignmentView<K, T>,
+{
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            inner: HashMap::new(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: HashMap::with_capacity(capacity),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn insert(&mut self, value: V) -> Option<V>
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        self.inner.insert(value.request_id(), value)
+    }
+
+    #[inline]
+    pub fn remove(&mut self, rid: RequestIdentifier) -> Option<V> {
+        self.inner.remove(&rid)
+    }
+
+    #[inline]
+    pub fn get(&self, rid: RequestIdentifier) -> Option<&V> {
+        self.inner.get(&rid)
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &V> {
+        self.inner.values()
+    }
+
+    #[inline]
+    pub fn contains_id(&self, rid: RequestIdentifier) -> bool {
+        self.inner.contains_key(&rid)
+    }
+
+    #[inline]
+    pub fn contains_assignment(&self, assignment: &V) -> bool
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        let rid = assignment.request_id();
+        self.contains_id(rid)
+    }
+}
+
+impl<K, T, V> FromIterator<V> for AssignmentContainer<K, T, V>
+where
+    K: Kind,
+    T: Copy + Ord + CheckedAdd + CheckedSub,
+    V: AssignmentView<K, T>,
+{
+    fn from_iter<I: IntoIterator<Item = V>>(iter: I) -> Self {
+        let mut container = AssignmentContainer::new();
+        for v in iter {
+            container.insert(v);
+        }
+        container
     }
 }
 
@@ -370,7 +507,7 @@ mod tests {
         for (b, d) in pt {
             map.insert(bid(*b), td(*d));
         }
-        Request::<FixedKind, i64>::new(rid(id), iv(win.0, win.1), map).unwrap()
+        Request::<FixedKind, i64>::new(rid(id), iv(win.0, win.1), 1, map).unwrap()
     }
 
     fn mk_req_flexible_with(
@@ -382,7 +519,7 @@ mod tests {
         for (b, d) in pt {
             map.insert(bid(*b), td(*d));
         }
-        Request::<FlexibleKind, i64>::new(rid(id), iv(win.0, win.1), map).unwrap()
+        Request::<FlexibleKind, i64>::new(rid(id), iv(win.0, win.1), 1, map).unwrap()
     }
 
     fn hash_of<T: Hash>(v: &T) -> u64 {
@@ -670,5 +807,41 @@ mod tests {
         // end == window.end -> OK
         let r2 = AssignmentRef::<FlexibleKind, i64>::new(&req, &berth, tp(20)).unwrap();
         assert_eq!(r2.end_time(), tp(25));
+    }
+
+    #[test]
+    fn test_waiting_turnaround_cost_nonzero_wait() {
+        // Window [10,100), start=15 -> waiting=5; pt=7 -> turnaround=12; weight=3 -> cost=36
+        let berth = mk_berth_multi(); // id=2 available in [0,20) ∪ [25,50)
+        let mut m = BTreeMap::new();
+        m.insert(bid(2), td(7));
+
+        let req = Request::<FixedKind, i64>::new(rid(77), iv(10, 100), 3, m).unwrap();
+        let a = Assignment::<FixedKind, i64>::new_fixed(req, berth, tp(15)).unwrap();
+
+        assert_eq!(a.waiting_time(), td(5));
+        assert_eq!(a.turnaround_time(), td(12));
+
+        // turnaround(12) * weight(3) = 36
+        assert_eq!(a.cost(), 36);
+        // (if you prefer type-driven calc)
+        // assert_eq!(a.cost(), a.turnaround_time().value().into() * 3.into());
+    }
+
+    #[test]
+    fn test_waiting_turnaround_cost_zero_wait() {
+        // Window [0,50), start=0 -> waiting=0; pt=10 -> turnaround=10; weight=5 -> cost=50
+        let berth = mk_berth_single(1, 0, 1000);
+        let mut m = BTreeMap::new();
+        m.insert(bid(1), td(10));
+
+        let req = Request::<FixedKind, i64>::new(rid(78), iv(0, 50), 5, m).unwrap();
+        let a = Assignment::<FixedKind, i64>::new_fixed(req, berth, tp(0)).unwrap();
+
+        assert_eq!(a.waiting_time(), td(0));
+        assert_eq!(a.turnaround_time(), td(10));
+
+        // turnaround(10) * weight(5) = 50
+        assert_eq!(a.cost(), 50);
     }
 }

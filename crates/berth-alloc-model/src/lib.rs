@@ -24,6 +24,16 @@ pub mod problem;
 pub mod solution;
 
 pub mod prelude {
-    pub use crate::common::*;
-    pub use crate::problem::*;
+    pub use crate::common::{FixedKind, FlexibleKind, Kind};
+    pub use crate::problem::{
+        asg::{Assignment, AssignmentContainer},
+        berth::{Berth, BerthContainer, BerthIdentifier},
+        err::{
+            AssignmenStartsBeforeFeasibleWindowError, AssignmentEndsAfterFeasibleWindowError,
+            IncomatibleBerthError,
+        },
+        prob::Problem,
+        req::{Request, RequestContainer, RequestIdentifier},
+    };
+    pub use crate::solution::{Solution, SolutionRef, SolutionValidationError, SolutionView};
 }
