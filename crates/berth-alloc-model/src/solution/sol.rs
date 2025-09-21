@@ -21,152 +21,140 @@
 
 use berth_alloc_core::prelude::TimePoint;
 use num_traits::{CheckedAdd, CheckedSub};
+use rangemap::RangeSet;
 
 use crate::{
     common::{FixedKind, FlexibleKind, Kind},
     problem::{
-        AssignmenStartsBeforeFeasibleWindowError, Assignment,
-        AssignmentEndsAfterFeasibleWindowError, AssignmentOverlapError, AssignmentRef, Berth,
-        BerthIdentifier, BerthNotFoundError, IncomatibleBerthError, Problem, RequestIdentifier,
+        asg::{Assignment, AssignmentContainer, AssignmentRef, AssignmentView},
+        berth::{BerthContainer, BerthIdentifier},
+        err::{
+            AssignmenStartsBeforeFeasibleWindowError, AssignmentEndsAfterFeasibleWindowError,
+            AssignmentOverlapError, BerthNotFoundError, IncomatibleBerthError,
+        },
+        prob::Problem,
+        req::RequestIdentifier,
     },
     solution::err::SolutionValidationError,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::{collections::BTreeMap, ops::Range};
 
-#[derive(Debug, Clone)]
-pub struct Solution<T: Copy + Ord> {
-    fixed_assignments: HashMap<RequestIdentifier, Assignment<FixedKind, T>>,
-    flexible_assignments: HashMap<RequestIdentifier, Assignment<FlexibleKind, T>>,
-}
+type StartIndex<T> = BTreeMap<TimePoint<T>, (TimePoint<T>, RequestIdentifier)>;
 
-impl<T: Copy + Ord> Solution<T> {
-    #[inline]
-    pub fn new(
-        fixed_assignments: HashMap<RequestIdentifier, Assignment<FixedKind, T>>,
-        flexible_assignments: HashMap<RequestIdentifier, Assignment<FlexibleKind, T>>,
-    ) -> Self {
-        Self {
-            fixed_assignments,
-            flexible_assignments,
-        }
-    }
-
-    #[inline]
-    pub fn fixed_assignments(&self) -> &HashMap<RequestIdentifier, Assignment<FixedKind, T>> {
-        &self.fixed_assignments
-    }
-
-    #[inline]
-    pub fn flexible_assignments(&self) -> &HashMap<RequestIdentifier, Assignment<FlexibleKind, T>> {
-        &self.flexible_assignments
-    }
-
-    #[inline]
-    pub fn total_assignments(&self) -> usize {
-        self.fixed_assignments.len() + self.flexible_assignments.len()
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.fixed_assignments.is_empty() && self.flexible_assignments.is_empty()
-    }
-
-    #[inline]
-    pub fn as_ref(&self) -> SolutionRef<'_, T>
-    where
-        T: CheckedAdd + CheckedSub + std::hash::Hash,
-    {
-        let fixed = self
-            .fixed_assignments
-            .iter()
-            .map(|(&rid, a)| (rid, a.to_ref()))
-            .collect::<HashMap<RequestIdentifier, AssignmentRef<'_, '_, FixedKind, T>>>();
-        let flex = self
-            .flexible_assignments
-            .iter()
-            .map(|(&rid, a)| (rid, a.to_ref()))
-            .collect::<HashMap<RequestIdentifier, AssignmentRef<'_, '_, FlexibleKind, T>>>();
-        SolutionRef::new(fixed, flex)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SolutionRef<'p, T: Copy + Ord> {
-    fixed_assignments: HashMap<RequestIdentifier, AssignmentRef<'p, 'p, FixedKind, T>>,
-    flexible_assignments: HashMap<RequestIdentifier, AssignmentRef<'p, 'p, FlexibleKind, T>>,
-}
-
-impl<'p, T: Copy + Ord> SolutionRef<'p, T> {
-    #[inline]
-    pub fn new(
-        fixed_assignments: HashMap<RequestIdentifier, AssignmentRef<'p, 'p, FixedKind, T>>,
-        flexible_assignments: HashMap<RequestIdentifier, AssignmentRef<'p, 'p, FlexibleKind, T>>,
-    ) -> Self {
-        Self {
-            fixed_assignments,
-            flexible_assignments,
-        }
-    }
-
-    #[inline]
-    pub fn fixed_assignments(
-        &self,
-    ) -> &HashMap<RequestIdentifier, AssignmentRef<'p, 'p, FixedKind, T>> {
-        &self.fixed_assignments
-    }
-
-    #[inline]
-    pub fn flexible_assignments(
-        &self,
-    ) -> &HashMap<RequestIdentifier, AssignmentRef<'p, 'p, FlexibleKind, T>> {
-        &self.flexible_assignments
-    }
-
-    #[inline]
-    pub fn total_assignments(&self) -> usize {
-        self.fixed_assignments.len() + self.flexible_assignments.len()
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.fixed_assignments.is_empty() && self.flexible_assignments.is_empty()
-    }
-
-    #[inline]
-    pub fn to_owned(&self) -> Solution<T>
-    where
-        T: CheckedAdd + CheckedSub + std::hash::Hash,
-    {
-        let fixed = self
-            .fixed_assignments
-            .iter()
-            .map(|(&rid, a)| (rid, a.to_owned()))
-            .collect::<HashMap<RequestIdentifier, Assignment<FixedKind, T>>>();
-
-        let flex = self
-            .flexible_assignments
-            .iter()
-            .map(|(&rid, a)| (rid, a.to_owned()))
-            .collect::<HashMap<RequestIdentifier, Assignment<FlexibleKind, T>>>();
-
-        Solution {
-            fixed_assignments: fixed,
-            flexible_assignments: flex,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ValidatedAssignment<T> {
-    req_id: RequestIdentifier,
-    berth_id: BerthIdentifier,
+#[derive(Clone, Copy)]
+struct Validated<T: Copy + Ord> {
+    rid: RequestIdentifier,
+    bid: BerthIdentifier,
     start: TimePoint<T>,
     end: TimePoint<T>,
 }
 
-impl<'p, T: Copy + Ord> SolutionRef<'p, T> {
+impl<T: Copy + Ord> Validated<T> {
     #[inline]
-    pub fn validate(&self, prob: &Problem<T>) -> Result<(), SolutionValidationError<T>>
+    fn range(&self) -> Range<TimePoint<T>> {
+        self.start..self.end
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BerthSchedule<T: Copy + Ord> {
+    occupied: RangeSet<TimePoint<T>>,
+    starts: StartIndex<T>,
+}
+
+impl<T: Copy + Ord> Default for BerthSchedule<T> {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            occupied: RangeSet::new(),
+            starts: StartIndex::new(),
+        }
+    }
+}
+
+type PerBerth<T> = BTreeMap<BerthIdentifier, BerthSchedule<T>>;
+type ValidateOneResult<T> = Result<Validated<T>, SolutionValidationError<T>>;
+
+fn validate_one<K: Kind, T: Copy + Ord + CheckedAdd + CheckedSub>(
+    a: &impl AssignmentView<K, T>,
+    berths: &BerthContainer<T>,
+) -> ValidateOneResult<T> {
+    let bid = a.berth_id();
+    let rid = a.request_id();
+
+    if !berths.contains_id(bid) {
+        return Err(SolutionValidationError::UnknownBerth(
+            BerthNotFoundError::new(rid, bid),
+        ));
+    }
+
+    let req = a.request();
+    if !req.is_berth_feasible(bid) {
+        return Err(SolutionValidationError::Incompatible(
+            IncomatibleBerthError::new(rid, bid),
+        ));
+    }
+
+    let window = req.feasible_window();
+    let start = a.start_time();
+    if start < window.start() {
+        return Err(
+            SolutionValidationError::AssignmentStartsBeforeFeasibleWindow(
+                AssignmenStartsBeforeFeasibleWindowError::new(rid, window.start(), start),
+            ),
+        );
+    }
+
+    let end = a.end_time();
+    if end > window.end() {
+        return Err(SolutionValidationError::AssignmentEndsAfterFeasibleWindow(
+            AssignmentEndsAfterFeasibleWindowError::new(rid, end, window),
+        ));
+    }
+
+    Ok(Validated {
+        rid,
+        bid,
+        start,
+        end,
+    })
+}
+
+pub trait SolutionView<T>
+where
+    T: Copy + Ord,
+{
+    type FixedAssignmentView: AssignmentView<FixedKind, T>;
+    type FlexibleAssignmentView: AssignmentView<FlexibleKind, T>;
+
+    fn fixed_assignments(&self) -> &AssignmentContainer<FixedKind, T, Self::FixedAssignmentView>;
+    fn flexible_assignments(
+        &self,
+    ) -> &AssignmentContainer<FlexibleKind, T, Self::FlexibleAssignmentView>;
+
+    fn fixed_assignments_len(&self) -> usize {
+        self.fixed_assignments().len()
+    }
+    fn flexible_assignments_len(&self) -> usize {
+        self.flexible_assignments().len()
+    }
+    fn total_assignments_len(&self) -> usize {
+        self.fixed_assignments_len() + self.flexible_assignments_len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.fixed_assignments().is_empty() && self.flexible_assignments().is_empty()
+    }
+
+    fn contains_fixed(&self, rid: RequestIdentifier) -> bool {
+        self.fixed_assignments().get(rid).is_some()
+    }
+    fn contains_flexible(&self, rid: RequestIdentifier) -> bool {
+        self.flexible_assignments().get(rid).is_some()
+    }
+
+    #[inline]
+    fn validate(&self, prob: &Problem<T>) -> Result<(), SolutionValidationError<T>>
     where
         T: CheckedAdd + CheckedSub,
     {
@@ -174,6 +162,7 @@ impl<'p, T: Copy + Ord> SolutionRef<'p, T> {
         self.validate_assignments_and_overlaps(prob)
     }
 
+    #[inline]
     fn validate_assignment_coverage(
         &self,
         prob: &Problem<T>,
@@ -181,24 +170,36 @@ impl<'p, T: Copy + Ord> SolutionRef<'p, T> {
     where
         T: CheckedAdd + CheckedSub,
     {
-        for assignment in prob.fixed_assignments() {
+        for assignment in prob.iter_fixed_assignments() {
             let rid = assignment.request_id();
-            if !self.fixed_assignments.contains_key(&rid) {
+            if !self.fixed_assignments().contains_id(rid) {
                 return Err(SolutionValidationError::MissingFixed(rid));
             }
         }
 
-        for request in prob.flexible_requests() {
+        for request in prob.iter_flexible_requests() {
             let rid = request.id();
-            if !self.flexible_assignments.contains_key(&rid) {
+            if !self.flexible_assignments().contains_id(rid) {
                 return Err(SolutionValidationError::MissingFlexible(rid));
             }
         }
 
-        // Check for extra flexible assignments
-        for &rid in self.flexible_assignments.keys() {
-            if !prob.flexible_requests().iter().any(|r| r.id() == rid) {
+        for a in self.flexible_assignments().iter() {
+            let rid = a.request_id();
+            let exists_in_problem = prob.flexible_requests().iter().any(|r| r.id() == rid);
+            if !exists_in_problem {
                 return Err(SolutionValidationError::ExtraFlexible(rid));
+            }
+        }
+
+        for a in self.fixed_assignments().iter() {
+            let rid = a.request_id();
+            let exists_in_problem = prob
+                .fixed_assignments()
+                .iter()
+                .any(|r| r.request_id() == rid);
+            if !exists_in_problem {
+                return Err(SolutionValidationError::ExtraFixed(rid));
             }
         }
 
@@ -212,101 +213,178 @@ impl<'p, T: Copy + Ord> SolutionRef<'p, T> {
     where
         T: CheckedAdd + CheckedSub,
     {
-        #[derive(Clone, Copy)]
-        struct Assignment<T> {
-            req: RequestIdentifier,
-            start: TimePoint<T>,
-            end: TimePoint<T>,
-        }
+        let mut per_berth: PerBerth<T> = BTreeMap::new();
+        let mut push = |v: Validated<T>| -> Result<(), SolutionValidationError<T>> {
+            if v.start >= v.end {
+                return Ok(());
+            }
 
-        let mut per_berth: BTreeMap<BerthIdentifier, Vec<Assignment<T>>> = BTreeMap::new();
+            let sched = per_berth.entry(v.bid).or_default();
+            let iv = v.range();
 
-        for assignment in self.fixed_assignments.values() {
-            let validated = Self::validate_single_assignment(assignment, prob.berths())?;
-            per_berth
-                .entry(validated.berth_id)
-                .or_default()
-                .push(Assignment {
-                    req: validated.req_id,
-                    start: validated.start,
-                    end: validated.end,
-                });
-        }
-
-        for assignment in self.flexible_assignments.values() {
-            let validated = Self::validate_single_assignment(assignment, prob.berths())?;
-            per_berth
-                .entry(validated.berth_id)
-                .or_default()
-                .push(Assignment {
-                    req: validated.req_id,
-                    start: validated.start,
-                    end: validated.end,
-                });
-        }
-
-        for assignments in per_berth.values_mut() {
-            assignments.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.end.cmp(&b.end)));
-
-            for window in assignments.windows(2) {
-                if window[0].end > window[1].start {
+            if sched.occupied.overlaps(&iv) {
+                if let Some((_s_pred, &(e_pred, rid_pred))) =
+                    sched.starts.range(..=v.start).next_back()
+                    && e_pred > v.start
+                {
                     return Err(SolutionValidationError::Overlap(
-                        AssignmentOverlapError::new(window[0].req, window[1].req),
+                        AssignmentOverlapError::new(rid_pred, v.rid),
+                    ));
+                }
+
+                if let Some((_s_succ, &(_e_succ, rid_succ))) =
+                    sched.starts.range(v.start..v.end).next()
+                {
+                    return Err(SolutionValidationError::Overlap(
+                        AssignmentOverlapError::new(rid_succ, v.rid),
+                    ));
+                }
+
+                if let Some((_s_any, &(_e_any, rid_any))) = sched.starts.iter().next() {
+                    return Err(SolutionValidationError::Overlap(
+                        AssignmentOverlapError::new(rid_any, v.rid),
                     ));
                 }
             }
+
+            sched.occupied.insert(iv);
+            sched.starts.insert(v.start, (v.end, v.rid));
+            Ok(())
+        };
+
+        for a in self.fixed_assignments().iter() {
+            push(validate_one(a, prob.berths())?)?;
+        }
+        for a in self.flexible_assignments().iter() {
+            push(validate_one(a, prob.berths())?)?;
         }
 
         Ok(())
     }
+}
 
-    fn validate_single_assignment<K: Kind>(
-        assignment: &AssignmentRef<'_, '_, K, T>,
-        berths_map: &HashMap<BerthIdentifier, Berth<T>>,
-    ) -> Result<ValidatedAssignment<T>, SolutionValidationError<T>>
+#[derive(Debug, Clone)]
+pub struct Solution<T: Copy + Ord> {
+    fixed_assignments: AssignmentContainer<FixedKind, T, Assignment<FixedKind, T>>,
+    flexible_assignments: AssignmentContainer<FlexibleKind, T, Assignment<FlexibleKind, T>>,
+}
+
+impl<T: Copy + Ord> Solution<T> {
+    #[inline]
+    pub fn new(
+        fixed_assignments: AssignmentContainer<FixedKind, T, Assignment<FixedKind, T>>,
+        flexible_assignments: AssignmentContainer<FlexibleKind, T, Assignment<FlexibleKind, T>>,
+    ) -> Self {
+        Self {
+            fixed_assignments,
+            flexible_assignments,
+        }
+    }
+
+    #[inline]
+    pub fn as_ref(&self) -> SolutionRef<'_, T>
     where
-        T: CheckedAdd + CheckedSub,
+        T: CheckedAdd + CheckedSub + std::hash::Hash,
     {
-        let bid = assignment.berth_id();
-        let rid = assignment.request_id();
+        let fixed = self
+            .fixed_assignments
+            .iter()
+            .map(|a| a.to_ref())
+            .collect::<AssignmentContainer<FixedKind, T, AssignmentRef<'_, '_, FixedKind, T>>>();
 
-        if !berths_map.contains_key(&bid) {
-            return Err(SolutionValidationError::UnknownBerth(
-                BerthNotFoundError::new(rid, bid),
-            ));
+        let flex = self
+                    .flexible_assignments
+                    .iter()
+                    .map(|a| a.to_ref())
+                    .collect::<AssignmentContainer<
+                        FlexibleKind,
+                        T,
+                        AssignmentRef<'_, '_, FlexibleKind, T>,
+                    >>();
+
+        SolutionRef::new(fixed, flex)
+    }
+}
+
+impl<T: Copy + Ord> SolutionView<T> for Solution<T> {
+    type FixedAssignmentView = Assignment<FixedKind, T>;
+    type FlexibleAssignmentView = Assignment<FlexibleKind, T>;
+
+    fn fixed_assignments(&self) -> &AssignmentContainer<FixedKind, T, Assignment<FixedKind, T>> {
+        &self.fixed_assignments
+    }
+
+    fn flexible_assignments(
+        &self,
+    ) -> &AssignmentContainer<FlexibleKind, T, Assignment<FlexibleKind, T>> {
+        &self.flexible_assignments
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SolutionRef<'p, T: Copy + Ord> {
+    fixed_assignments: AssignmentContainer<FixedKind, T, AssignmentRef<'p, 'p, FixedKind, T>>,
+    flexible_assignments:
+        AssignmentContainer<FlexibleKind, T, AssignmentRef<'p, 'p, FlexibleKind, T>>,
+}
+
+impl<'p, T: Copy + Ord> SolutionRef<'p, T> {
+    #[inline]
+    pub fn new(
+        fixed_assignments: AssignmentContainer<FixedKind, T, AssignmentRef<'p, 'p, FixedKind, T>>,
+        flexible_assignments: AssignmentContainer<
+            FlexibleKind,
+            T,
+            AssignmentRef<'p, 'p, FlexibleKind, T>,
+        >,
+    ) -> Self {
+        Self {
+            fixed_assignments,
+            flexible_assignments,
         }
+    }
 
-        let req = assignment.request();
-        if !req.is_berth_feasible(bid) {
-            return Err(SolutionValidationError::Incompatible(
-                IncomatibleBerthError::new(rid, bid),
-            ));
-        };
+    #[inline]
+    pub fn to_owned(&self) -> Solution<T>
+    where
+        T: CheckedAdd + CheckedSub + std::hash::Hash,
+    {
+        let fixed = self
+            .fixed_assignments
+            .iter()
+            .map(|a| a.to_owned())
+            .collect::<AssignmentContainer<FixedKind, T, Assignment<FixedKind, T>>>();
 
-        let window = req.feasible_window();
-        let start = assignment.start_time();
+        let flex = self
+            .flexible_assignments
+            .iter()
+            .map(|a| a.to_owned())
+            .collect::<AssignmentContainer<FlexibleKind, T, Assignment<FlexibleKind, T>>>();
 
-        if start < window.start() {
-            return Err(
-                SolutionValidationError::AssignmentStartsBeforeFeasibleWindow(
-                    AssignmenStartsBeforeFeasibleWindowError::new(rid, window.start(), start),
-                ),
-            );
-        }
+        Solution::new(fixed, flex)
+    }
 
-        let end = assignment.end_time();
-        if end > window.end() {
-            return Err(SolutionValidationError::AssignmentEndsAfterFeasibleWindow(
-                AssignmentEndsAfterFeasibleWindowError::new(rid, end, window),
-            ));
-        }
+    #[inline]
+    pub fn into_owned(self) -> Solution<T>
+    where
+        T: CheckedAdd + CheckedSub + std::hash::Hash,
+    {
+        self.to_owned()
+    }
+}
 
-        Ok(ValidatedAssignment {
-            req_id: rid,
-            berth_id: bid,
-            start,
-            end,
-        })
+impl<'p, T: Copy + Ord> SolutionView<T> for SolutionRef<'p, T> {
+    type FixedAssignmentView = AssignmentRef<'p, 'p, FixedKind, T>;
+    type FlexibleAssignmentView = AssignmentRef<'p, 'p, FlexibleKind, T>;
+
+    fn fixed_assignments(&self) -> &AssignmentContainer<FixedKind, T, Self::FixedAssignmentView> {
+        &self.fixed_assignments
+    }
+
+    fn flexible_assignments(
+        &self,
+    ) -> &AssignmentContainer<FlexibleKind, T, Self::FlexibleAssignmentView> {
+        &self.flexible_assignments
     }
 }
 
@@ -316,12 +394,14 @@ mod tests {
     use crate::{
         common::{FixedKind, FlexibleKind},
         problem::{
-            asg::Assignment, berth::Berth, berth::BerthIdentifier, prob::Problem, req::Request,
-            req::RequestIdentifier,
+            asg::{Assignment, AssignmentContainer},
+            berth::{Berth, BerthContainer, BerthIdentifier},
+            prob::Problem,
+            req::{Request, RequestContainer, RequestIdentifier},
         },
     };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::BTreeMap;
 
     #[inline]
     fn tp(v: i64) -> TimePoint<i64> {
@@ -353,7 +433,7 @@ mod tests {
         for (b, d) in pts {
             m.insert(bid(*b), td(*d));
         }
-        Request::<FixedKind, i64>::new(rid(id), iv(window.0, window.1), m).unwrap()
+        Request::<FixedKind, i64>::new(rid(id), iv(window.0, window.1), 1, m).unwrap()
     }
 
     fn req_flex(id: u32, window: (i64, i64), pts: &[(u32, i64)]) -> Request<FlexibleKind, i64> {
@@ -361,7 +441,7 @@ mod tests {
         for (b, d) in pts {
             m.insert(bid(*b), td(*d));
         }
-        Request::<FlexibleKind, i64>::new(rid(id), iv(window.0, window.1), m).unwrap()
+        Request::<FlexibleKind, i64>::new(rid(id), iv(window.0, window.1), 1, m).unwrap()
     }
 
     fn asg_fixed(
@@ -393,22 +473,24 @@ mod tests {
         let rx = req_flex(21, (0, 100), &[(2, 10)]);
         let ax = asg_flex(&rx, &b2, 0);
 
-        let mut berths = HashMap::new();
-        berths.insert(b1.id(), b1.clone());
-        berths.insert(b2.id(), b2.clone());
+        let mut berths = BerthContainer::new();
+        berths.insert(b1.clone());
+        berths.insert(b2.clone());
 
-        let mut fixed_reqset = HashSet::new();
-        fixed_reqset.insert(af.clone());
+        let mut prob_fixed =
+            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        prob_fixed.insert(af.clone());
 
-        let mut flex_reqset = HashSet::new();
-        flex_reqset.insert(rx.clone());
+        let mut prob_flex = RequestContainer::<FlexibleKind, i64>::new();
+        prob_flex.insert(rx.clone());
 
-        let prob = Problem::new(berths, fixed_reqset, flex_reqset).unwrap();
+        let prob = Problem::new(berths, prob_fixed, prob_flex).unwrap();
 
-        let mut s_fixed = HashMap::new();
-        s_fixed.insert(rid(11), af);
-        let mut s_flex = HashMap::new();
-        s_flex.insert(rid(21), ax);
+        let mut s_fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        s_fixed.insert(af);
+        let mut s_flex =
+            AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
+        s_flex.insert(ax);
 
         let sol = Solution::new(s_fixed, s_flex);
         sol.as_ref().validate(&prob).unwrap();
@@ -421,15 +503,16 @@ mod tests {
         let rf = req_fixed(1, (0, 50), &[(1, 5)]);
         let af = asg_fixed(&rf, &b1, 0);
 
-        let mut berths = HashMap::new();
-        berths.insert(b1.id(), b1);
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
 
-        let mut fixed_in_prob = HashSet::new();
+        let mut fixed_in_prob =
+            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
         fixed_in_prob.insert(af);
 
-        let prob = Problem::new(berths, fixed_in_prob, HashSet::new()).unwrap();
+        let prob = Problem::new(berths, fixed_in_prob, RequestContainer::new()).unwrap();
 
-        let sol = Solution::<i64>::new(HashMap::new(), HashMap::new());
+        let sol = Solution::<i64>::new(AssignmentContainer::new(), AssignmentContainer::new());
         let err = sol.as_ref().validate(&prob).unwrap_err();
         match err {
             SolutionValidationError::MissingFixed(id) => assert_eq!(id, rid(1)),
@@ -443,15 +526,15 @@ mod tests {
 
         let rx = req_flex(2, (0, 50), &[(1, 5)]);
 
-        let mut berths = HashMap::new();
-        berths.insert(b1.id(), b1);
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
 
-        let mut flex_in_prob = HashSet::new();
+        let mut flex_in_prob = RequestContainer::<FlexibleKind, i64>::new();
         flex_in_prob.insert(rx);
 
-        let prob = Problem::new(berths, HashSet::new(), flex_in_prob).unwrap();
+        let prob = Problem::new(berths, AssignmentContainer::new(), flex_in_prob).unwrap();
 
-        let sol = Solution::<i64>::new(HashMap::new(), HashMap::new());
+        let sol = Solution::<i64>::new(AssignmentContainer::new(), AssignmentContainer::new());
         let err = sol.as_ref().validate(&prob).unwrap_err();
         match err {
             SolutionValidationError::MissingFlexible(id) => assert_eq!(id, rid(2)),
@@ -466,24 +549,25 @@ mod tests {
         // The only required flexible in the problem:
         let r_req = req_flex(10, (0, 50), &[(1, 5)]);
 
-        let mut berths = HashMap::new();
-        berths.insert(b1.id(), b1.clone());
+        let mut berths = BerthContainer::new();
+        berths.insert(b1.clone());
 
-        let mut flex_in_prob = HashSet::new();
+        let mut flex_in_prob = RequestContainer::<FlexibleKind, i64>::new();
         flex_in_prob.insert(r_req.clone());
 
-        let prob = Problem::new(berths, HashSet::new(), flex_in_prob).unwrap();
+        let prob = Problem::new(berths, AssignmentContainer::new(), flex_in_prob).unwrap();
 
         // Solution assigns the required one AND an extra one (id 11) → ExtraFlexible
         let a_req = asg_flex(&r_req, &b1, 0);
         let r_extra = req_flex(11, (0, 50), &[(1, 5)]);
         let a_extra = asg_flex(&r_extra, &b1, 10);
 
-        let mut s_flex = HashMap::new();
-        s_flex.insert(rid(10), a_req);
-        s_flex.insert(rid(11), a_extra);
+        let mut s_flex =
+            AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
+        s_flex.insert(a_req);
+        s_flex.insert(a_extra);
 
-        let sol = Solution::new(HashMap::new(), s_flex);
+        let sol = Solution::new(AssignmentContainer::new(), s_flex);
         let err = sol.as_ref().validate(&prob).unwrap_err();
         match err {
             SolutionValidationError::ExtraFlexible(id) => assert_eq!(id, rid(11)),
@@ -503,20 +587,23 @@ mod tests {
         let rx = req_flex(31, (0, 100), &[(1, 10)]);
         let ax = asg_flex(&rx, &b1, 5);
 
-        let mut berths = HashMap::new();
-        berths.insert(b1.id(), b1);
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
 
-        let mut fixed_in_prob = HashSet::new();
+        let mut fixed_in_prob =
+            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
         fixed_in_prob.insert(af.clone());
-        let mut flex_in_prob = HashSet::new();
+
+        let mut flex_in_prob = RequestContainer::<FlexibleKind, i64>::new();
         flex_in_prob.insert(rx.clone());
 
         let prob = Problem::new(berths, fixed_in_prob, flex_in_prob).unwrap();
 
-        let mut s_fixed = HashMap::new();
-        s_fixed.insert(rid(30), af);
-        let mut s_flex = HashMap::new();
-        s_flex.insert(rid(31), ax);
+        let mut s_fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        s_fixed.insert(af);
+        let mut s_flex =
+            AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
+        s_flex.insert(ax);
 
         let sol = Solution::new(s_fixed, s_flex);
         let err = sol.as_ref().validate(&prob).unwrap_err();
@@ -541,26 +628,26 @@ mod tests {
         let rf_prob = req_fixed(40, (0, 100), &[(1, 5)]);
         let af_prob = asg_fixed(&rf_prob, &b1, 0);
 
-        let mut berths = HashMap::new();
-        berths.insert(b1.id(), b1.clone());
+        let mut berths = BerthContainer::new();
+        berths.insert(b1.clone());
 
-        let mut fixed_in_prob = HashSet::new();
+        let mut fixed_in_prob =
+            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
         fixed_in_prob.insert(af_prob);
 
         // No flexible requirements in the problem here
-        let prob = Problem::new(berths, fixed_in_prob, HashSet::new()).unwrap();
+        let prob = Problem::new(berths, fixed_in_prob, RequestContainer::new()).unwrap();
 
         // Solution provides a *different* assignment for the *same request id* 40,
-        // but on an unknown berth 3. This passes the "MissingFixed" check
-        // (request id present) and should fail as UnknownBerth afterwards.
+        // but on an unknown berth 3.
         let b3 = mk_berth(3, 0, 200);
         let rf_sol = req_fixed(40, (0, 100), &[(3, 5)]); // note: maps to berth 3
         let af_sol = asg_fixed(&rf_sol, &b3, 10);
 
-        let mut s_fixed = HashMap::new();
-        s_fixed.insert(rid(40), af_sol);
+        let mut s_fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        s_fixed.insert(af_sol);
 
-        let sol = Solution::new(s_fixed, HashMap::new());
+        let sol = Solution::new(s_fixed, AssignmentContainer::new());
         let err = sol.as_ref().validate(&prob).unwrap_err();
         match err {
             SolutionValidationError::UnknownBerth(e) => {

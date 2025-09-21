@@ -19,36 +19,34 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::{
-    common::{FixedKind, FlexibleKind},
-    problem::{
-        BerthIdentifier, ProblemError, asg::Assignment, berth::Berth, prob::Problem, req::Request,
-    },
+use crate::common::{FixedKind, FlexibleKind};
+use crate::problem::{
+    asg::{Assignment, AssignmentContainer},
+    berth::{Berth, BerthContainer},
+    err::ProblemError,
+    prob::Problem,
+    req::{Request, RequestContainer},
 };
 use num_traits::{CheckedAdd, CheckedSub};
-use std::{
-    collections::{HashMap, HashSet},
-    hash::Hash,
-};
 
 #[derive(Debug, Clone)]
 pub struct ProblemBuilder<T: Copy + Ord> {
-    berths: HashMap<BerthIdentifier, Berth<T>>,
-    fixed_assignments: HashSet<Assignment<FixedKind, T>>,
-    flexible_requests: HashSet<Request<FlexibleKind, T>>,
+    berths: BerthContainer<T>,
+    fixed_assignments: AssignmentContainer<FixedKind, T, Assignment<FixedKind, T>>,
+    flexible_requests: RequestContainer<FlexibleKind, T>,
 }
 
 impl<T: Copy + Ord> Default for ProblemBuilder<T> {
     fn default() -> Self {
         Self {
-            berths: HashMap::new(),
-            fixed_assignments: HashSet::new(),
-            flexible_requests: HashSet::new(),
+            berths: BerthContainer::new(),
+            fixed_assignments: AssignmentContainer::new(),
+            flexible_requests: RequestContainer::new(),
         }
     }
 }
 
-impl<T: Copy + Ord + Hash> ProblemBuilder<T> {
+impl<T: Copy + Ord + std::hash::Hash> ProblemBuilder<T> {
     #[inline]
     pub fn new() -> Self {
         Self::default()
@@ -57,9 +55,9 @@ impl<T: Copy + Ord + Hash> ProblemBuilder<T> {
     #[inline]
     pub fn with_capacities(berths: usize, fixed: usize, flex: usize) -> Self {
         Self {
-            berths: HashMap::with_capacity(berths),
-            fixed_assignments: HashSet::with_capacity(fixed),
-            flexible_requests: HashSet::with_capacity(flex),
+            berths: BerthContainer::with_capacity(berths),
+            fixed_assignments: AssignmentContainer::with_capacity(fixed),
+            flexible_requests: RequestContainer::with_capacity(flex),
         }
     }
 
@@ -68,8 +66,7 @@ impl<T: Copy + Ord + Hash> ProblemBuilder<T> {
     where
         I: IntoIterator<Item = Berth<T>>,
     {
-        self.berths.clear();
-        self.berths.extend(berths.into_iter().map(|b| (b.id(), b)));
+        self.berths = berths.into_iter().collect();
         self
     }
 
@@ -77,9 +74,9 @@ impl<T: Copy + Ord + Hash> ProblemBuilder<T> {
     pub fn with_fixed_assignments<I>(mut self, assignments: I) -> Self
     where
         I: IntoIterator<Item = Assignment<FixedKind, T>>,
+        T: CheckedAdd + CheckedSub,
     {
-        self.fixed_assignments.clear();
-        self.fixed_assignments.extend(assignments);
+        self.fixed_assignments = assignments.into_iter().collect();
         self
     }
 
@@ -87,15 +84,15 @@ impl<T: Copy + Ord + Hash> ProblemBuilder<T> {
     pub fn with_flexible_requests<I>(mut self, requests: I) -> Self
     where
         I: IntoIterator<Item = Request<FlexibleKind, T>>,
+        T: CheckedSub,
     {
-        self.flexible_requests.clear();
-        self.flexible_requests.extend(requests);
+        self.flexible_requests = requests.into_iter().collect();
         self
     }
 
     #[inline]
     pub fn add_berth(&mut self, berth: Berth<T>) -> &mut Self {
-        self.berths.insert(berth.id(), berth);
+        self.berths.insert(berth);
         self
     }
 
@@ -104,12 +101,17 @@ impl<T: Copy + Ord + Hash> ProblemBuilder<T> {
     where
         I: IntoIterator<Item = Berth<T>>,
     {
-        self.berths.extend(berths.into_iter().map(|b| (b.id(), b)));
+        for b in berths {
+            self.berths.insert(b);
+        }
         self
     }
 
     #[inline]
-    pub fn add_fixed(&mut self, a: Assignment<FixedKind, T>) -> &mut Self {
+    pub fn add_fixed(&mut self, a: Assignment<FixedKind, T>) -> &mut Self
+    where
+        T: CheckedAdd + CheckedSub,
+    {
         self.fixed_assignments.insert(a);
         self
     }
@@ -118,13 +120,19 @@ impl<T: Copy + Ord + Hash> ProblemBuilder<T> {
     pub fn extend_fixed<I>(&mut self, it: I) -> &mut Self
     where
         I: IntoIterator<Item = Assignment<FixedKind, T>>,
+        T: CheckedAdd + CheckedSub,
     {
-        self.fixed_assignments.extend(it);
+        for a in it {
+            self.fixed_assignments.insert(a);
+        }
         self
     }
 
     #[inline]
-    pub fn add_flexible(&mut self, r: Request<FlexibleKind, T>) -> &mut Self {
+    pub fn add_flexible(&mut self, r: Request<FlexibleKind, T>) -> &mut Self
+    where
+        T: CheckedSub,
+    {
         self.flexible_requests.insert(r);
         self
     }
@@ -133,8 +141,11 @@ impl<T: Copy + Ord + Hash> ProblemBuilder<T> {
     pub fn extend_flexible<I>(&mut self, it: I) -> &mut Self
     where
         I: IntoIterator<Item = Request<FlexibleKind, T>>,
+        T: CheckedSub,
     {
-        self.flexible_requests.extend(it);
+        for r in it {
+            self.flexible_requests.insert(r);
+        }
         self
     }
 
@@ -150,10 +161,9 @@ impl<T: Copy + Ord + Hash> ProblemBuilder<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        common::FlexibleKind,
-        problem::{berth::BerthIdentifier, req::RequestIdentifier},
-    };
+    use crate::common::FlexibleKind;
+    use crate::problem::berth::BerthIdentifier;
+    use crate::problem::req::RequestIdentifier;
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
     use std::collections::BTreeMap;
 
@@ -191,19 +201,19 @@ mod tests {
         for (b, t) in pts {
             m.insert(bid(*b), td(*t));
         }
-        Request::<FlexibleKind, i64>::new_flexible(rid(id), iv(win.0, win.1), m).unwrap()
+        Request::<FlexibleKind, i64>::new_flexible(rid(id), iv(win.0, win.1), 1, m).unwrap()
     }
 
     #[test]
-    fn build_empty() {
+    fn test_build_empty() {
         let p = ProblemBuilder::<i64>::new().build().unwrap();
-        assert!(p.berths().is_empty());
-        assert!(p.fixed_assignments().is_empty());
-        assert!(p.flexible_requests().is_empty());
+        assert_eq!(p.berths().iter().count(), 0);
+        assert_eq!(p.fixed_assignments().iter().count(), 0);
+        assert_eq!(p.flexible_requests().iter().count(), 0);
     }
 
     #[test]
-    fn with_capacities_and_add() {
+    fn test_with_capacities_and_add() {
         let mut b = ProblemBuilder::<i64>::with_capacities(4, 2, 8);
         b.add_berth(make_berth(1, 0, 10))
             .add_berth(make_berth(2, 5, 15));
@@ -211,13 +221,13 @@ mod tests {
         b.add_flexible(r);
 
         let p = b.build().unwrap();
-        assert_eq!(p.berths().len(), 2);
-        assert_eq!(p.flexible_requests().len(), 1);
-        assert_eq!(p.fixed_assignments().len(), 0);
+        assert_eq!(p.berths().iter().count(), 2);
+        assert_eq!(p.flexible_requests().iter().count(), 1);
+        assert_eq!(p.fixed_assignments().iter().count(), 0);
     }
 
     #[test]
-    fn with_bulk_replacers() {
+    fn test_with_bulk_replacers() {
         let berths = vec![make_berth(1, 0, 10), make_berth(2, 0, 20)];
         let r1 = make_request_flex(1, (0, 30), &[(1, 5)]);
         let r2 = make_request_flex(2, (10, 40), &[(2, 7)]);
@@ -228,26 +238,24 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(p.berths().len(), 2);
-        assert_eq!(p.flexible_requests().len(), 2);
-
-        // Verify `with_*` replaced (not appended) by comparing against a fresh set.
-        let mut hb = HashMap::new();
-        hb.extend(berths.into_iter().map(|b| (b.id(), b)));
-        assert_eq!(p.berths(), &hb);
+        assert_eq!(p.berths().iter().count(), 2);
+        assert_eq!(p.flexible_requests().iter().count(), 2);
+        // Presence checks rather than raw map equality.
+        assert!(p.berths().contains_id(bid(1)));
+        assert!(p.berths().contains_id(bid(2)));
     }
 
     #[test]
-    fn extend_and_dedup() {
+    fn test_extend_and_dedup() {
         let b1 = make_berth(1, 0, 10);
         let b2 = make_berth(2, 0, 20);
         let mut builder = ProblemBuilder::<i64>::new();
         builder.extend_berths(vec![b1.clone(), b2.clone()]);
-        builder.extend_berths(vec![b1.clone()]); // duplicate; should be deduped by HashSet
+        builder.extend_berths(vec![b1.clone()]); // duplicate; overwrites by id
 
         let p = builder.build().unwrap();
-        assert_eq!(p.berths().len(), 2);
-        assert!(p.berths().contains_key(&bid(1)));
-        assert!(p.berths().contains_key(&bid(2)));
+        assert_eq!(p.berths().iter().count(), 2);
+        assert!(p.berths().contains_id(bid(1)));
+        assert!(p.berths().contains_id(bid(2)));
     }
 }

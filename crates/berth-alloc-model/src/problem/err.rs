@@ -19,9 +19,8 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+use crate::problem::{berth::BerthIdentifier, req::RequestIdentifier};
 use berth_alloc_core::prelude::{TimeInterval, TimePoint};
-
-use crate::problem::{BerthIdentifier, req::RequestIdentifier};
 use std::num::ParseIntError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -22,8 +22,8 @@
 use crate::{
     common::FlexibleKind,
     problem::{
-        ProblemBuilder,
         berth::{Berth, BerthIdentifier},
+        builder::ProblemBuilder,
         err::{ProblemLoaderError, RequestError},
         prob::Problem,
         req::{Request, RequestIdentifier},
@@ -131,7 +131,8 @@ impl ProblemLoader {
                 pt.insert(BerthIdentifier::new((j as u32) + 1), TimeDelta::new(hij));
             }
 
-            match Request::<FlexibleKind, i64>::new_flexible(rid, window, pt) {
+            // No weights given in the input format, so we use a uniform weight of 1.
+            match Request::<FlexibleKind, i64>::new_flexible(rid, window, 1, pt) {
                 Ok(req) => {
                     builder.add_flexible(req);
                 }

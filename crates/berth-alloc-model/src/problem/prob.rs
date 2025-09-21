@@ -19,32 +19,32 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::{
-    common::{FixedKind, FlexibleKind},
-    problem::{
-        Assignment, AssignmentOverlapError, Berth, BerthIdentifier, BerthNotFoundError,
-        ProblemError, Request,
-    },
+use crate::common::{FixedKind, FlexibleKind};
+use crate::problem::{
+    asg::{Assignment, AssignmentContainer, AssignmentView},
+    berth::BerthContainer,
+    err::{AssignmentOverlapError, BerthNotFoundError, ProblemError},
+    req::{Request, RequestContainer},
 };
 use num_traits::{CheckedAdd, CheckedSub};
-use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct Problem<T: Copy + Ord> {
-    berths: HashMap<BerthIdentifier, Berth<T>>,
-    fixed_assignments: HashSet<Assignment<FixedKind, T>>,
-    flexible_requests: HashSet<Request<FlexibleKind, T>>,
+    berths: BerthContainer<T>,
+    fixed_assignments: AssignmentContainer<FixedKind, T, Assignment<FixedKind, T>>,
+    flexible_requests: RequestContainer<FlexibleKind, T>,
 }
 
 impl<T: Copy + Ord + CheckedAdd + CheckedSub> Problem<T> {
     #[inline]
     pub fn new(
-        berths: HashMap<BerthIdentifier, Berth<T>>,
-        fixed_assignments: HashSet<Assignment<FixedKind, T>>,
-        flexible_requests: HashSet<Request<FlexibleKind, T>>,
+        berths: BerthContainer<T>,
+        fixed_assignments: AssignmentContainer<FixedKind, T, Assignment<FixedKind, T>>,
+        flexible_requests: RequestContainer<FlexibleKind, T>,
     ) -> Result<Self, ProblemError> {
-        for a in &fixed_assignments {
-            if !berths.contains_key(&a.berth_id()) {
+        // Every fixed assignment must reference a known berth
+        for a in fixed_assignments.iter() {
+            if !berths.contains_id(a.berth_id()) {
                 return Err(ProblemError::from(BerthNotFoundError::new(
                     a.request_id(),
                     a.berth_id(),
@@ -52,14 +52,16 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub> Problem<T> {
             }
         }
 
-        for r in &flexible_requests {
-            for bid in r.processing_times().keys() {
-                if !berths.contains_key(bid) {
-                    return Err(ProblemError::from(BerthNotFoundError::new(r.id(), *bid)));
+        // Every berth referenced by any flexible request must be known
+        for r in flexible_requests.iter() {
+            for &bid in r.processing_times().keys() {
+                if !berths.contains_id(bid) {
+                    return Err(ProblemError::from(BerthNotFoundError::new(r.id(), bid)));
                 }
             }
         }
 
+        // No fixed overlaps per-berth
         validate_no_fixed_overlaps(&fixed_assignments)?;
 
         Ok(Self {
@@ -70,17 +72,19 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub> Problem<T> {
     }
 
     #[inline]
-    pub fn berths(&self) -> &HashMap<BerthIdentifier, Berth<T>> {
+    pub fn berths(&self) -> &BerthContainer<T> {
         &self.berths
     }
 
     #[inline]
-    pub fn fixed_assignments(&self) -> &HashSet<Assignment<FixedKind, T>> {
+    pub fn fixed_assignments(
+        &self,
+    ) -> &AssignmentContainer<FixedKind, T, Assignment<FixedKind, T>> {
         &self.fixed_assignments
     }
 
     #[inline]
-    pub fn flexible_requests(&self) -> &HashSet<Request<FlexibleKind, T>> {
+    pub fn flexible_requests(&self) -> &RequestContainer<FlexibleKind, T> {
         &self.flexible_requests
     }
 
@@ -96,23 +100,25 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub> Problem<T> {
 }
 
 fn validate_no_fixed_overlaps<T: Copy + Ord + CheckedAdd + CheckedSub>(
-    fixed: &HashSet<Assignment<FixedKind, T>>,
+    fixed: &AssignmentContainer<FixedKind, T, Assignment<FixedKind, T>>,
 ) -> Result<(), AssignmentOverlapError> {
-    if fixed.len() <= 1 {
+    // Collect & sort by (berth_id, start, end)
+    let mut v: Vec<&Assignment<FixedKind, T>> = fixed.iter().collect();
+    if v.len() <= 1 {
         return Ok(());
     }
 
-    let mut sorted_assignments: Vec<_> = fixed.iter().collect();
-    sorted_assignments.sort_unstable_by(|a, b| {
+    v.sort_unstable_by(|a, b| {
         a.berth_id()
             .cmp(&b.berth_id())
             .then_with(|| a.start_time().cmp(&b.start_time()))
             .then_with(|| a.end_time().cmp(&b.end_time()))
     });
 
-    for window in sorted_assignments.windows(2) {
-        let left = window[0];
-        let right = window[1];
+    // Adjacent overlaps per berth
+    for win in v.windows(2) {
+        let left = win[0];
+        let right = win[1];
         if left.berth_id() == right.berth_id() && left.end_time() > right.start_time() {
             return Err(AssignmentOverlapError::new(
                 left.request_id(),
@@ -127,12 +133,11 @@ fn validate_no_fixed_overlaps<T: Copy + Ord + CheckedAdd + CheckedSub>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        common::{FixedKind, FlexibleKind},
-        problem::{Assignment, Berth, BerthIdentifier, ProblemError, Request, RequestIdentifier},
-    };
+    use crate::common::{FixedKind, FlexibleKind};
+    use crate::problem::berth::{Berth, BerthIdentifier};
+    use crate::problem::req::RequestIdentifier;
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::BTreeMap;
 
     #[inline]
     fn tp(v: i64) -> TimePoint<i64> {
@@ -168,7 +173,7 @@ mod tests {
         for (b, d) in pts {
             m.insert(bid(*b), td(*d));
         }
-        Request::<FixedKind, i64>::new(rid(id), iv(window.0, window.1), m).unwrap()
+        Request::<FixedKind, i64>::new(rid(id), iv(window.0, window.1), 1, m).unwrap()
     }
 
     fn req_flex(id: u32, window: (i64, i64), pts: &[(u32, i64)]) -> Request<FlexibleKind, i64> {
@@ -176,7 +181,7 @@ mod tests {
         for (b, d) in pts {
             m.insert(bid(*b), td(*d));
         }
-        Request::<FlexibleKind, i64>::new(rid(id), iv(window.0, window.1), m).unwrap()
+        Request::<FlexibleKind, i64>::new(rid(id), iv(window.0, window.1), 1, m).unwrap()
     }
 
     fn asg_fixed(
@@ -188,40 +193,40 @@ mod tests {
     }
 
     #[test]
-    fn empty_everything_is_ok() {
-        let berths: HashMap<_, _> = [].into_iter().collect();
-        let fixed: HashSet<Assignment<FixedKind, i64>> = HashSet::new();
-        let flex: HashSet<Request<FlexibleKind, i64>> = HashSet::new();
+    fn test_empty_everything_is_ok() {
+        let berths = BerthContainer::<i64>::new();
+        let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        let flex = RequestContainer::<FlexibleKind, i64>::new();
 
         let p = Problem::new(berths, fixed, flex).unwrap();
-        assert_eq!(p.berths().len(), 0);
-        assert_eq!(p.fixed_assignments().len(), 0);
-        assert_eq!(p.flexible_requests().len(), 0);
+        assert_eq!(p.berths().iter().count(), 0);
+        assert_eq!(p.fixed_assignments().iter().count(), 0);
+        assert_eq!(p.flexible_requests().iter().count(), 0);
     }
 
     #[test]
-    fn no_fixed_assignments_ok_even_with_flex() {
+    fn test_no_fixed_assignments_ok_even_with_flex() {
         let b1 = berth(1, 0, 1_000);
         let b2 = berth(2, 0, 1_000);
 
-        let mut berths = HashMap::new();
-        berths.insert(b1.id(), b1);
-        berths.insert(b2.id(), b2);
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
+        berths.insert(b2);
 
-        let fixed: HashSet<Assignment<FixedKind, i64>> = HashSet::new();
+        let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
 
         let f1 = req_flex(1, (0, 100), &[(1, 10)]);
         let f2 = req_flex(2, (50, 200), &[(2, 10)]);
-        let mut flex = HashSet::new();
+        let mut flex = RequestContainer::<FlexibleKind, i64>::new();
         flex.insert(f1);
         flex.insert(f2);
 
         let p = Problem::new(berths, fixed, flex).unwrap();
-        assert_eq!(p.flexible_requests().len(), 2);
+        assert_eq!(p.flexible_requests().iter().count(), 2);
     }
 
     #[test]
-    fn fixed_assignment_refers_to_unknown_berth_is_rejected() {
+    fn test_fixed_assignment_refers_to_unknown_berth_is_rejected() {
         // Create an assignment on berth(1), but do NOT include that berth in the set.
         let missing_berth = berth(1, 0, 100);
         let present_berth = berth(2, 0, 100);
@@ -231,13 +236,15 @@ mod tests {
 
         let a = asg_fixed(&r, &missing_berth, 0);
 
-        let mut berths = HashMap::new();
-        berths.insert(present_berth.id(), present_berth); // berth 1 intentionally omitted
+        let mut berths = BerthContainer::new();
+        berths.insert(present_berth); // berth 1 intentionally omitted
 
-        let mut fixed = HashSet::new();
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
         fixed.insert(a);
 
-        let err = Problem::new(berths, fixed, HashSet::new()).unwrap_err();
+        let flex = RequestContainer::<FlexibleKind, i64>::new();
+
+        let err = Problem::new(berths, fixed, flex).unwrap_err();
         match err {
             ProblemError::BerthNotFound(e) => {
                 assert_eq!(e.request(), rid(10));
@@ -248,18 +255,20 @@ mod tests {
     }
 
     #[test]
-    fn flexible_request_with_unknown_berth_is_rejected() {
+    fn test_flexible_request_with_unknown_berth_is_rejected() {
         // Present only berth(2)
-        let mut berths = HashMap::new();
-        let berth = berth(2, 0, 100);
-        berths.insert(berth.id(), berth);
+        let mut berths = BerthContainer::new();
+        let b = berth(2, 0, 100);
+        berths.insert(b);
 
         // Flex request that references berth(1) in its processing-time map.
         let r = req_flex(7, (0, 100), &[(1, 5)]);
-        let mut flex = HashSet::new();
+        let mut flex = RequestContainer::<FlexibleKind, i64>::new();
         flex.insert(r);
 
-        let err = Problem::new(berths, HashSet::new(), flex).unwrap_err();
+        let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+
+        let err = Problem::new(berths, fixed, flex).unwrap_err();
         match err {
             ProblemError::BerthNotFound(e) => {
                 assert_eq!(e.request(), rid(7));
@@ -270,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn touching_intervals_on_same_berth_are_ok() {
+    fn test_touching_intervals_on_same_berth_are_ok() {
         // [0,10) and [10,20) should NOT overlap
         let b1 = berth(1, 0, 1_000);
 
@@ -280,17 +289,20 @@ mod tests {
         let a = asg_fixed(&ra, &b1, 0);
         let b = asg_fixed(&rb, &b1, 10);
 
-        let mut berths = HashMap::new();
-        berths.insert(b1.id(), b1);
-        let mut fixed = HashSet::new();
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
+
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
         fixed.insert(a);
         fixed.insert(b);
 
-        let _ = Problem::new(berths, fixed, HashSet::new()).unwrap();
+        let flex = RequestContainer::<FlexibleKind, i64>::new();
+
+        let _ = Problem::new(berths, fixed, flex).unwrap();
     }
 
     #[test]
-    fn disjoint_intervals_on_same_berth_are_ok() {
+    fn test_disjoint_intervals_on_same_berth_are_ok() {
         let b1 = berth(1, 0, 1_000);
 
         let ra = req_fixed(30, (0, 1000), &[(1, 5)]);
@@ -299,17 +311,20 @@ mod tests {
         let a = asg_fixed(&ra, &b1, 0); // [0,5)
         let b = asg_fixed(&rb, &b1, 10); // [10,17)
 
-        let mut berths = HashMap::new();
-        berths.insert(b1.id(), b1);
-        let mut fixed = HashSet::new();
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
+
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
         fixed.insert(a);
         fixed.insert(b);
 
-        let _ = Problem::new(berths, fixed, HashSet::new()).unwrap();
+        let flex = RequestContainer::<FlexibleKind, i64>::new();
+
+        let _ = Problem::new(berths, fixed, flex).unwrap();
     }
 
     #[test]
-    fn overlapping_intervals_on_same_berth_are_rejected() {
+    fn test_overlapping_intervals_on_same_berth_are_rejected() {
         let b1 = berth(1, 0, 1_000);
 
         let ra = req_fixed(40, (0, 1000), &[(1, 10)]);
@@ -319,13 +334,16 @@ mod tests {
         let a = asg_fixed(&ra, &b1, 5);
         let b = asg_fixed(&rb, &b1, 10);
 
-        let mut berths = HashMap::new();
-        berths.insert(b1.id(), b1);
-        let mut fixed = HashSet::new();
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
+
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
         fixed.insert(a);
         fixed.insert(b);
 
-        let err = Problem::new(berths, fixed, HashSet::new()).unwrap_err();
+        let flex = RequestContainer::<FlexibleKind, i64>::new();
+
+        let err = Problem::new(berths, fixed, flex).unwrap_err();
         match err {
             ProblemError::FixedAssignmentOverlap(e) => {
                 let ids = [e.first(), e.second()];
@@ -336,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_on_different_berths_are_ok() {
+    fn test_overlapping_on_different_berths_are_ok() {
         let b1 = berth(1, 0, 1_000);
         let b2 = berth(2, 0, 1_000);
 
@@ -347,18 +365,21 @@ mod tests {
         let a = asg_fixed(&ra, &b1, 100); // [100,120)
         let b = asg_fixed(&rb, &b2, 100); // [100,120)
 
-        let mut berths = HashMap::new();
-        berths.insert(b1.id(), b1);
-        berths.insert(b2.id(), b2);
-        let mut fixed = HashSet::new();
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
+        berths.insert(b2);
+
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
         fixed.insert(a);
         fixed.insert(b);
 
-        let _ = Problem::new(berths, fixed, HashSet::new()).unwrap();
+        let flex = RequestContainer::<FlexibleKind, i64>::new();
+
+        let _ = Problem::new(berths, fixed, flex).unwrap();
     }
 
     #[test]
-    fn unordered_input_still_detects_overlap() {
+    fn test_unordered_input_still_detects_overlap() {
         let b1 = berth(1, 0, 1_000);
 
         let r1 = req_fixed(60, (0, 1000), &[(1, 10)]); // [50,60)
@@ -369,15 +390,18 @@ mod tests {
         let a2 = asg_fixed(&r2, &b1, 58);
         let a3 = asg_fixed(&r3, &b1, 0);
 
-        let mut fixed = HashSet::new();
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        // Intentionally insert in a jumbled order:
         fixed.insert(a2);
         fixed.insert(a3);
         fixed.insert(a1);
 
-        let mut berths = HashMap::new();
-        berths.insert(b1.id(), b1);
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
 
-        let err = Problem::new(berths, fixed, HashSet::new()).unwrap_err();
+        let flex = RequestContainer::<FlexibleKind, i64>::new();
+
+        let err = Problem::new(berths, fixed, flex).unwrap_err();
         match err {
             ProblemError::FixedAssignmentOverlap(e) => {
                 let ids = [e.first(), e.second()];
@@ -388,11 +412,12 @@ mod tests {
     }
 
     #[test]
-    fn many_non_overlapping_chain_ok() {
+    fn test_many_non_overlapping_chain_ok() {
         let b1 = berth(1, 0, 10_000);
 
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+
         // 10 sequential non-overlapping fixed assignments, each len=10, spaced by 10
-        let mut fixed = HashSet::new();
         for i in 0..10 {
             let rid_u = 100 + i;
             let start = i * 10;
@@ -400,14 +425,16 @@ mod tests {
             fixed.insert(asg_fixed(&r, &b1, start));
         }
 
-        let mut berths = HashMap::new();
-        berths.insert(b1.id(), b1);
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
 
-        let _ = Problem::new(berths, fixed, HashSet::new()).unwrap();
+        let flex = RequestContainer::<FlexibleKind, i64>::new();
+
+        let _ = Problem::new(berths, fixed, flex).unwrap();
     }
 
     #[test]
-    fn zero_length_processing_does_not_overlap() {
+    fn test_zero_length_processing_does_not_overlap() {
         // Two zero-length jobs at the same instant: [t,t) and [t,t) — OK
         let b1 = berth(1, 0, 1_000);
 
@@ -417,17 +444,20 @@ mod tests {
         let a1 = asg_fixed(&r1, &b1, 100); // [100,100)
         let a2 = asg_fixed(&r2, &b1, 100); // [100,100)
 
-        let mut berths = HashMap::new();
-        berths.insert(b1.id(), b1);
-        let mut fixed = HashSet::new();
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
+
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
         fixed.insert(a1);
         fixed.insert(a2);
 
-        let _ = Problem::new(berths, fixed, HashSet::new()).unwrap();
+        let flex = RequestContainer::<FlexibleKind, i64>::new();
+
+        let _ = Problem::new(berths, fixed, flex).unwrap();
     }
 
     #[test]
-    fn zero_length_and_nonzero_at_same_start_are_ok() {
+    fn test_zero_length_and_nonzero_at_same_start_are_ok() {
         let b1 = berth(1, 0, 1_000);
 
         let r0 = req_fixed(210, (0, 1000), &[(1, 0)]); // [100,100)
@@ -436,12 +466,15 @@ mod tests {
         let a0 = asg_fixed(&r0, &b1, 100);
         let a1 = asg_fixed(&r1, &b1, 100);
 
-        let mut berths = HashMap::new();
-        berths.insert(b1.id(), b1);
-        let mut fixed = HashSet::new();
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
+
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
         fixed.insert(a0);
         fixed.insert(a1);
 
-        let _ = Problem::new(berths, fixed, HashSet::new()).unwrap();
+        let flex = RequestContainer::<FlexibleKind, i64>::new();
+
+        let _ = Problem::new(berths, fixed, flex).unwrap();
     }
 }

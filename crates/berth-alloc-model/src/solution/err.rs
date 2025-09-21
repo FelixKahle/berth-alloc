@@ -19,16 +19,18 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::problem::{
+use crate::problem::err::{
     AssignmenStartsBeforeFeasibleWindowError, AssignmentEndsAfterFeasibleWindowError,
-    AssignmentOverlapError, BerthNotFoundError, IncomatibleBerthError, RequestIdentifier,
+    AssignmentOverlapError, BerthNotFoundError, IncomatibleBerthError,
 };
+use crate::problem::req::RequestIdentifier;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SolutionValidationError<T> {
     MissingFixed(RequestIdentifier),
     MissingFlexible(RequestIdentifier),
     ExtraFlexible(RequestIdentifier),
+    ExtraFixed(RequestIdentifier),
     UnknownBerth(BerthNotFoundError),
     Incompatible(IncomatibleBerthError),
     AssignmentStartsBeforeFeasibleWindow(AssignmenStartsBeforeFeasibleWindowError<T>),
@@ -50,6 +52,9 @@ where
             }
             SolutionValidationError::ExtraFlexible(id) => {
                 write!(f, "Extra flexible assignment for request {}", id)
+            }
+            SolutionValidationError::ExtraFixed(id) => {
+                write!(f, "Extra fixed assignment for request {}", id)
             }
             SolutionValidationError::UnknownBerth(err) => write!(f, "{}", err),
             SolutionValidationError::Incompatible(err) => write!(f, "{}", err),
