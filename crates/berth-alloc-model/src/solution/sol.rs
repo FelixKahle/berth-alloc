@@ -19,109 +19,19 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use berth_alloc_core::prelude::{Cost, TimePoint};
-use num_traits::{CheckedAdd, CheckedSub};
-use rangemap::RangeSet;
-
 use crate::{
-    common::{FixedKind, FlexibleKind, Kind},
+    common::{FixedKind, FlexibleKind},
     problem::{
         asg::{Assignment, AssignmentContainer, AssignmentRef, AssignmentView},
-        berth::{BerthContainer, BerthIdentifier},
-        err::{
-            AssignmenStartsBeforeFeasibleWindowError, AssignmentEndsAfterFeasibleWindowError,
-            AssignmentOverlapError, BerthNotFoundError, IncomatibleBerthError,
-        },
         prob::Problem,
         req::RequestIdentifier,
     },
-    solution::err::SolutionValidationError,
+    solution::SolutionError,
+    validation::StateValidator,
 };
-use std::{
-    collections::BTreeMap,
-    ops::{Mul, Range},
-};
-
-type StartIndex<T> = BTreeMap<TimePoint<T>, (TimePoint<T>, RequestIdentifier)>;
-
-#[derive(Clone, Copy)]
-struct Validated<T: Copy + Ord> {
-    rid: RequestIdentifier,
-    bid: BerthIdentifier,
-    start: TimePoint<T>,
-    end: TimePoint<T>,
-}
-
-impl<T: Copy + Ord> Validated<T> {
-    #[inline]
-    fn range(&self) -> Range<TimePoint<T>> {
-        self.start..self.end
-    }
-}
-
-#[derive(Debug, Clone)]
-struct BerthSchedule<T: Copy + Ord> {
-    occupied: RangeSet<TimePoint<T>>,
-    starts: StartIndex<T>,
-}
-
-impl<T: Copy + Ord> Default for BerthSchedule<T> {
-    #[inline]
-    fn default() -> Self {
-        Self {
-            occupied: RangeSet::new(),
-            starts: StartIndex::new(),
-        }
-    }
-}
-
-type PerBerth<T> = BTreeMap<BerthIdentifier, BerthSchedule<T>>;
-type ValidateOneResult<T> = Result<Validated<T>, SolutionValidationError<T>>;
-
-fn validate_one<K: Kind, T: Copy + Ord + CheckedAdd + CheckedSub>(
-    a: &impl AssignmentView<K, T>,
-    berths: &BerthContainer<T>,
-) -> ValidateOneResult<T> {
-    let bid = a.berth_id();
-    let rid = a.request_id();
-
-    if !berths.contains_id(bid) {
-        return Err(SolutionValidationError::UnknownBerth(
-            BerthNotFoundError::new(rid, bid),
-        ));
-    }
-
-    let req = a.request();
-    if !req.is_berth_feasible(bid) {
-        return Err(SolutionValidationError::Incompatible(
-            IncomatibleBerthError::new(rid, bid),
-        ));
-    }
-
-    let window = req.feasible_window();
-    let start = a.start_time();
-    if start < window.start() {
-        return Err(
-            SolutionValidationError::AssignmentStartsBeforeFeasibleWindow(
-                AssignmenStartsBeforeFeasibleWindowError::new(rid, window.start(), start),
-            ),
-        );
-    }
-
-    let end = a.end_time();
-    if end > window.end() {
-        return Err(SolutionValidationError::AssignmentEndsAfterFeasibleWindow(
-            AssignmentEndsAfterFeasibleWindowError::new(rid, end, window),
-        ));
-    }
-
-    Ok(Validated {
-        rid,
-        bid,
-        start,
-        end,
-    })
-}
+use berth_alloc_core::prelude::Cost;
+use num_traits::{CheckedAdd, CheckedSub};
+use std::ops::Mul;
 
 pub trait SolutionView<T>
 where
@@ -164,115 +74,6 @@ where
         let flex_cost: Cost = self.flexible_assignments().iter().map(|a| a.cost()).sum();
         fixed_cost + flex_cost
     }
-
-    #[inline]
-    fn validate(&self, prob: &Problem<T>) -> Result<(), SolutionValidationError<T>>
-    where
-        T: CheckedAdd + CheckedSub,
-    {
-        self.validate_assignment_coverage(prob)?;
-        self.validate_assignments_and_overlaps(prob)
-    }
-
-    #[inline]
-    fn validate_assignment_coverage(
-        &self,
-        prob: &Problem<T>,
-    ) -> Result<(), SolutionValidationError<T>>
-    where
-        T: CheckedAdd + CheckedSub,
-    {
-        for assignment in prob.iter_fixed_assignments() {
-            let rid = assignment.request_id();
-            if !self.fixed_assignments().contains_id(rid) {
-                return Err(SolutionValidationError::MissingFixed(rid));
-            }
-        }
-
-        for request in prob.iter_flexible_requests() {
-            let rid = request.id();
-            if !self.flexible_assignments().contains_id(rid) {
-                return Err(SolutionValidationError::MissingFlexible(rid));
-            }
-        }
-
-        for a in self.flexible_assignments().iter() {
-            let rid = a.request_id();
-            let exists_in_problem = prob.flexible_requests().iter().any(|r| r.id() == rid);
-            if !exists_in_problem {
-                return Err(SolutionValidationError::ExtraFlexible(rid));
-            }
-        }
-
-        for a in self.fixed_assignments().iter() {
-            let rid = a.request_id();
-            let exists_in_problem = prob
-                .fixed_assignments()
-                .iter()
-                .any(|r| r.request_id() == rid);
-            if !exists_in_problem {
-                return Err(SolutionValidationError::ExtraFixed(rid));
-            }
-        }
-
-        Ok(())
-    }
-
-    fn validate_assignments_and_overlaps(
-        &self,
-        prob: &Problem<T>,
-    ) -> Result<(), SolutionValidationError<T>>
-    where
-        T: CheckedAdd + CheckedSub,
-    {
-        let mut per_berth: PerBerth<T> = BTreeMap::new();
-        let mut push = |v: Validated<T>| -> Result<(), SolutionValidationError<T>> {
-            if v.start >= v.end {
-                return Ok(());
-            }
-
-            let sched = per_berth.entry(v.bid).or_default();
-            let iv = v.range();
-
-            if sched.occupied.overlaps(&iv) {
-                if let Some((_s_pred, &(e_pred, rid_pred))) =
-                    sched.starts.range(..=v.start).next_back()
-                    && e_pred > v.start
-                {
-                    return Err(SolutionValidationError::Overlap(
-                        AssignmentOverlapError::new(rid_pred, v.rid),
-                    ));
-                }
-
-                if let Some((_s_succ, &(_e_succ, rid_succ))) =
-                    sched.starts.range(v.start..v.end).next()
-                {
-                    return Err(SolutionValidationError::Overlap(
-                        AssignmentOverlapError::new(rid_succ, v.rid),
-                    ));
-                }
-
-                if let Some((_s_any, &(_e_any, rid_any))) = sched.starts.iter().next() {
-                    return Err(SolutionValidationError::Overlap(
-                        AssignmentOverlapError::new(rid_any, v.rid),
-                    ));
-                }
-            }
-
-            sched.occupied.insert(iv);
-            sched.starts.insert(v.start, (v.end, v.rid));
-            Ok(())
-        };
-
-        for a in self.fixed_assignments().iter() {
-            push(validate_one(a, prob.berths())?)?;
-        }
-        for a in self.flexible_assignments().iter() {
-            push(validate_one(a, prob.berths())?)?;
-        }
-
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -281,16 +82,25 @@ pub struct Solution<T: Copy + Ord> {
     flexible_assignments: AssignmentContainer<FlexibleKind, T, Assignment<FlexibleKind, T>>,
 }
 
-impl<T: Copy + Ord> Solution<T> {
+impl<T: Copy + Ord + CheckedAdd + CheckedSub> Solution<T> {
     #[inline]
     pub fn new(
         fixed_assignments: AssignmentContainer<FixedKind, T, Assignment<FixedKind, T>>,
         flexible_assignments: AssignmentContainer<FlexibleKind, T, Assignment<FlexibleKind, T>>,
-    ) -> Self {
-        Self {
+        problem: &Problem<T>,
+    ) -> Result<Self, SolutionError> {
+        StateValidator::validate_no_extra_fixed_assignments(&fixed_assignments)?;
+        StateValidator::validate_no_extra_flexible_assignments(&flexible_assignments)?;
+        StateValidator::validate_request_ids_unique(&fixed_assignments, &flexible_assignments)?;
+        StateValidator::validate_all_fixed_assignments_present(&fixed_assignments, problem)?;
+        StateValidator::validate_all_flexible_assignments_present(&flexible_assignments, problem)?;
+        StateValidator::validate_no_extra_fixed_requests(&fixed_assignments, problem)?;
+        StateValidator::validate_no_extra_flexible_requests(&flexible_assignments, problem)?;
+
+        Ok(Self {
             fixed_assignments,
             flexible_assignments,
-        }
+        })
     }
 
     #[inline]
@@ -314,7 +124,11 @@ impl<T: Copy + Ord> Solution<T> {
                         AssignmentRef<'_, '_, FlexibleKind, T>,
                     >>();
 
-        SolutionRef::new(fixed, flex)
+        // Skip validation here; it was done when creating the original Solution
+        SolutionRef {
+            fixed_assignments: fixed,
+            flexible_assignments: flex,
+        }
     }
 }
 
@@ -340,7 +154,7 @@ pub struct SolutionRef<'p, T: Copy + Ord> {
         AssignmentContainer<FlexibleKind, T, AssignmentRef<'p, 'p, FlexibleKind, T>>,
 }
 
-impl<'p, T: Copy + Ord> SolutionRef<'p, T> {
+impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub> SolutionRef<'p, T> {
     #[inline]
     pub fn new(
         fixed_assignments: AssignmentContainer<FixedKind, T, AssignmentRef<'p, 'p, FixedKind, T>>,
@@ -349,11 +163,20 @@ impl<'p, T: Copy + Ord> SolutionRef<'p, T> {
             T,
             AssignmentRef<'p, 'p, FlexibleKind, T>,
         >,
-    ) -> Self {
-        Self {
+        problem: &'p Problem<T>,
+    ) -> Result<Self, SolutionError> {
+        StateValidator::validate_no_extra_fixed_assignments(&fixed_assignments)?;
+        StateValidator::validate_no_extra_flexible_assignments(&flexible_assignments)?;
+        StateValidator::validate_request_ids_unique(&fixed_assignments, &flexible_assignments)?;
+        StateValidator::validate_all_fixed_assignments_present(&fixed_assignments, problem)?;
+        StateValidator::validate_all_flexible_assignments_present(&flexible_assignments, problem)?;
+        StateValidator::validate_no_extra_fixed_requests(&fixed_assignments, problem)?;
+        StateValidator::validate_no_extra_flexible_requests(&flexible_assignments, problem)?;
+
+        Ok(Self {
             fixed_assignments,
             flexible_assignments,
-        }
+        })
     }
 
     #[inline]
@@ -373,7 +196,11 @@ impl<'p, T: Copy + Ord> SolutionRef<'p, T> {
             .map(|a| a.to_owned())
             .collect::<AssignmentContainer<FlexibleKind, T, Assignment<FlexibleKind, T>>>();
 
-        Solution::new(fixed, flex)
+        // Skip validation here; it was done when creating the original SolutionRef
+        Solution {
+            fixed_assignments: fixed,
+            flexible_assignments: flex,
+        }
     }
 
     #[inline]
@@ -411,10 +238,12 @@ mod tests {
             prob::Problem,
             req::{Request, RequestContainer, RequestIdentifier},
         },
+        validation::{StateValidator, err::CrossValidationError},
     };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
     use std::collections::BTreeMap;
 
+    // ---------- small helpers ----------
     #[inline]
     fn tp(v: i64) -> TimePoint<i64> {
         TimePoint::new(v)
@@ -472,8 +301,10 @@ mod tests {
         Assignment::<FlexibleKind, i64>::new_flexible(r.clone(), b.clone(), tp(start)).unwrap()
     }
 
+    // ---------- Solution::new() constructor validations ----------
+
     #[test]
-    fn test_validate_ok_basic() {
+    fn solution_new_ok_basic() {
         let b1 = mk_berth(1, 0, 200);
         let b2 = mk_berth(2, 0, 200);
 
@@ -485,6 +316,7 @@ mod tests {
         let rx = req_flex(21, (0, 100), &[(2, 10)]);
         let ax = asg_flex(&rx, &b2, 0);
 
+        // Problem definition
         let mut berths = BerthContainer::new();
         berths.insert(b1.clone());
         berths.insert(b2.clone());
@@ -498,18 +330,19 @@ mod tests {
 
         let prob = Problem::new(berths, prob_fixed, prob_flex).unwrap();
 
+        // Candidate solution
         let mut s_fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
         s_fixed.insert(af);
         let mut s_flex =
             AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
         s_flex.insert(ax);
 
-        let sol = Solution::new(s_fixed, s_flex);
-        sol.as_ref().validate(&prob).unwrap();
+        // Should construct fine
+        let _sol = Solution::new(s_fixed, s_flex, &prob).expect("valid solution");
     }
 
     #[test]
-    fn test_missing_fixed_is_reported() {
+    fn solution_new_missing_fixed_is_err() {
         let b1 = mk_berth(1, 0, 200);
 
         let rf = req_fixed(1, (0, 50), &[(1, 5)]);
@@ -524,41 +357,38 @@ mod tests {
 
         let prob = Problem::new(berths, fixed_in_prob, RequestContainer::new()).unwrap();
 
-        let sol = Solution::<i64>::new(AssignmentContainer::new(), AssignmentContainer::new());
-        let err = sol.as_ref().validate(&prob).unwrap_err();
-        match err {
-            SolutionValidationError::MissingFixed(id) => assert_eq!(id, rid(1)),
-            other => panic!("expected MissingFixed, got {other}"),
-        }
+        // Solution misses the fixed requirement
+        let s_fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        let s_flex = AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
+
+        assert!(Solution::new(s_fixed, s_flex, &prob).is_err());
     }
 
     #[test]
-    fn test_missing_flexible_is_reported() {
+    fn solution_new_missing_flexible_is_err() {
         let b1 = mk_berth(1, 0, 200);
 
         let rx = req_flex(2, (0, 50), &[(1, 5)]);
+        let mut flex_in_prob = RequestContainer::<FlexibleKind, i64>::new();
+        flex_in_prob.insert(rx);
 
         let mut berths = BerthContainer::new();
         berths.insert(b1);
 
-        let mut flex_in_prob = RequestContainer::<FlexibleKind, i64>::new();
-        flex_in_prob.insert(rx);
-
         let prob = Problem::new(berths, AssignmentContainer::new(), flex_in_prob).unwrap();
 
-        let sol = Solution::<i64>::new(AssignmentContainer::new(), AssignmentContainer::new());
-        let err = sol.as_ref().validate(&prob).unwrap_err();
-        match err {
-            SolutionValidationError::MissingFlexible(id) => assert_eq!(id, rid(2)),
-            other => panic!("expected MissingFlexible, got {other}"),
-        }
+        // Solution misses the flexible requirement
+        let s_fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        let s_flex = AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
+
+        assert!(Solution::new(s_fixed, s_flex, &prob).is_err());
     }
 
     #[test]
-    fn test_extra_flexible_is_reported() {
+    fn solution_new_extra_flexible_request_is_err() {
         let b1 = mk_berth(1, 0, 200);
 
-        // The only required flexible in the problem:
+        // The only flexible in the problem:
         let r_req = req_flex(10, (0, 50), &[(1, 5)]);
 
         let mut berths = BerthContainer::new();
@@ -569,47 +399,81 @@ mod tests {
 
         let prob = Problem::new(berths, AssignmentContainer::new(), flex_in_prob).unwrap();
 
-        // Solution assigns the required one AND an extra one (id 11) → ExtraFlexible
+        // Solution includes required one AND an extra (id 11) → should fail constructor
         let a_req = asg_flex(&r_req, &b1, 0);
         let r_extra = req_flex(11, (0, 50), &[(1, 5)]);
         let a_extra = asg_flex(&r_extra, &b1, 10);
 
+        let s_fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
         let mut s_flex =
             AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
         s_flex.insert(a_req);
         s_flex.insert(a_extra);
 
-        let sol = Solution::new(AssignmentContainer::new(), s_flex);
-        let err = sol.as_ref().validate(&prob).unwrap_err();
+        assert!(Solution::new(s_fixed, s_flex, &prob).is_err());
+    }
+
+    // ---------- Cross-assignment feasibility (non-overlap & berth existence) ----------
+
+    #[test]
+    fn nonoverlap_unknown_berth_is_reported() {
+        // Problem knows only berth 1, but solution uses berth 2.
+        let b_known = mk_berth(1, 0, 1000);
+        let b_unknown = mk_berth(2, 0, 1000);
+
+        let r_fix = req_fixed(5, (0, 100), &[(2, 10)]); // request supports berth 2
+        let a_fix = asg_fixed(&r_fix, &b_unknown, 0);
+
+        let mut berths = BerthContainer::new();
+        berths.insert(b_known); // berth 2 NOT inserted into problem
+
+        let prob = Problem::new(
+            berths,
+            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
+            RequestContainer::<FlexibleKind, i64>::new(),
+        )
+        .unwrap();
+
+        let mut fixed_solution =
+            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        fixed_solution.insert(a_fix);
+
+        let flex_solution =
+            AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
+
+        let err = StateValidator::validate_nonoverlap(&fixed_solution, &flex_solution, &prob)
+            .unwrap_err();
+
         match err {
-            SolutionValidationError::ExtraFlexible(id) => assert_eq!(id, rid(11)),
-            other => panic!("expected ExtraFlexible, got {other}"),
+            CrossValidationError::UnknownBerth(e) => {
+                assert_eq!(e.request(), rid(5));
+                assert_eq!(e.requested_berth(), bid(2));
+            }
+            other => panic!("expected UnknownBerth, got {other}"),
         }
     }
 
     #[test]
-    fn test_overlap_across_fixed_and_flexible_is_reported() {
-        let b1 = mk_berth(1, 0, 200);
+    fn nonoverlap_reports_overlap_between_fixed_and_flexible_on_same_berth() {
+        let b1 = mk_berth(1, 0, 1000);
 
-        // fixed req id=30 on b1, len=10, start=0 -> [0,10)
+        // fixed rid=30 on b1, len=10, start=0 -> [0,10)
         let rf = req_fixed(30, (0, 100), &[(1, 10)]);
         let af = asg_fixed(&rf, &b1, 0);
 
-        // flex req id=31 on b1, len=10, start=5 -> [5,15) overlaps
+        // flex rid=31 on b1, len=10, start=5 -> [5,15) overlaps
         let rx = req_flex(31, (0, 100), &[(1, 10)]);
         let ax = asg_flex(&rx, &b1, 5);
 
         let mut berths = BerthContainer::new();
         berths.insert(b1);
 
-        let mut fixed_in_prob =
-            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
-        fixed_in_prob.insert(af.clone());
-
-        let mut flex_in_prob = RequestContainer::<FlexibleKind, i64>::new();
-        flex_in_prob.insert(rx.clone());
-
-        let prob = Problem::new(berths, fixed_in_prob, flex_in_prob).unwrap();
+        let prob = Problem::new(
+            berths,
+            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
+            RequestContainer::<FlexibleKind, i64>::new(),
+        )
+        .unwrap();
 
         let mut s_fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
         s_fixed.insert(af);
@@ -617,10 +481,9 @@ mod tests {
             AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
         s_flex.insert(ax);
 
-        let sol = Solution::new(s_fixed, s_flex);
-        let err = sol.as_ref().validate(&prob).unwrap_err();
+        let err = StateValidator::validate_nonoverlap(&s_fixed, &s_flex, &prob).unwrap_err();
         match err {
-            SolutionValidationError::Overlap(e) => {
+            CrossValidationError::Overlap(e) => {
                 let a = e.first();
                 let b = e.second();
                 assert!([rid(30), rid(31)].contains(&a));
@@ -632,41 +495,299 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_berth_on_fixed_is_reported_even_if_request_id_matches() {
-        // Problem only knows berth 1
-        let b1 = mk_berth(1, 0, 200);
+    fn nonoverlap_ok_same_berth_back_to_back() {
+        let b1 = mk_berth(1, 0, 1000);
 
-        // Problem's fixed requirement (id=40) scheduled on b1
-        let rf_prob = req_fixed(40, (0, 100), &[(1, 5)]);
-        let af_prob = asg_fixed(&rf_prob, &b1, 0);
+        // Two assignments on the same berth touching at boundary: [0,10) and [10,20)
+        let r1 = req_fixed(101, (0, 100), &[(1, 10)]);
+        let r2 = req_flex(102, (0, 100), &[(1, 10)]);
 
+        let a1 = asg_fixed(&r1, &b1, 0);
+        let a2 = asg_flex(&r2, &b1, 10);
+
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
+
+        let prob = Problem::new(
+            berths,
+            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
+            RequestContainer::<FlexibleKind, i64>::new(),
+        )
+        .unwrap();
+
+        let mut s_fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        s_fixed.insert(a1);
+        let mut s_flex =
+            AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
+        s_flex.insert(a2);
+
+        StateValidator::validate_nonoverlap(&s_fixed, &s_flex, &prob).unwrap();
+    }
+
+    #[test]
+    fn nonoverlap_ok_same_time_different_berths() {
+        let b1 = mk_berth(1, 0, 1000);
+        let b2 = mk_berth(2, 0, 1000);
+
+        // Same time window but different berths: OK.
+        let r1 = req_fixed(201, (0, 100), &[(1, 10)]);
+        let r2 = req_flex(202, (0, 100), &[(2, 10)]);
+
+        let a1 = asg_fixed(&r1, &b1, 0);
+        let a2 = asg_flex(&r2, &b2, 0);
+
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
+        berths.insert(b2);
+
+        let prob = Problem::new(
+            berths,
+            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
+            RequestContainer::<FlexibleKind, i64>::new(),
+        )
+        .unwrap();
+
+        let mut s_fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        s_fixed.insert(a1);
+        let mut s_flex =
+            AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
+        s_flex.insert(a2);
+
+        StateValidator::validate_nonoverlap(&s_fixed, &s_flex, &prob).unwrap();
+    }
+
+    #[test]
+    fn nonoverlap_ignores_zero_length_intervals() {
+        // zero-length [10,10) must be ignored.
+        let b1 = mk_berth(1, 0, 1000);
+
+        let r_zero = req_fixed(301, (0, 100), &[(1, 0)]); // pt = 0
+        let r_norm = req_flex(302, (0, 100), &[(1, 10)]);
+
+        let a_zero = asg_fixed(&r_zero, &b1, 10); // [10,10)
+        let a_norm = asg_flex(&r_norm, &b1, 0); // [0,10)
+
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
+
+        let prob = Problem::new(
+            berths,
+            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
+            RequestContainer::<FlexibleKind, i64>::new(),
+        )
+        .unwrap();
+
+        let mut s_fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        s_fixed.insert(a_zero);
+        let mut s_flex =
+            AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
+        s_flex.insert(a_norm);
+
+        StateValidator::validate_nonoverlap(&s_fixed, &s_flex, &prob).unwrap();
+    }
+
+    // ---------- Incremental check: validate_nooverlap_with ----------
+
+    #[test]
+    fn nooverlap_with_unknown_berth() {
+        let b1 = mk_berth(1, 0, 1000);
         let mut berths = BerthContainer::new();
         berths.insert(b1.clone());
 
-        let mut fixed_in_prob =
-            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
-        fixed_in_prob.insert(af_prob);
+        let prob = Problem::new(
+            berths,
+            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
+            RequestContainer::<FlexibleKind, i64>::new(),
+        )
+        .unwrap();
 
-        // No flexible requirements in the problem here
-        let prob = Problem::new(berths, fixed_in_prob, RequestContainer::new()).unwrap();
+        // Candidate on berth 2 which is not in problem
+        let b2 = mk_berth(2, 0, 1000);
+        let r = req_fixed(900, (0, 100), &[(2, 10)]);
+        let cand = asg_fixed(&r, &b2, 0);
 
-        // Solution provides a *different* assignment for the *same request id* 40,
-        // but on an unknown berth 3.
-        let b3 = mk_berth(3, 0, 200);
-        let rf_sol = req_fixed(40, (0, 100), &[(3, 5)]); // note: maps to berth 3
-        let af_sol = asg_fixed(&rf_sol, &b3, 10);
+        let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        let flex = AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
 
-        let mut s_fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
-        s_fixed.insert(af_sol);
+        let err = StateValidator::validate_nooverlap_with::<_, FixedKind, _, _, _>(
+            &fixed, &flex, &prob, &cand,
+        )
+        .unwrap_err();
 
-        let sol = Solution::new(s_fixed, AssignmentContainer::new());
-        let err = sol.as_ref().validate(&prob).unwrap_err();
         match err {
-            SolutionValidationError::UnknownBerth(e) => {
-                assert_eq!(e.request(), rid(40));
-                assert_eq!(e.requested_berth(), bid(3));
+            CrossValidationError::UnknownBerth(e) => {
+                assert_eq!(e.request(), rid(900));
+                assert_eq!(e.requested_berth(), bid(2));
             }
             other => panic!("expected UnknownBerth, got {other}"),
         }
+    }
+
+    #[test]
+    fn nooverlap_with_detects_overlap_against_fixed() {
+        // Existing fixed: [0,10) on berth 1. Candidate overlaps: [5,15) on berth 1.
+        let b1 = mk_berth(1, 0, 1000);
+        let mut berths = BerthContainer::new();
+        berths.insert(b1.clone());
+
+        let rf = req_fixed(11, (0, 100), &[(1, 10)]);
+        let af = asg_fixed(&rf, &b1, 0);
+
+        let prob = Problem::new(
+            berths,
+            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
+            RequestContainer::<FlexibleKind, i64>::new(),
+        )
+        .unwrap();
+
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        fixed.insert(af);
+
+        let flex = AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
+
+        let rx = req_flex(12, (0, 100), &[(1, 10)]);
+        let cand = asg_flex(&rx, &b1, 5);
+
+        let err = StateValidator::validate_nooverlap_with::<_, FlexibleKind, _, _, _>(
+            &fixed, &flex, &prob, &cand,
+        )
+        .unwrap_err();
+
+        match err {
+            CrossValidationError::Overlap(e) => {
+                assert_eq!(e.first(), rid(11));
+                assert_eq!(e.second(), rid(12));
+            }
+            other => panic!("expected Overlap, got {other}"),
+        }
+    }
+
+    #[test]
+    fn nooverlap_with_ok_back_to_back() {
+        // Existing fixed: [0,10) on berth 1. Candidate: [10,20) on berth 1 → OK.
+        let b1 = mk_berth(1, 0, 1000);
+        let mut berths = BerthContainer::new();
+        berths.insert(b1.clone());
+
+        let rf = req_fixed(21, (0, 100), &[(1, 10)]);
+        let af = asg_fixed(&rf, &b1, 0);
+
+        let prob = Problem::new(
+            berths,
+            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
+            RequestContainer::<FlexibleKind, i64>::new(),
+        )
+        .unwrap();
+
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        fixed.insert(af);
+
+        let flex = AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
+
+        let rx = req_flex(22, (0, 100), &[(1, 10)]);
+        let cand = asg_flex(&rx, &b1, 10);
+
+        StateValidator::validate_nooverlap_with::<_, FlexibleKind, _, _, _>(
+            &fixed, &flex, &prob, &cand,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn nooverlap_with_ok_different_berth_same_time() {
+        // Existing fixed on berth 1; candidate on berth 2, same time → OK.
+        let b1 = mk_berth(1, 0, 1000);
+        let b2 = mk_berth(2, 0, 1000);
+
+        let mut berths = BerthContainer::new();
+        berths.insert(b1.clone());
+        berths.insert(b2.clone());
+
+        let rf = req_fixed(31, (0, 100), &[(1, 10)]);
+        let af = asg_fixed(&rf, &b1, 0);
+
+        let prob = Problem::new(
+            berths,
+            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
+            RequestContainer::<FlexibleKind, i64>::new(),
+        )
+        .unwrap();
+
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        fixed.insert(af);
+
+        let flex = AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
+
+        let rx = req_flex(32, (0, 100), &[(2, 10)]);
+        let cand = asg_flex(&rx, &b2, 0);
+
+        StateValidator::validate_nooverlap_with::<_, FlexibleKind, _, _, _>(
+            &fixed, &flex, &prob, &cand,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn nooverlap_with_ignores_zero_length_candidate() {
+        // Candidate has zero processing time → ignored.
+        let b1 = mk_berth(1, 0, 1000);
+        let mut berths = BerthContainer::new();
+        berths.insert(b1.clone());
+
+        let rf = req_fixed(41, (0, 100), &[(1, 10)]);
+        let af = asg_fixed(&rf, &b1, 0);
+
+        let prob = Problem::new(
+            berths,
+            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
+            RequestContainer::<FlexibleKind, i64>::new(),
+        )
+        .unwrap();
+
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        fixed.insert(af);
+
+        let flex = AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
+
+        let r_zero = req_flex(42, (0, 100), &[(1, 0)]); // pt = 0
+        let cand = asg_flex(&r_zero, &b1, 5); // [5,5)
+
+        StateValidator::validate_nooverlap_with::<_, FlexibleKind, _, _, _>(
+            &fixed, &flex, &prob, &cand,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn nooverlap_with_skips_same_request_id() {
+        // Existing assignment rid=55 on berth 1; candidate has same rid=55 overlapping.
+        // No error here; duplicates are handled by the other validators.
+        let b1 = mk_berth(1, 0, 1000);
+        let mut berths = BerthContainer::new();
+        berths.insert(b1.clone());
+
+        let r_fix = req_fixed(55, (0, 100), &[(1, 10)]);
+        let a_existing = asg_fixed(&r_fix, &b1, 0);
+
+        let prob = Problem::new(
+            berths,
+            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
+            RequestContainer::<FlexibleKind, i64>::new(),
+        )
+        .unwrap();
+
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        fixed.insert(a_existing);
+
+        let flex = AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
+
+        // Same request id, overlapping time
+        let r_same = req_fixed(55, (0, 100), &[(1, 10)]);
+        let cand = asg_fixed(&r_same, &b1, 5);
+
+        StateValidator::validate_nooverlap_with::<_, FixedKind, _, _, _>(
+            &fixed, &flex, &prob, &cand,
+        )
+        .unwrap();
     }
 }

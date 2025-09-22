@@ -19,28 +19,64 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use berth_alloc_model::{prelude::RequestIdentifier, problem::err::AssignmentError};
+use berth_alloc_model::{
+    prelude::{
+        CrossValidationError, ExtraFlexibleAssignmentError, ExtraFlexibleRequestError,
+        RequestIdNotUniqueError, RequestIdentifier,
+    },
+    problem::err::AssignmentError,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum LedgerComitError<T> {
+pub enum LedgerCommitError<T> {
     Assignment(AssignmentError<T>),
-    AlreadyCommitted(RequestIdentifier),
+    CrossValidation(CrossValidationError),
+    ExtraFlexibleAssignment(ExtraFlexibleAssignmentError),
+    ExtraFlexibleRequest(ExtraFlexibleRequestError),
+    RequestIdNotUnique(RequestIdNotUniqueError),
 }
 
-impl<T: std::fmt::Display> std::fmt::Display for LedgerComitError<T> {
+impl<T: std::fmt::Display> std::fmt::Display for LedgerCommitError<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Assignment(e) => write!(f, "{}", e),
-            Self::AlreadyCommitted(id) => write!(f, "Request {id} is already committed"),
+            Self::CrossValidation(e) => write!(f, "{}", e),
+            Self::ExtraFlexibleAssignment(e) => write!(f, "{}", e),
+            Self::ExtraFlexibleRequest(e) => write!(f, "{}", e),
+            Self::RequestIdNotUnique(e) => write!(f, "{}", e),
         }
     }
 }
 
-impl<T: std::fmt::Display + std::fmt::Debug> std::error::Error for LedgerComitError<T> {}
+impl<T: std::fmt::Display + std::fmt::Debug> std::error::Error for LedgerCommitError<T> {}
 
-impl<T> From<AssignmentError<T>> for LedgerComitError<T> {
-    fn from(value: AssignmentError<T>) -> Self {
-        Self::Assignment(value)
+impl<T> From<AssignmentError<T>> for LedgerCommitError<T> {
+    fn from(err: AssignmentError<T>) -> Self {
+        LedgerCommitError::Assignment(err)
+    }
+}
+
+impl<T> From<CrossValidationError> for LedgerCommitError<T> {
+    fn from(err: CrossValidationError) -> Self {
+        LedgerCommitError::CrossValidation(err)
+    }
+}
+
+impl<T> From<ExtraFlexibleAssignmentError> for LedgerCommitError<T> {
+    fn from(err: ExtraFlexibleAssignmentError) -> Self {
+        LedgerCommitError::ExtraFlexibleAssignment(err)
+    }
+}
+
+impl<T> From<ExtraFlexibleRequestError> for LedgerCommitError<T> {
+    fn from(err: ExtraFlexibleRequestError) -> Self {
+        LedgerCommitError::ExtraFlexibleRequest(err)
+    }
+}
+
+impl<T> From<RequestIdNotUniqueError> for LedgerCommitError<T> {
+    fn from(err: RequestIdNotUniqueError) -> Self {
+        LedgerCommitError::RequestIdNotUnique(err)
     }
 }
 

@@ -19,11 +19,13 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::registry::err::{LedgerComitError, LedgerUncomitError};
+use crate::registry::err::{LedgerCommitError, LedgerUncomitError};
 use berth_alloc_core::prelude::TimePoint;
 use berth_alloc_model::{
     common::{FixedKind, FlexibleKind},
-    prelude::{Assignment, AssignmentContainer, Berth, Problem, Request, RequestContainer},
+    prelude::{
+        Assignment, AssignmentContainer, Berth, Problem, Request, RequestContainer, StateValidator,
+    },
     problem::asg::{AssignmentRef, AssignmentView},
 };
 use num_traits::{CheckedAdd, CheckedSub};
@@ -77,17 +79,34 @@ impl<'p, T: Copy + Ord> Ledger<'p, T> {
         request: &'p Request<FlexibleKind, T>,
         berth: &'p Berth<T>,
         start_time: TimePoint<T>,
-    ) -> Result<AssignmentRef<'p, 'p, FlexibleKind, T>, LedgerComitError<T>>
+    ) -> Result<AssignmentRef<'p, 'p, FlexibleKind, T>, LedgerCommitError<T>>
     where
         T: CheckedAdd + CheckedSub,
     {
         let assignment = AssignmentRef::new(request, berth, start_time)?;
-        if self.commited.contains_assignment(&assignment) {
-            Err(LedgerComitError::AlreadyCommitted(request.id()))
-        } else {
-            self.commited.insert(assignment);
-            Ok(assignment)
-        }
+        StateValidator::validate_nooverlap_with(
+            self.problem().fixed_assignments(),
+            self.commited_assignments(),
+            self.problem(),
+            &assignment,
+        )?;
+        StateValidator::validate_no_extra_flexible_assignments_with(
+            self.commited_assignments(),
+            &assignment,
+        )?;
+        StateValidator::validate_request_ids_unique_with(
+            self.problem().fixed_assignments(),
+            self.commited_assignments(),
+            &assignment,
+        )?;
+        StateValidator::validate_no_extra_flexible_requests_with(
+            self.commited_assignments(),
+            self.problem(),
+            &assignment,
+        )?;
+
+        self.commited.insert(assignment);
+        Ok(assignment)
     }
 
     #[inline]
@@ -117,11 +136,14 @@ impl<'p, T: Copy + Ord> Ledger<'p, T> {
     }
 
     #[inline]
-    pub fn iter_assigned_requests(&self) -> impl Iterator<Item = &Request<FlexibleKind, T>>
+    pub fn iter_assigned_requests(&self) -> impl Iterator<Item = &'p Request<FlexibleKind, T>>
     where
         T: CheckedAdd + CheckedSub,
     {
-        self.commited.iter().map(|a| a.request())
+        self.problem()
+            .flexible_requests()
+            .iter()
+            .filter(move |r| self.commited.contains_id(r.id()))
     }
 
     #[inline]
@@ -254,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn test_double_commit_returns_already_committed() {
+    fn test_double_commit_returns_duplicate_flexible_error() {
         let prob = problem_one_berth_two_flex();
         let mut ledger = Ledger::new(&prob);
 
@@ -265,8 +287,11 @@ mod tests {
 
         let err = ledger.commit_assignment(req, b, tp(20)).unwrap_err();
         match err {
-            LedgerComitError::AlreadyCommitted(id) => assert_eq!(id, rid(1)),
-            other => panic!("expected AlreadyCommitted, got {other:?}"),
+            LedgerCommitError::ExtraFlexibleAssignment(e) => {
+                // ensure the validator surfaces the right rid
+                assert_eq!(e.request_id(), rid(1));
+            }
+            other => panic!("expected ExtraFlexible, got {other:?}"),
         }
     }
 
@@ -290,6 +315,12 @@ mod tests {
 
         let res = ledger.commit_assignment(req, b, tp(0));
         assert!(res.is_err(), "expected commit to error for invalid timing");
+        // Optionally assert variant:
+        if let Err(LedgerCommitError::Assignment(_)) = res {
+            // ok
+        } else {
+            panic!("expected InvalidAssignment variant");
+        }
     }
 
     #[test]

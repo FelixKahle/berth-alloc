@@ -292,6 +292,11 @@ impl<'r, 'b, K: Kind, T: Ord + Copy + CheckedSub + CheckedAdd> AssignmentRef<'r,
     }
 
     #[inline]
+    pub fn berth(&self) -> &'b Berth<T> {
+        self.berth
+    }
+
+    #[inline]
     pub fn to_owned(&self) -> Assignment<K, T> {
         Assignment {
             request: self.request.clone(),

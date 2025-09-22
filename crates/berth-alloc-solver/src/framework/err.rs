@@ -20,13 +20,16 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    registry::err::{LedgerComitError, LedgerUncomitError},
+    registry::err::{LedgerCommitError, LedgerUncomitError},
     terminal::err::{TerminalApplyError, TerminalUpdateError},
 };
 use berth_alloc_core::prelude::TimeInterval;
 use berth_alloc_model::{
-    prelude::{BerthIdentifier, RequestIdentifier},
-    problem::err::{AssignmentError, AssignmentOverlapError},
+    prelude::{
+        BerthIdentifier, CrossValidationError, ExtraFlexibleAssignmentError,
+        ExtraFlexibleRequestError, MissingFlexibleAssignmentError, RequestIdNotUniqueError,
+    },
+    problem::err::AssignmentError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -85,7 +88,7 @@ impl<T: std::fmt::Debug + std::fmt::Display> std::error::Error for BerthNotFreeE
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProposeAssignmentError<T> {
-    Ledger(LedgerComitError<T>),
+    Ledger(LedgerCommitError<T>),
     Terminal(TerminalUpdateError<T>),
     NotFree(BerthNotFreeError<T>),
 }
@@ -102,8 +105,8 @@ impl<T: std::fmt::Display> std::fmt::Display for ProposeAssignmentError<T> {
 
 impl<T: std::fmt::Debug + std::fmt::Display> std::error::Error for ProposeAssignmentError<T> {}
 
-impl<T> From<LedgerComitError<T>> for ProposeAssignmentError<T> {
-    fn from(err: LedgerComitError<T>) -> Self {
+impl<T> From<LedgerCommitError<T>> for ProposeAssignmentError<T> {
+    fn from(err: LedgerCommitError<T>) -> Self {
         ProposeAssignmentError::Ledger(err)
     }
 }
@@ -122,7 +125,7 @@ impl<T> From<BerthNotFreeError<T>> for ProposeAssignmentError<T> {
 
 impl<T> From<AssignmentError<T>> for ProposeAssignmentError<T> {
     fn from(err: AssignmentError<T>) -> Self {
-        ProposeAssignmentError::Ledger(LedgerComitError::from(err))
+        ProposeAssignmentError::Ledger(LedgerCommitError::from(err))
     }
 }
 
@@ -156,88 +159,162 @@ impl<T> From<TerminalUpdateError<T>> for ProposeUnassignmentError<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct UnassignedRequestError {
-    id: RequestIdentifier,
+pub enum IncompleteSolverStatePlanApplyError<T> {
+    CrossValidation(CrossValidationError),
+    ExtraFlexibleAssignment(ExtraFlexibleAssignmentError),
+    ExtraFlexibleRequest(ExtraFlexibleRequestError),
+    RequestIdNotUnique(RequestIdNotUniqueError),
+    TerminalApply(TerminalApplyError<T>),
 }
 
-impl UnassignedRequestError {
-    #[inline]
-    pub fn new(id: RequestIdentifier) -> Self {
-        Self { id }
-    }
-
-    #[inline]
-    pub fn id(&self) -> RequestIdentifier {
-        self.id
-    }
-}
-
-impl std::fmt::Display for UnassignedRequestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Request {} is not assigned", self.id)
-    }
-}
-
-impl std::error::Error for UnassignedRequestError {}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct UnassignedRequestsError {
-    errors: Vec<UnassignedRequestError>,
-}
-
-impl UnassignedRequestsError {
-    #[inline]
-    pub fn new(errors: Vec<UnassignedRequestError>) -> Self {
-        Self { errors }
-    }
-
-    #[inline]
-    pub fn errors(&self) -> &[UnassignedRequestError] {
-        &self.errors
-    }
-}
-
-impl std::fmt::Display for UnassignedRequestsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let ids: Vec<String> = self.errors.iter().map(|e| e.id().to_string()).collect();
-        write!(f, "Requests not assigned: {}", ids.join(", "))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FeasibilityError<T> {
-    Unassigned(UnassignedRequestsError),
-    Overlap(AssignmentOverlapError),
-    Terminal(TerminalApplyError<T>),
-}
-
-impl<T: std::fmt::Display> std::fmt::Display for FeasibilityError<T> {
+impl<T: std::fmt::Display> std::fmt::Display for IncompleteSolverStatePlanApplyError<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FeasibilityError::Unassigned(e) => write!(f, "{e}"),
-            FeasibilityError::Overlap(e) => write!(f, "{e}"),
-            FeasibilityError::Terminal(e) => write!(f, "{e}"),
+            IncompleteSolverStatePlanApplyError::CrossValidation(e) => write!(f, "{}", e),
+            IncompleteSolverStatePlanApplyError::ExtraFlexibleAssignment(e) => write!(f, "{}", e),
+            IncompleteSolverStatePlanApplyError::ExtraFlexibleRequest(e) => write!(f, "{}", e),
+            IncompleteSolverStatePlanApplyError::RequestIdNotUnique(e) => write!(f, "{}", e),
+            IncompleteSolverStatePlanApplyError::TerminalApply(e) => write!(f, "{}", e),
         }
     }
 }
 
-impl<T: std::fmt::Debug + std::fmt::Display> std::error::Error for FeasibilityError<T> {}
+impl<T: std::fmt::Display + std::fmt::Debug> std::error::Error
+    for IncompleteSolverStatePlanApplyError<T>
+{
+}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl<T> From<CrossValidationError> for IncompleteSolverStatePlanApplyError<T> {
+    fn from(err: CrossValidationError) -> Self {
+        IncompleteSolverStatePlanApplyError::CrossValidation(err)
+    }
+}
+
+impl<T> From<ExtraFlexibleRequestError> for IncompleteSolverStatePlanApplyError<T> {
+    fn from(err: ExtraFlexibleRequestError) -> Self {
+        IncompleteSolverStatePlanApplyError::ExtraFlexibleRequest(err)
+    }
+}
+
+impl<T> From<ExtraFlexibleAssignmentError> for IncompleteSolverStatePlanApplyError<T> {
+    fn from(err: ExtraFlexibleAssignmentError) -> Self {
+        IncompleteSolverStatePlanApplyError::ExtraFlexibleAssignment(err)
+    }
+}
+
+impl<T> From<RequestIdNotUniqueError> for IncompleteSolverStatePlanApplyError<T> {
+    fn from(err: RequestIdNotUniqueError) -> Self {
+        IncompleteSolverStatePlanApplyError::RequestIdNotUnique(err)
+    }
+}
+
+impl<T> From<TerminalApplyError<T>> for IncompleteSolverStatePlanApplyError<T> {
+    fn from(err: TerminalApplyError<T>) -> Self {
+        IncompleteSolverStatePlanApplyError::TerminalApply(err)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FeasibilityError {
+    CrossValidation(CrossValidationError),
+    MissingFlexibleAssignment(MissingFlexibleAssignmentError),
+    ExtraFlexibleAssignment(ExtraFlexibleAssignmentError),
+    ExtraFlexibleRequest(ExtraFlexibleRequestError),
+    RequestIdNotUnique(RequestIdNotUniqueError),
+}
+
+impl std::fmt::Display for FeasibilityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FeasibilityError::CrossValidation(e) => write!(f, "{}", e),
+            FeasibilityError::MissingFlexibleAssignment(e) => write!(f, "{}", e),
+            FeasibilityError::ExtraFlexibleAssignment(e) => write!(f, "{}", e),
+            FeasibilityError::ExtraFlexibleRequest(e) => write!(f, "{}", e),
+            FeasibilityError::RequestIdNotUnique(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl std::error::Error for FeasibilityError {}
+
+impl From<CrossValidationError> for FeasibilityError {
+    fn from(err: CrossValidationError) -> Self {
+        FeasibilityError::CrossValidation(err)
+    }
+}
+impl From<MissingFlexibleAssignmentError> for FeasibilityError {
+    fn from(err: MissingFlexibleAssignmentError) -> Self {
+        FeasibilityError::MissingFlexibleAssignment(err)
+    }
+}
+impl From<ExtraFlexibleAssignmentError> for FeasibilityError {
+    fn from(err: ExtraFlexibleAssignmentError) -> Self {
+        FeasibilityError::ExtraFlexibleAssignment(err)
+    }
+}
+impl From<ExtraFlexibleRequestError> for FeasibilityError {
+    fn from(err: ExtraFlexibleRequestError) -> Self {
+        FeasibilityError::ExtraFlexibleRequest(err)
+    }
+}
+impl From<RequestIdNotUniqueError> for FeasibilityError {
+    fn from(err: RequestIdNotUniqueError) -> Self {
+        FeasibilityError::RequestIdNotUnique(err)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PlanRejectionError<T> {
-    Unassigned(UnassignedRequestsError),
-    Overlap(AssignmentOverlapError),
+    CrossValidation(CrossValidationError),
+    MissingFlexibleAssignment(MissingFlexibleAssignmentError),
+    ExtraFlexibleAssignment(ExtraFlexibleAssignmentError),
+    ExtraFlexibleRequest(ExtraFlexibleRequestError),
+    RequestIdNotUnique(RequestIdNotUniqueError),
     Terminal(TerminalApplyError<T>),
 }
 
 impl<T: std::fmt::Display> std::fmt::Display for PlanRejectionError<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PlanRejectionError::Unassigned(e) => write!(f, "{e}"),
-            PlanRejectionError::Overlap(e) => write!(f, "{e}"),
-            PlanRejectionError::Terminal(e) => write!(f, "{e}"),
+            PlanRejectionError::CrossValidation(e) => write!(f, "{}", e),
+            PlanRejectionError::MissingFlexibleAssignment(e) => write!(f, "{}", e),
+            PlanRejectionError::ExtraFlexibleAssignment(e) => write!(f, "{}", e),
+            PlanRejectionError::ExtraFlexibleRequest(e) => write!(f, "{}", e),
+            PlanRejectionError::RequestIdNotUnique(e) => write!(f, "{}", e),
+            PlanRejectionError::Terminal(e) => write!(f, "{}", e),
         }
     }
 }
 
 impl<T: std::fmt::Debug + std::fmt::Display> std::error::Error for PlanRejectionError<T> {}
+
+impl<T> From<CrossValidationError> for PlanRejectionError<T> {
+    fn from(err: CrossValidationError) -> Self {
+        PlanRejectionError::CrossValidation(err)
+    }
+}
+impl<T> From<MissingFlexibleAssignmentError> for PlanRejectionError<T> {
+    fn from(err: MissingFlexibleAssignmentError) -> Self {
+        PlanRejectionError::MissingFlexibleAssignment(err)
+    }
+}
+impl<T> From<ExtraFlexibleAssignmentError> for PlanRejectionError<T> {
+    fn from(err: ExtraFlexibleAssignmentError) -> Self {
+        PlanRejectionError::ExtraFlexibleAssignment(err)
+    }
+}
+impl<T> From<ExtraFlexibleRequestError> for PlanRejectionError<T> {
+    fn from(err: ExtraFlexibleRequestError) -> Self {
+        PlanRejectionError::ExtraFlexibleRequest(err)
+    }
+}
+impl<T> From<RequestIdNotUniqueError> for PlanRejectionError<T> {
+    fn from(err: RequestIdNotUniqueError) -> Self {
+        PlanRejectionError::RequestIdNotUnique(err)
+    }
+}
+impl<T> From<TerminalApplyError<T>> for PlanRejectionError<T> {
+    fn from(err: TerminalApplyError<T>) -> Self {
+        PlanRejectionError::Terminal(err)
+    }
+}
