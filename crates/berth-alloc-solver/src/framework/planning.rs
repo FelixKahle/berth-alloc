@@ -43,12 +43,12 @@ use num_traits::{CheckedAdd, CheckedSub};
 use std::ops::Mul;
 
 #[derive(Debug, Clone)]
-pub struct BrandedRequest<'brand, 'p, K: Kind, T: Copy + Ord> {
+pub struct BrandedRequest<'pb, 'p, K: Kind, T: Copy + Ord> {
     req: &'p Request<K, T>,
-    _brand: Brand<'brand>,
+    _brand: Brand<'pb>,
 }
 
-impl<'brand, 'p, K: Kind, T: Copy + Ord> BrandedRequest<'brand, 'p, K, T> {
+impl<'pb, 'p, K: Kind, T: Copy + Ord> BrandedRequest<'pb, 'p, K, T> {
     #[inline]
     fn new(req: &'p Request<K, T>) -> Self {
         Self {
@@ -64,14 +64,14 @@ impl<'brand, 'p, K: Kind, T: Copy + Ord> BrandedRequest<'brand, 'p, K, T> {
 }
 
 #[derive(Debug, Clone)]
-pub struct BrandedAssignmentRef<'brand, 'a, 'p, K: Kind, T: Copy + Ord> {
-    asg: &'a AssignmentRef<'p, 'p, K, T>,
+pub struct BrandedAssignmentRef<'brand, 'p, K: Kind, T: Copy + Ord> {
+    asg: AssignmentRef<'p, 'p, K, T>,
     _brand: Brand<'brand>,
 }
 
-impl<'brand, 'a, 'p, K: Kind, T: Copy + Ord> BrandedAssignmentRef<'brand, 'a, 'p, K, T> {
+impl<'brand, 'p, K: Kind, T: Copy + Ord> BrandedAssignmentRef<'brand, 'p, K, T> {
     #[inline]
-    fn new(asg: &'a AssignmentRef<'p, 'p, K, T>) -> Self {
+    fn new(asg: AssignmentRef<'p, 'p, K, T>) -> Self {
         Self {
             asg,
             _brand: Brand::new(),
@@ -79,8 +79,8 @@ impl<'brand, 'a, 'p, K: Kind, T: Copy + Ord> BrandedAssignmentRef<'brand, 'a, 'p
     }
 
     #[inline]
-    pub fn asg(&self) -> &'a AssignmentRef<'p, 'p, K, T> {
-        self.asg
+    pub fn asg(&self) -> &AssignmentRef<'p, 'p, K, T> {
+        &self.asg
     }
 }
 
@@ -151,32 +151,37 @@ impl<'p, T: Copy + Ord> Plan<'p, T> {
 }
 
 #[derive(Debug, Clone)]
-pub struct PlanExplorer<'p, 'a, T: Copy + Ord> {
-    ledger: &'a Ledger<'p, T>,
-    sandbox: &'a TerminalSandbox<'p, T>,
+pub struct PlanExplorer<'brand, 'pb, 'p, T: Copy + Ord> {
+    ledger: &'pb Ledger<'p, T>,
+    sandbox: &'pb TerminalSandbox<'p, T>,
+    _brand: Brand<'brand>,
 }
 
-impl<'p, 'a, T: Copy + Ord> PlanExplorer<'p, 'a, T> {
+impl<'brand, 'pb, 'p, T: Copy + Ord> PlanExplorer<'brand, 'pb, 'p, T> {
     #[inline]
-    pub fn new(ledger: &'a Ledger<'p, T>, sandbox: &'a TerminalSandbox<'p, T>) -> Self {
-        Self { ledger, sandbox }
+    pub fn new(ledger: &'pb Ledger<'p, T>, sandbox: &'pb TerminalSandbox<'p, T>) -> Self {
+        Self {
+            ledger,
+            sandbox,
+            _brand: Brand::new(),
+        }
     }
 
     #[inline]
-    pub fn ledger(&self) -> &'a Ledger<'p, T> {
+    pub fn ledger(&self) -> &'pb Ledger<'p, T> {
         self.ledger
     }
 
     #[inline]
-    pub fn sandbox(&self) -> &'a TerminalSandbox<'p, T> {
+    pub fn sandbox(&self) -> &'pb TerminalSandbox<'p, T> {
         self.sandbox
     }
 
     #[inline]
     pub fn iter_free_for(
-        &'a self,
-        req: BrandedRequest<'a, 'a, FlexibleKind, T>,
-    ) -> impl Iterator<Item = BrandedFreeBerth<'a, 'p, T>> + 'a
+        &self,
+        req: BrandedRequest<'brand, 'p, FlexibleKind, T>,
+    ) -> impl Iterator<Item = BrandedFreeBerth<'brand, 'p, T>> + 'pb
     where
         T: CheckedAdd + CheckedSub,
     {
@@ -191,7 +196,7 @@ impl<'p, 'a, T: Copy + Ord> PlanExplorer<'p, 'a, T> {
     #[inline]
     pub fn iter_unassigned_requests(
         &self,
-    ) -> impl Iterator<Item = BrandedRequest<'_, 'p, FlexibleKind, T>>
+    ) -> impl Iterator<Item = BrandedRequest<'brand, 'p, FlexibleKind, T>>
     where
         T: CheckedAdd + CheckedSub,
     {
@@ -203,7 +208,7 @@ impl<'p, 'a, T: Copy + Ord> PlanExplorer<'p, 'a, T> {
     #[inline]
     pub fn iter_assigned_requests(
         &self,
-    ) -> impl Iterator<Item = BrandedRequest<'_, 'p, FlexibleKind, T>>
+    ) -> impl Iterator<Item = BrandedRequest<'brand, 'p, FlexibleKind, T>>
     where
         T: CheckedAdd + CheckedSub,
     {
@@ -215,27 +220,29 @@ impl<'p, 'a, T: Copy + Ord> PlanExplorer<'p, 'a, T> {
     #[inline]
     pub fn iter_assignments(
         &self,
-    ) -> impl Iterator<Item = BrandedAssignmentRef<'_, '_, 'p, FlexibleKind, T>> {
+    ) -> impl Iterator<Item = BrandedAssignmentRef<'brand, 'p, FlexibleKind, T>> {
         self.ledger
             .iter_assignments()
-            .map(BrandedAssignmentRef::new)
+            .map(|a| BrandedAssignmentRef::new(*a))
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct PlanBuilder<'p, T: Copy + Ord> {
+pub struct PlanBuilder<'brand, 'p, T: Copy + Ord> {
     ledger: Ledger<'p, T>,
     sandbox: TerminalSandbox<'p, T>,
     delta_cost: Cost,
+    _brand: Brand<'brand>,
 }
 
-impl<'p, T: Copy + Ord> PlanBuilder<'p, T> {
+impl<'brand, 'p, T: Copy + Ord> PlanBuilder<'brand, 'p, T> {
     #[inline]
     pub fn new(ledger: Ledger<'p, T>, terminal: TerminalOccupancy<'p, T>) -> Self {
         Self {
             ledger,
             sandbox: TerminalSandbox::new(terminal),
             delta_cost: Cost::zero(),
+            _brand: Brand::new(),
         }
     }
 
@@ -294,8 +301,8 @@ impl<'p, T: Copy + Ord> PlanBuilder<'p, T> {
     #[inline]
     pub fn propose_unassignment(
         &mut self,
-        asg: &BrandedAssignmentRef<'_, '_, 'p, FlexibleKind, T>,
-    ) -> Result<BrandedFreeBerth<'_, 'p, T>, ProposeUnassignmentError<T>>
+        asg: &BrandedAssignmentRef<'brand, 'p, FlexibleKind, T>,
+    ) -> Result<BrandedFreeBerth<'brand, 'p, T>, ProposeUnassignmentError<T>>
     where
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
@@ -317,10 +324,11 @@ impl<'p, T: Copy + Ord> PlanBuilder<'p, T> {
     #[inline]
     pub fn with_explorer<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(&PlanExplorer<'_, '_, T>) -> R,
+        F: FnOnce(&PlanExplorer<'brand, '_, 'p, T>) -> R,
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
-        let explorer = PlanExplorer::new(&self.ledger, &self.sandbox);
+        let explorer: PlanExplorer<'brand, '_, 'p, T> =
+            PlanExplorer::new(&self.ledger, &self.sandbox);
         f(&explorer)
     }
 
@@ -335,37 +343,38 @@ impl<'p, T: Copy + Ord> PlanBuilder<'p, T> {
 }
 
 #[derive(Debug, Clone)]
-pub struct PlanningContext<'a, 'p, T: Copy + Ord> {
-    ledger: &'a Ledger<'p, T>,
-    terminal: &'a TerminalOccupancy<'p, T>,
+pub struct PlanningContext<'s, 'p, T: Copy + Ord> {
+    ledger: &'s Ledger<'p, T>,
+    terminal: &'s TerminalOccupancy<'p, T>,
 }
 
-impl<'a, 'p, T: Copy + Ord> PlanningContext<'a, 'p, T> {
+impl<'s, 'p, T: Copy + Ord> PlanningContext<'s, 'p, T> {
     #[inline]
-    pub fn new(ledger: &'a Ledger<'p, T>, terminal: &'a TerminalOccupancy<'p, T>) -> Self {
+    pub fn new(ledger: &'s Ledger<'p, T>, terminal: &'s TerminalOccupancy<'p, T>) -> Self {
         Self { ledger, terminal }
     }
 
     #[inline]
-    pub fn ledger(&self) -> &'a Ledger<'p, T> {
+    pub fn ledger(&self) -> &'s Ledger<'p, T> {
         self.ledger
     }
 
     #[inline]
-    pub fn terminal(&self) -> &'a TerminalOccupancy<'p, T> {
+    pub fn terminal(&self) -> &'s TerminalOccupancy<'p, T> {
         self.terminal
     }
 
     #[inline]
-    pub fn with_builder<F, R>(&self, f: F) -> Plan<'p, T>
+    pub fn with_builder<F>(&self, f: F) -> Result<Plan<'p, T>, BerthIdentifierNotFoundError>
     where
-        F: FnOnce(&mut PlanBuilder<'p, T>) -> Plan<'p, T>,
+        F: for<'brand> FnOnce(&mut PlanBuilder<'brand, 'p, T>),
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
         // For now we do not use specialized overlays. Just the cloned ledger and terminal,
         // so proposals can be made on them independently from the master state.
         let mut pb = PlanBuilder::new(self.ledger.clone(), self.terminal.clone());
-        f(&mut pb)
+        f(&mut pb);
+        pb.finalize()
     }
 }
 
@@ -516,12 +525,7 @@ mod tests {
         let ledger = Ledger::new(&problem);
         let mut pb = PlanBuilder::new(ledger, terminal);
 
-        let req_ref = pb
-            .ledger
-            .problem()
-            .flexible_requests()
-            .get(rid(200))
-            .unwrap();
+        let req_ref = problem.flexible_requests().get(rid(200)).unwrap();
 
         // Assign at start=3 -> [3,7)
         let (iv_copy, berth_id) = pb.with_explorer(|explorer| {
@@ -538,7 +542,7 @@ mod tests {
             .unwrap();
 
         // Then unassign; delta_cost must return to zero
-        let branded_asg = BrandedAssignmentRef::new(&asg);
+        let branded_asg = BrandedAssignmentRef::new(asg);
         let freed = pb.propose_unassignment(&branded_asg).expect("unassign ok");
         assert_eq!(freed.berth().id(), bid(1));
         assert_eq!(pb.delta_cost(), Cost::zero());
@@ -780,7 +784,7 @@ mod tests {
             AssignmentRef::<FlexibleKind, i64>::new(req2_ref, berth2_ref, start2).unwrap();
 
         // 3) Wrap in a branded ref and then mutably borrow pb2 to unassign.
-        let branded_a2_again = BrandedAssignmentRef::new(&a2_again);
+        let branded_a2_again = BrandedAssignmentRef::new(a2_again);
         pb2.propose_unassignment(&branded_a2_again)
             .expect("unassign r2");
 

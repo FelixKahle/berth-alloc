@@ -19,8 +19,10 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+use std::ops::Mul;
+
 use crate::registry::err::{LedgerCommitError, LedgerUncomitError};
-use berth_alloc_core::prelude::TimePoint;
+use berth_alloc_core::prelude::{Cost, TimePoint};
 use berth_alloc_model::{
     common::{FixedKind, FlexibleKind},
     prelude::{
@@ -28,6 +30,7 @@ use berth_alloc_model::{
     },
     problem::asg::{AssignmentRef, AssignmentView},
 };
+use num_traits::Zero;
 use num_traits::{CheckedAdd, CheckedSub};
 
 #[derive(Debug, Clone)]
@@ -163,6 +166,17 @@ impl<'p, T: Copy + Ord> Ledger<'p, T> {
         self,
     ) -> AssignmentContainer<FlexibleKind, T, AssignmentRef<'p, 'p, FlexibleKind, T>> {
         self.commited
+    }
+
+    #[inline]
+    pub fn cost(&self) -> Cost
+    where
+        T: CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>,
+    {
+        self.commited
+            .iter()
+            .map(|a| a.cost())
+            .fold(Cost::zero(), |acc, c| acc + c)
     }
 }
 
@@ -401,6 +415,73 @@ mod tests {
         ledger1.apply(ledger2);
         let assigned_ids: Vec<_> = ledger1.iter_assigned_requests().map(|r| r.id()).collect();
         assert_eq!(assigned_ids, vec![rid(2)]);
+    }
+
+    #[test]
+    fn test_cost_accumulates_and_updates_on_commit_uncommit() {
+        // Problem with one berth and two flexible requests, distinct processing times / weights
+        let mut berths = berth_alloc_model::problem::berth::BerthContainer::new();
+        berths.insert(berth(1, 0, 500));
+
+        let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+
+        let mut flex =
+            berth_alloc_model::problem::req::RequestContainer::<FlexibleKind, i64>::new();
+        // r1: pt=10, weight=2
+        flex.insert(flex_req(10, (0, 300), &[(1, 10)], 2));
+        // r2: pt=15, weight=3
+        flex.insert(flex_req(20, (0, 300), &[(1, 15)], 3));
+
+        let prob = Problem::new(berths, fixed, flex).expect("problem build");
+        let mut ledger = Ledger::new(&prob);
+
+        let r1 = prob.flexible_requests().get(rid(10)).unwrap();
+        let r2 = prob.flexible_requests().get(rid(20)).unwrap();
+        let b1 = prob.berths().get(bid(1)).unwrap();
+
+        assert_eq!(ledger.cost(), Cost::zero(), "initial cost should be zero");
+
+        let a1 = ledger.commit_assignment(r1, b1, tp(0)).expect("commit r1");
+        let cost_after_r1 = ledger.cost();
+
+        assert!(
+            cost_after_r1 > Cost::zero(),
+            "cost should increase after first commit"
+        );
+
+        let a2 = ledger
+            .commit_assignment(r2, b1, tp(100))
+            .expect("commit r2");
+        let cost_after_r2 = ledger.cost();
+
+        assert!(
+            cost_after_r2 > cost_after_r1,
+            "cost should increase after second commit"
+        );
+
+        // Derive expected sum from assignments directly to be robust against formula changes
+        let expected_sum = a1.cost() + a2.cost();
+        assert_eq!(
+            cost_after_r2, expected_sum,
+            "ledger cost equals sum of assignment costs"
+        );
+
+        // Uncommit second assignment: cost should revert to the first assignment's cost
+        ledger.uncommit_assignment(&a2).expect("uncommit r2");
+        let cost_after_uncommit = ledger.cost();
+        assert_eq!(
+            cost_after_uncommit,
+            a1.cost(),
+            "cost after uncommitting second assignment should match r1 cost"
+        );
+
+        // Uncommit first assignment: cost returns to zero
+        ledger.uncommit_assignment(&a1).expect("uncommit r1");
+        assert_eq!(
+            ledger.cost(),
+            Cost::zero(),
+            "cost should be zero after all uncommitted"
+        );
     }
 }
 

@@ -19,6 +19,9 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+use std::ops::Mul;
+
+use berth_alloc_core::prelude::Cost;
 use berth_alloc_model::{
     prelude::{SolutionRef, StateValidator},
     solution::SolutionError,
@@ -37,6 +40,12 @@ use crate::{
 pub trait SolverStateView<'p, T: Copy + Ord> {
     fn ledger(&self) -> &Ledger<'p, T>;
     fn terminal_occupancy(&self) -> &TerminalOccupancy<'p, T>;
+    fn cost(&self) -> Cost
+    where
+        T: Into<Cost> + CheckedAdd + CheckedSub + Mul<Output = Cost> + 'p,
+    {
+        self.ledger().cost()
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -89,8 +89,11 @@ pub struct TerminalOccupancy<'b, T: Copy + Ord> {
 }
 
 impl<'b, T: Copy + Ord> TerminalOccupancy<'b, T> {
-    pub fn new(berths: &'b [Berth<T>]) -> Self {
-        let berths_occ: Vec<_> = berths.iter().map(BerthOccupancy::new).collect();
+    pub fn new<I>(berths: I) -> Self
+    where
+        I: IntoIterator<Item = &'b Berth<T>>,
+    {
+        let berths_occ: Vec<_> = berths.into_iter().map(BerthOccupancy::new).collect();
         let index_map = berths_occ
             .iter()
             .enumerate()

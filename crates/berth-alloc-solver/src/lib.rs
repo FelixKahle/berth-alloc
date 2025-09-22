@@ -21,5 +21,6 @@
 
 pub mod berth;
 pub mod framework;
+pub mod greedy;
 pub mod registry;
 pub mod terminal;
