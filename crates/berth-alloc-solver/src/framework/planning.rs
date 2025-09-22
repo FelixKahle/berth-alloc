@@ -151,6 +151,78 @@ impl<'p, T: Copy + Ord> Plan<'p, T> {
 }
 
 #[derive(Debug, Clone)]
+pub struct PlanExplorer<'p, 'a, T: Copy + Ord> {
+    ledger: &'a Ledger<'p, T>,
+    sandbox: &'a TerminalSandbox<'p, T>,
+}
+
+impl<'p, 'a, T: Copy + Ord> PlanExplorer<'p, 'a, T> {
+    #[inline]
+    pub fn new(ledger: &'a Ledger<'p, T>, sandbox: &'a TerminalSandbox<'p, T>) -> Self {
+        Self { ledger, sandbox }
+    }
+
+    #[inline]
+    pub fn ledger(&self) -> &'a Ledger<'p, T> {
+        self.ledger
+    }
+
+    #[inline]
+    pub fn sandbox(&self) -> &'a TerminalSandbox<'p, T> {
+        self.sandbox
+    }
+
+    #[inline]
+    pub fn iter_free_for(
+        &'a self,
+        req: BrandedRequest<'a, 'a, FlexibleKind, T>,
+    ) -> impl Iterator<Item = BrandedFreeBerth<'a, 'p, T>> + 'a
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        let window = req.req().feasible_window();
+        let allowed = req.req().iter_allowed_berths_ids();
+        self.sandbox
+            .inner()
+            .iter_free_intervals_for_berths_in(allowed, window)
+            .map(|fb| BrandedFreeBerth::new(fb.interval(), fb.berth()))
+    }
+
+    #[inline]
+    pub fn iter_unassigned_requests(
+        &self,
+    ) -> impl Iterator<Item = BrandedRequest<'_, 'p, FlexibleKind, T>>
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        self.ledger
+            .iter_unassigned_requests()
+            .map(BrandedRequest::new)
+    }
+
+    #[inline]
+    pub fn iter_assigned_requests(
+        &self,
+    ) -> impl Iterator<Item = BrandedRequest<'_, 'p, FlexibleKind, T>>
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        self.ledger
+            .iter_assigned_requests()
+            .map(BrandedRequest::new)
+    }
+
+    #[inline]
+    pub fn iter_assignments(
+        &self,
+    ) -> impl Iterator<Item = BrandedAssignmentRef<'_, '_, 'p, FlexibleKind, T>> {
+        self.ledger
+            .iter_assignments()
+            .map(BrandedAssignmentRef::new)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct PlanBuilder<'p, T: Copy + Ord> {
     ledger: Ledger<'p, T>,
     sandbox: TerminalSandbox<'p, T>,
@@ -243,52 +315,13 @@ impl<'p, T: Copy + Ord> PlanBuilder<'p, T> {
     }
 
     #[inline]
-    pub fn iter_free_for<'a>(
-        &'a self,
-        req: BrandedRequest<'a, 'a, FlexibleKind, T>,
-    ) -> impl Iterator<Item = BrandedFreeBerth<'a, 'p, T>> + 'a
+    pub fn with_explorer<F, R>(&self, f: F) -> R
     where
-        T: CheckedAdd + CheckedSub,
+        F: FnOnce(&PlanExplorer<'_, '_, T>) -> R,
+        T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
-        let window = req.req().feasible_window();
-        let allowed = req.req().iter_allowed_berths_ids();
-        self.sandbox
-            .inner()
-            .iter_free_intervals_for_berths_in(allowed, window)
-            .map(|fb| BrandedFreeBerth::new(fb.interval(), fb.berth()))
-    }
-
-    #[inline]
-    pub fn iter_unassigned_requests(
-        &self,
-    ) -> impl Iterator<Item = BrandedRequest<'_, 'p, FlexibleKind, T>>
-    where
-        T: CheckedAdd + CheckedSub,
-    {
-        self.ledger
-            .iter_unassigned_requests()
-            .map(BrandedRequest::new)
-    }
-
-    #[inline]
-    pub fn iter_assigned_requests(
-        &self,
-    ) -> impl Iterator<Item = BrandedRequest<'_, 'p, FlexibleKind, T>>
-    where
-        T: CheckedAdd + CheckedSub,
-    {
-        self.ledger
-            .iter_assigned_requests()
-            .map(BrandedRequest::new)
-    }
-
-    #[inline]
-    pub fn iter_assignments(
-        &self,
-    ) -> impl Iterator<Item = BrandedAssignmentRef<'_, '_, 'p, FlexibleKind, T>> {
-        self.ledger
-            .iter_assignments()
-            .map(BrandedAssignmentRef::new)
+        let explorer = PlanExplorer::new(&self.ledger, &self.sandbox);
+        f(&explorer)
     }
 
     #[inline]
@@ -433,13 +466,13 @@ mod tests {
             .expect("request exists");
 
         // Find free slot and assign at start=2 -> [2,6)
-        let (iv_copy, berth_id) = {
-            let tmp = pb
+        let (iv_copy, berth_id) = pb.with_explorer(|explorer| {
+            let tmp = explorer
                 .iter_free_for(BrandedRequest::new(req_ref))
                 .next()
                 .expect("expected some free interval");
             (*tmp.interval(), tmp.berth().id())
-        };
+        });
         let berth_ref = pb.ledger.problem().berths().get(berth_id).unwrap();
         let free = BrandedFreeBerth::new(iv_copy, berth_ref);
 
@@ -491,13 +524,13 @@ mod tests {
             .unwrap();
 
         // Assign at start=3 -> [3,7)
-        let (iv_copy, berth_id) = {
-            let tmp = pb
+        let (iv_copy, berth_id) = pb.with_explorer(|explorer| {
+            let tmp = explorer
                 .iter_free_for(BrandedRequest::new(req_ref))
                 .next()
                 .unwrap();
             (*tmp.interval(), tmp.berth().id())
-        };
+        });
         let berth_ref = pb.ledger.problem().berths().get(berth_id).unwrap();
         let free = BrandedFreeBerth::new(iv_copy, berth_ref);
         let asg = pb
@@ -547,13 +580,13 @@ mod tests {
             .unwrap();
 
         // Pick the (only) free interval [0,10); starting at 5 -> [5,13) which is *not* fully free
-        let (iv_copy, berth_id) = {
-            let tmp = pb
+        let (iv_copy, berth_id) = pb.with_explorer(|explorer| {
+            let tmp = explorer
                 .iter_free_for(BrandedRequest::new(req_ref))
                 .next()
                 .unwrap();
             (*tmp.interval(), tmp.berth().id())
-        };
+        });
         let berth_ref = pb.ledger.problem().berths().get(berth_id).unwrap();
         let free = BrandedFreeBerth::new(iv_copy, berth_ref);
         let err = pb
@@ -593,10 +626,12 @@ mod tests {
             .unwrap();
 
         // Only berth 2 should produce free intervals here.
-        let v: Vec<_> = pb
-            .iter_free_for(BrandedRequest::new(req_ref))
-            .map(|fb| (fb.berth().id(), fb.interval().clone()))
-            .collect();
+        let v: Vec<_> = pb.with_explorer(|explorer| {
+            explorer
+                .iter_free_for(BrandedRequest::new(req_ref))
+                .map(|fb| (fb.berth().id(), fb.interval().clone()))
+                .collect()
+        });
 
         assert!(
             v.iter().all(|(id, _)| *id == bid(2)),
@@ -635,23 +670,25 @@ mod tests {
             .unwrap();
 
         // Assign r1 at start=5 → [5,15)
-        let (iv1, bid1) = {
-            let tmp = pb
+        let (iv1, bid1) = pb.with_explorer(|explorer| {
+            let tmp = explorer
                 .iter_free_for(BrandedRequest::new(r1_ref))
                 .next()
                 .expect("some free for r1");
             (*tmp.interval(), tmp.berth().id())
-        };
+        });
         let b1_ref = pb.ledger.problem().berths().get(bid1).unwrap();
         let free1 = BrandedFreeBerth::new(iv1, b1_ref);
         pb.propose_assignment(BrandedRequest::new(r1_ref), tp(5), &free1)
             .expect("assign r1");
 
         // Now r2 should see a hole: free windows [0,5) and [15,30)
-        let v: Vec<_> = pb
-            .iter_free_for(BrandedRequest::new(r2_ref))
-            .map(|fb| fb.interval().clone())
-            .collect();
+        let v: Vec<_> = pb.with_explorer(|explorer| {
+            explorer
+                .iter_free_for(BrandedRequest::new(r2_ref))
+                .map(|fb| fb.interval().clone())
+                .collect()
+        });
         assert_eq!(v, vec![iv(0, 5), iv(15, 30)]);
     }
 
@@ -675,13 +712,13 @@ mod tests {
         let r3_ref = problem.flexible_requests().get(rid(3)).unwrap();
 
         // Assign r1 at t=2 → [2,8)
-        let (iv1, bid1) = {
-            let tmp = pb
+        let (iv1, bid1) = pb.with_explorer(|explorer| {
+            let tmp = explorer
                 .iter_free_for(BrandedRequest::new(r1_ref))
                 .next()
                 .expect("free for r1");
             (*tmp.interval(), tmp.berth().id())
-        };
+        });
         let b1_ref = problem.berths().get(bid1).unwrap();
         let free1 = BrandedFreeBerth::new(iv1, b1_ref);
         let _a1 = pb
@@ -689,13 +726,13 @@ mod tests {
             .expect("assign r1");
 
         // Assign r2 at t=10 → [10,14)
-        let (iv2, bid2) = {
-            let tmp = pb
+        let (iv2, bid2) = pb.with_explorer(|explorer| {
+            let tmp = explorer
                 .iter_free_for(BrandedRequest::new(r2_ref))
                 .last()
                 .expect("free for r2");
             (*tmp.interval(), tmp.berth().id())
-        };
+        });
         assert_eq!(bid1, bid2);
         let b2_ref = problem.berths().get(bid2).unwrap();
         let free2 = BrandedFreeBerth::new(iv2, b2_ref);
@@ -714,16 +751,18 @@ mod tests {
         // With [2,8) and [10,14) occupied, r3 should see: [0,2), [8,10), [14,20)
         let pb2_ledger = plan1.ledger().clone();
         let mut pb2 = PlanBuilder::new(pb2_ledger, term_applied);
-        let v_before_unassign: Vec<_> = pb2
-            .iter_free_for(BrandedRequest::new(r3_ref))
-            .map(|fb| fb.interval().clone())
-            .collect();
+        let v_before_unassign: Vec<_> = pb2.with_explorer(|explorer| {
+            explorer
+                .iter_free_for(BrandedRequest::new(r3_ref))
+                .map(|fb| fb.interval().clone())
+                .collect()
+        });
         assert_eq!(v_before_unassign, vec![iv(0, 2), iv(8, 10), iv(14, 20)]);
 
         // === Borrow-safe unassignment of r2 ===
         // 1) Read scalars while immutably borrowing pb2.
-        let (rid2, bid2, start2) = {
-            let a2_ref = pb2
+        let (rid2, bid2, start2) = pb2.with_explorer(|explorer| {
+            let a2_ref = explorer
                 .iter_assignments()
                 .find(|a| a.asg().request_id() == rid(2))
                 .expect("r2 assignment present");
@@ -732,7 +771,7 @@ mod tests {
                 a2_ref.asg().berth_id(),
                 a2_ref.asg().start_time(),
             )
-        }; // immutable borrow ends here
+        }); // immutable borrow ends here
 
         // 2) Rebuild an independent AssignmentRef from the *problem* (not pb2).
         let req2_ref = problem.flexible_requests().get(rid2).unwrap();
@@ -787,13 +826,13 @@ mod tests {
         let r2_ref = problem.flexible_requests().get(rid(2)).unwrap();
 
         // Expect free windows [0,2) and [8,10); can fit r2 at start=8.
-        let (iv_free, bid_) = {
-            let tmp = pb
+        let (iv_free, bid_) = pb.with_explorer(|explorer| {
+            let tmp = explorer
                 .iter_free_for(BrandedRequest::new(r2_ref))
                 .last()
                 .unwrap();
             (*tmp.interval(), tmp.berth().id())
-        };
+        });
         assert_eq!(iv_free, iv(8, 10));
         let b_ref = problem.berths().get(bid_).unwrap();
         let free = BrandedFreeBerth::new(iv_free, b_ref);

@@ -157,6 +157,13 @@ impl<'p, T: Copy + Ord> Ledger<'p, T> {
     pub fn apply(&mut self, other: Self) {
         *self = other;
     }
+
+    #[inline]
+    pub fn into_inner(
+        self,
+    ) -> AssignmentContainer<FlexibleKind, T, AssignmentRef<'p, 'p, FlexibleKind, T>> {
+        self.commited
+    }
 }
 
 #[cfg(test)]

@@ -19,7 +19,10 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use berth_alloc_model::prelude::StateValidator;
+use berth_alloc_model::{
+    prelude::{SolutionRef, StateValidator},
+    solution::SolutionError,
+};
 use num_traits::{CheckedAdd, CheckedSub};
 
 use crate::{
@@ -208,6 +211,25 @@ impl<'p, T: Copy + Ord> SolverStateView<'p, T> for FeasibleSolverState<'p, T> {
     #[inline]
     fn terminal_occupancy(&self) -> &TerminalOccupancy<'p, T> {
         &self.terminal_occupancy
+    }
+}
+
+impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub> TryInto<SolutionRef<'p, T>>
+    for FeasibleSolverState<'p, T>
+{
+    type Error = SolutionError;
+
+    fn try_into(self) -> Result<SolutionRef<'p, T>, Self::Error> {
+        let problem = self.ledger.problem();
+        let fixed_refs = self
+            .ledger
+            .problem()
+            .fixed_assignments()
+            .iter()
+            .map(|a| a.to_ref())
+            .collect();
+        let flexible_refs = self.ledger.into_inner();
+        SolutionRef::new(fixed_refs, flexible_refs, problem)
     }
 }
 
