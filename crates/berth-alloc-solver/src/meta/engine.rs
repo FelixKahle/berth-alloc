@@ -484,11 +484,14 @@ where
         let temp_base = (anneal.initial_temperature * anneal.cooling_rate.powi(iteration as i32))
             .max(anneal.min_temperature);
 
-        // --- effective temperature with reheat multiplier ---
-        let temp_eff = (temp_base * self.temp_scale).max(anneal.min_temperature);
+        // --- effective temperature with reheat multiplier (clamped) ---
+        let temp_eff_unclamped = temp_base * self.temp_scale;
+        let temp_eff = temp_eff_unclamped
+            .min(anneal.max_temperature)
+            .max(anneal.min_temperature);
 
-        // Use a smoother softmax temperature that reflects effective temp
-        let norm = (temp_eff / anneal.initial_temperature).clamp(0.0, 1.0);
+        // Softmax τ should reflect *base* exploration, not reheats (keeps selection stable)
+        let norm = (temp_base / anneal.initial_temperature).clamp(0.0, 1.0);
         let tau = alloc_cfg.softmax_tau_min
             + (alloc_cfg.softmax_tau_max - alloc_cfg.softmax_tau_min) * norm;
 
@@ -502,6 +505,7 @@ where
             }
         }
 
+        // Better logging: show base, scale, and effective temp
         tracing::Span::current().record("iteration", iteration);
         tracing::Span::current().record("temp", temp_eff);
         tracing::Span::current().record("tau", tau);
@@ -768,7 +772,9 @@ where
                 best_feasible_state = Some(state.clone());
                 self.iters_since_best_feasible = 0;
 
-                // decay lambda when we made progress (not below initial)
+                self.temp_scale = 1.0;
+                self.explore_boost_until = None;
+
                 if self.config.penalty.use_penalty {
                     self.lambda = (self.lambda * self.config.penalty.lambda_decay)
                         .max(self.config.penalty.lambda_initial);
