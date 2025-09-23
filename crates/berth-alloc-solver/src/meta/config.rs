@@ -83,6 +83,7 @@ pub struct AnnealingConfig {
     pub initial_temperature: f64,
     pub cooling_rate: f64,
     pub min_temperature: f64,
+    pub max_temperature: f64,
 }
 
 impl Default for AnnealingConfig {
@@ -91,6 +92,7 @@ impl Default for AnnealingConfig {
             initial_temperature: 1.0,
             cooling_rate: 0.9995,
             min_temperature: 1e-9,
+            max_temperature: 100.0,
         }
     }
 }
