@@ -68,11 +68,11 @@ impl Default for AllocationConfig {
             target_total_proposals_per_round: 4096,
             min_per_op: 128,
             max_per_op: 4096,
-            explore_frac: 0.15,
-            speed_weight: 0.7,
-            success_weight: 0.3,
-            softmax_tau_min: 0.02,
-            softmax_tau_max: 0.25,
+            explore_frac: 0.25,
+            speed_weight: 0.4,
+            success_weight: 0.6,
+            softmax_tau_min: 0.15,
+            softmax_tau_max: 0.60,
             softmax_eps: 1e-9,
         }
     }
@@ -111,6 +111,56 @@ impl Default for RandomConfig {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct PenaltyConfig {
+    /// Enable E = delta_cost + lambda * (#unassigned) as the SA energy.
+    pub use_penalty: bool,
+    /// Initial lambda.
+    pub lambda_initial: f64,
+    /// Multiplicative growth on stagnation.
+    pub lambda_growth: f64,
+    /// Multiplicative decay on improvement (≤ 1.0).
+    pub lambda_decay: f64,
+    /// Upper bound for lambda.
+    pub lambda_max: f64,
+}
+impl Default for PenaltyConfig {
+    fn default() -> Self {
+        Self {
+            use_penalty: true,
+            lambda_initial: 0.5,
+            lambda_growth: 1.25,
+            lambda_decay: 0.8,
+            lambda_max: 50.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StagnationConfig {
+    /// Iterations without *feasible* improvement before we kick the table.
+    pub iter_threshold: usize,
+    /// Multiply temperature by this factor (applied to a temp scale).
+    pub reheat_multiplier: f64,
+    /// Temporary explore_frac override during boost.
+    pub explore_boost: f64,
+    /// How many iterations to keep the explore boost.
+    pub explore_boost_iters: usize,
+    /// Reset per-operator stats (EWMA) when reheating.
+    pub reset_operator_stats_on_reheat: bool,
+}
+impl Default for StagnationConfig {
+    fn default() -> Self {
+        Self {
+            iter_threshold: 300,
+            reheat_multiplier: 3.0,
+            explore_boost: 0.35,
+            explore_boost_iters: 150,
+            reset_operator_stats_on_reheat: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetaConfig {
     /// Hard time budget for the whole meta solve (milliseconds).
     pub max_solver_time_ms: u64,
@@ -122,16 +172,20 @@ pub struct MetaConfig {
     pub anneal: AnnealingConfig,
     /// RNG seeds.
     pub random: RandomConfig,
+    pub penalty: PenaltyConfig,
+    pub stagnation: StagnationConfig,
 }
 
 impl Default for MetaConfig {
     fn default() -> Self {
         Self {
-            max_solver_time_ms: 20000, // 10 seconds
+            max_solver_time_ms: 30000,
             stats: StatsConfig::default(),
             alloc: AllocationConfig::default(),
             anneal: AnnealingConfig::default(),
             random: RandomConfig::default(),
+            penalty: PenaltyConfig::default(),
+            stagnation: StagnationConfig::default(),
         }
     }
 }
