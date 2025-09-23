@@ -30,7 +30,6 @@ use berth_alloc_model::{
     },
     problem::asg::{AssignmentRef, AssignmentView},
 };
-use num_traits::Zero;
 use num_traits::{CheckedAdd, CheckedSub};
 
 #[derive(Debug, Clone)]
@@ -69,7 +68,7 @@ impl<'p, T: Copy + Ord> Ledger<'p, T> {
     }
 
     #[inline]
-    pub fn flexible_assignments(&self) -> &RequestContainer<FlexibleKind, T>
+    pub fn flexible_requests(&self) -> &RequestContainer<FlexibleKind, T>
     where
         T: CheckedAdd + CheckedSub,
     {
@@ -173,10 +172,9 @@ impl<'p, T: Copy + Ord> Ledger<'p, T> {
     where
         T: CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>,
     {
-        self.commited
-            .iter()
-            .map(|a| a.cost())
-            .fold(Cost::zero(), |acc, c| acc + c)
+        let fixed_cost: Cost = self.fixed_assignments().iter().map(|a| a.cost()).sum();
+        let flexible_cost: Cost = self.commited_assignments().iter().map(|a| a.cost()).sum();
+        fixed_cost + flexible_cost
     }
 }
 
@@ -185,6 +183,7 @@ mod tests {
     use super::*;
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
     use berth_alloc_model::prelude::*;
+    use num_traits::Zero;
     use std::collections::BTreeMap;
 
     #[inline]

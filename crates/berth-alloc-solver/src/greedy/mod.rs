@@ -26,7 +26,7 @@ use crate::{
         err::ProposeAssignmentError,
         planning::{BrandedRequest, PlanningContext},
         solver::ConstructionSolver,
-        state::{FeasibleSolverState, IncompleteSolverState},
+        state::SolverState,
     },
     greedy::err::GreedyError,
     registry::ledger::Ledger,
@@ -70,10 +70,10 @@ where
     fn construct<'p>(
         &mut self,
         problem: &'p berth_alloc_model::prelude::Problem<T>,
-    ) -> Result<FeasibleSolverState<'p, T>, Self::Error> {
+    ) -> Result<SolverState<'p, T>, Self::Error> {
         let terminal = TerminalOccupancy::new(problem.berths().iter());
         let ledger = Ledger::new(problem);
-        let mut state = IncompleteSolverState::new(ledger, terminal);
+        let mut state = SolverState::new(ledger, terminal);
         let planning_ctx = PlanningContext::new(state.ledger(), state.terminal_occupancy());
 
         let plan_res = planning_ctx.with_builder(|pb| {
@@ -100,7 +100,7 @@ where
                     (None, None) => a.req().id().cmp(&b.req().id()),
                 });
 
-                let mut placed_in_pass = 0usize;
+                let mut placed_in_pass: usize = 0;
 
                 for req in reqs {
                     if slack_of(&req).is_none() {
@@ -142,8 +142,7 @@ where
         };
 
         state.apply_plan(plan)?;
-        let feasible: FeasibleSolverState<'p, T> = state.try_into()?;
-        Ok(feasible)
+        Ok(state)
     }
 }
 
@@ -157,7 +156,6 @@ mod tests {
         use std::fs;
         use std::path::{Path, PathBuf};
 
-        // Find the nearest ancestor that contains an `instances/` directory.
         fn find_instances_dir() -> Option<PathBuf> {
             let mut cur: Option<&Path> = Some(Path::new(env!("CARGO_MANIFEST_DIR")));
             while let Some(p) = cur {

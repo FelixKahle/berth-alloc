@@ -40,6 +40,13 @@ use crate::{
 pub trait SolverStateView<'p, T: Copy + Ord> {
     fn ledger(&self) -> &Ledger<'p, T>;
     fn terminal_occupancy(&self) -> &TerminalOccupancy<'p, T>;
+    fn is_feasible(&self) -> bool
+    where
+        T: CheckedAdd + CheckedSub + 'p,
+    {
+        self.ledger().iter_unassigned_requests().count() == 0
+    }
+
     fn cost(&self) -> Cost
     where
         T: Into<Cost> + CheckedAdd + CheckedSub + Mul<Output = Cost> + 'p,
@@ -49,12 +56,12 @@ pub trait SolverStateView<'p, T: Copy + Ord> {
 }
 
 #[derive(Debug, Clone)]
-pub struct IncompleteSolverState<'p, T: Copy + Ord> {
+pub struct SolverState<'p, T: Copy + Ord> {
     ledger: Ledger<'p, T>,
     terminal_occupancy: TerminalOccupancy<'p, T>,
 }
 
-impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub> IncompleteSolverState<'p, T> {
+impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub> SolverState<'p, T> {
     #[inline]
     pub fn new(ledger: Ledger<'p, T>, terminal_occupancy: TerminalOccupancy<'p, T>) -> Self {
         Self {
@@ -102,7 +109,7 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub> IncompleteSolverState<'p, T> {
     }
 }
 
-impl<'p, T: Copy + Ord> SolverStateView<'p, T> for IncompleteSolverState<'p, T> {
+impl<'p, T: Copy + Ord> SolverStateView<'p, T> for SolverState<'p, T> {
     #[inline]
     fn ledger(&self) -> &Ledger<'p, T> {
         &self.ledger
@@ -177,13 +184,13 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub> FeasibleSolverState<'p, T> {
     }
 }
 
-impl<'p, T> TryFrom<IncompleteSolverState<'p, T>> for FeasibleSolverState<'p, T>
+impl<'p, T> TryFrom<SolverState<'p, T>> for FeasibleSolverState<'p, T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {
     type Error = FeasibilityError;
 
-    fn try_from(value: IncompleteSolverState<'p, T>) -> Result<Self, Self::Error> {
+    fn try_from(value: SolverState<'p, T>) -> Result<Self, Self::Error> {
         let ledger = &value.ledger;
 
         StateValidator::validate_nonoverlap(
@@ -322,7 +329,7 @@ mod feasible_state_tests {
         let berths_vec: Vec<Berth<i64>> = prob.berths().iter().cloned().collect();
         let occ = mk_occ(&berths_vec);
 
-        let inc = IncompleteSolverState::new(ledger, occ);
+        let inc = SolverState::new(ledger, occ);
         let feas = FeasibleSolverState::try_from(inc).expect("should be feasible");
 
         let ids: Vec<_> = feas
@@ -345,7 +352,7 @@ mod feasible_state_tests {
         let berths_vec: Vec<Berth<i64>> = prob.berths().iter().cloned().collect();
         let occ = mk_occ(&berths_vec);
 
-        let inc = IncompleteSolverState::new(ledger, occ);
+        let inc = SolverState::new(ledger, occ);
         let err = FeasibleSolverState::try_from(inc).unwrap_err();
         match err {
             FeasibilityError::MissingFlexibleAssignment(e) => {

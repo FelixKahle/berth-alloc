@@ -97,6 +97,11 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub> Problem<T> {
     pub fn iter_fixed_assignments(&self) -> impl Iterator<Item = &Assignment<FixedKind, T>> {
         self.fixed_assignments.iter()
     }
+
+    #[inline]
+    pub fn request_count(&self) -> usize {
+        self.flexible_requests.len() + self.fixed_assignments.len()
+    }
 }
 
 fn validate_no_fixed_overlaps<T: Copy + Ord + CheckedAdd + CheckedSub>(

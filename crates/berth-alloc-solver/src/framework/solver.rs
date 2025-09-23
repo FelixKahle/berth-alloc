@@ -19,35 +19,18 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::framework::state::FeasibleSolverState;
+use crate::framework::state::SolverState;
 use berth_alloc_model::prelude::{Problem, SolutionRef};
 
 pub trait ConstructionSolver<T: Copy + Ord> {
     type Error;
 
-    fn construct<'p>(
-        &mut self,
-        problem: &'p Problem<T>,
-    ) -> Result<FeasibleSolverState<'p, T>, Self::Error>;
+    fn construct<'p>(&mut self, problem: &'p Problem<T>)
+    -> Result<SolverState<'p, T>, Self::Error>;
 }
 
 pub trait Solver<T: Copy + Ord> {
     type Error;
 
     fn solve<'p>(&mut self, problem: &'p Problem<T>) -> Result<SolutionRef<'p, T>, Self::Error>;
-}
-
-impl<S, T> Solver<T> for S
-where
-    S: ConstructionSolver<T>,
-    T: Copy + Ord + num_traits::CheckedAdd + num_traits::CheckedSub,
-    S::Error: From<berth_alloc_model::solution::SolutionError>,
-{
-    type Error = S::Error;
-
-    fn solve<'p>(&mut self, problem: &'p Problem<T>) -> Result<SolutionRef<'p, T>, Self::Error> {
-        let state = self.construct(problem)?;
-        let solution = state.try_into()?;
-        Ok(solution)
-    }
 }

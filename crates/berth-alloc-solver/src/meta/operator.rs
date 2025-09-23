@@ -19,9 +19,13 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod berth;
-pub mod framework;
-pub mod greedy;
-pub mod meta;
-pub mod registry;
-pub mod terminal;
+use crate::framework::planning::{Plan, PlanningContext};
+
+pub trait Operator {
+    type Time: Copy + Ord;
+
+    fn propose<'s, 'p>(
+        &self,
+        context: PlanningContext<'s, 'p, Self::Time>,
+    ) -> Option<Plan<'s, Self::Time>>;
+}

@@ -17,6 +17,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "berth_alloc_main"
+version = "0.1.0"
+dependencies = [
+ "berth_alloc_core",
+ "berth_alloc_model",
+ "berth_alloc_solver",
+ "num-traits",
+ "rand",
+ "rangemap",
+]
+
+[[package]]
 name = "berth_alloc_model"
 version = "0.1.0"
 dependencies = [

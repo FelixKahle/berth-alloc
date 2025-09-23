@@ -19,14 +19,15 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-[workspace]
-members = [
-    "crates/berth-alloc-core",
-    "crates/berth-alloc-model",
-    "crates/berth-alloc-solver",
-    "crates/berth-alloc-main",
-]
-resolver = "3"
+[package]
+name = "berth_alloc_main"
+version = "0.1.0"
+edition.workspace = true
 
-[workspace.package]
-edition = "2024"
+[dependencies]
+berth_alloc_core = { path = "../berth-alloc-core" }
+berth_alloc_model = { path = "../berth-alloc-model" }
+berth_alloc_solver = { path = "../berth-alloc-solver" }
+num-traits = "0.2.19"
+rand = "0.9.2"
+rangemap = "1.6.0"
