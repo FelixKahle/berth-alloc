@@ -19,7 +19,7 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::berth::err::BerthUpdateError;
+use crate::berth::err::{BerthApplyError, BerthUpdateError};
 use berth_alloc_model::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -53,7 +53,7 @@ pub enum TerminalUpdateError<T> {
 
 impl<T> std::fmt::Display for TerminalUpdateError<T>
 where
-    T: std::fmt::Debug + std::fmt::Display,
+    T: std::fmt::Display,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -74,5 +74,34 @@ impl<T> From<BerthIdentifierNotFoundError> for TerminalUpdateError<T> {
 impl<T> From<BerthUpdateError<T>> for TerminalUpdateError<T> {
     fn from(err: BerthUpdateError<T>) -> Self {
         TerminalUpdateError::BerthUpdate(err)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TerminalApplyError<T> {
+    BerthIdentifierNotFound(BerthIdentifierNotFoundError),
+    BerthApply(BerthApplyError<T>),
+}
+
+impl<T: std::fmt::Display> std::fmt::Display for TerminalApplyError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TerminalApplyError::BerthIdentifierNotFound(e) => write!(f, "{}", e),
+            TerminalApplyError::BerthApply(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl<T: std::fmt::Debug + std::fmt::Display> std::error::Error for TerminalApplyError<T> {}
+
+impl<T> From<BerthIdentifierNotFoundError> for TerminalApplyError<T> {
+    fn from(err: BerthIdentifierNotFoundError) -> Self {
+        TerminalApplyError::BerthIdentifierNotFound(err)
+    }
+}
+
+impl<T> From<BerthApplyError<T>> for TerminalApplyError<T> {
+    fn from(err: BerthApplyError<T>) -> Self {
+        TerminalApplyError::BerthApply(err)
     }
 }

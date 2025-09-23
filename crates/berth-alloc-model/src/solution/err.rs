@@ -19,52 +19,85 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::problem::err::{
-    AssignmenStartsBeforeFeasibleWindowError, AssignmentEndsAfterFeasibleWindowError,
-    AssignmentOverlapError, BerthNotFoundError, IncomatibleBerthError,
+use crate::validation::err::{
+    CrossValidationError, ExtraFixedAssignmentError, ExtraFixedRequestError,
+    ExtraFlexibleAssignmentError, ExtraFlexibleRequestError, MissingFixedAssignmentError,
+    MissingFlexibleAssignmentError, RequestIdNotUniqueError,
 };
-use crate::problem::req::RequestIdentifier;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum SolutionValidationError<T> {
-    MissingFixed(RequestIdentifier),
-    MissingFlexible(RequestIdentifier),
-    ExtraFlexible(RequestIdentifier),
-    ExtraFixed(RequestIdentifier),
-    UnknownBerth(BerthNotFoundError),
-    Incompatible(IncomatibleBerthError),
-    AssignmentStartsBeforeFeasibleWindow(AssignmenStartsBeforeFeasibleWindowError<T>),
-    AssignmentEndsAfterFeasibleWindow(AssignmentEndsAfterFeasibleWindowError<T>),
-    Overlap(AssignmentOverlapError),
+pub enum SolutionError {
+    MissingFixedAssignment(MissingFixedAssignmentError),
+    MissingFlexibleAssignment(MissingFlexibleAssignmentError),
+    ExtraFlexibleRequest(ExtraFlexibleRequestError),
+    ExtraFixedRequest(ExtraFixedRequestError),
+    ExtraFixedAssignment(ExtraFixedAssignmentError),
+    ExtraFlexibleAssignment(ExtraFlexibleAssignmentError),
+    RequestIdNotUnique(RequestIdNotUniqueError),
+    CrossValidation(CrossValidationError),
 }
 
-impl<T> std::fmt::Display for SolutionValidationError<T>
-where
-    T: std::fmt::Display,
-{
+impl std::fmt::Display for SolutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SolutionValidationError::MissingFixed(id) => {
-                write!(f, "Missing fixed assignment for request {}", id)
-            }
-            SolutionValidationError::MissingFlexible(id) => {
-                write!(f, "Missing flexible assignment for request {}", id)
-            }
-            SolutionValidationError::ExtraFlexible(id) => {
-                write!(f, "Extra flexible assignment for request {}", id)
-            }
-            SolutionValidationError::ExtraFixed(id) => {
-                write!(f, "Extra fixed assignment for request {}", id)
-            }
-            SolutionValidationError::UnknownBerth(err) => write!(f, "{}", err),
-            SolutionValidationError::Incompatible(err) => write!(f, "{}", err),
-            SolutionValidationError::AssignmentStartsBeforeFeasibleWindow(err) => {
-                write!(f, "{}", err)
-            }
-            SolutionValidationError::AssignmentEndsAfterFeasibleWindow(err) => write!(f, "{}", err),
-            SolutionValidationError::Overlap(err) => write!(f, "{}", err),
+            SolutionError::MissingFixedAssignment(e) => write!(f, "{}", e),
+            SolutionError::MissingFlexibleAssignment(e) => write!(f, "{}", e),
+            SolutionError::ExtraFlexibleRequest(e) => write!(f, "{}", e),
+            SolutionError::ExtraFixedRequest(e) => write!(f, "{}", e),
+            SolutionError::ExtraFixedAssignment(e) => write!(f, "{}", e),
+            SolutionError::ExtraFlexibleAssignment(e) => write!(f, "{}", e),
+            SolutionError::RequestIdNotUnique(e) => write!(f, "{}", e),
+            SolutionError::CrossValidation(e) => write!(f, "{}", e),
         }
     }
 }
 
-impl<T: std::fmt::Debug + std::fmt::Display> std::error::Error for SolutionValidationError<T> {}
+impl std::error::Error for SolutionError {}
+
+impl From<MissingFixedAssignmentError> for SolutionError {
+    fn from(err: MissingFixedAssignmentError) -> Self {
+        SolutionError::MissingFixedAssignment(err)
+    }
+}
+
+impl From<MissingFlexibleAssignmentError> for SolutionError {
+    fn from(err: MissingFlexibleAssignmentError) -> Self {
+        SolutionError::MissingFlexibleAssignment(err)
+    }
+}
+
+impl From<ExtraFlexibleRequestError> for SolutionError {
+    fn from(err: ExtraFlexibleRequestError) -> Self {
+        SolutionError::ExtraFlexibleRequest(err)
+    }
+}
+
+impl From<ExtraFixedRequestError> for SolutionError {
+    fn from(err: ExtraFixedRequestError) -> Self {
+        SolutionError::ExtraFixedRequest(err)
+    }
+}
+
+impl From<ExtraFixedAssignmentError> for SolutionError {
+    fn from(err: ExtraFixedAssignmentError) -> Self {
+        SolutionError::ExtraFixedAssignment(err)
+    }
+}
+
+impl From<ExtraFlexibleAssignmentError> for SolutionError {
+    fn from(err: ExtraFlexibleAssignmentError) -> Self {
+        SolutionError::ExtraFlexibleAssignment(err)
+    }
+}
+
+impl From<RequestIdNotUniqueError> for SolutionError {
+    fn from(err: RequestIdNotUniqueError) -> Self {
+        SolutionError::RequestIdNotUnique(err)
+    }
+}
+
+impl From<CrossValidationError> for SolutionError {
+    fn from(err: CrossValidationError) -> Self {
+        SolutionError::CrossValidation(err)
+    }
+}

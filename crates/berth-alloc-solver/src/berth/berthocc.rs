@@ -19,21 +19,31 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::berth::err::{BerthUpdateError, NotFreeError, OutsideAvailabilityError};
+use crate::berth::err::{
+    BerthApplyError, BerthUpdateError, FreeOutsideAvailabilityError, MismatchedBerthIdsError,
+    NotFreeError, OutsideAvailabilityError,
+};
 use berth_alloc_core::prelude::*;
 use berth_alloc_model::prelude::*;
 use rangemap::RangeSet;
 
-pub trait BerthRead<T: Copy + Ord> {
+pub trait BerthRead<'b, T: Copy + Ord> {
     fn is_free(&self, interval: TimeInterval<T>) -> bool;
     fn is_occupied(&self, interval: TimeInterval<T>) -> bool;
-    fn berth(&self) -> &Berth<T>;
-    fn iter_free_within(&self, window: TimeInterval<T>) -> impl Iterator<Item = TimeInterval<T>>;
+    fn berth(&self) -> &'b Berth<T>;
+    fn iter_free_intervals_in(
+        &self,
+        window: TimeInterval<T>,
+    ) -> impl Iterator<Item = TimeInterval<T>>;
 }
 
-pub trait BerthWrite<T: Copy + Ord>: BerthRead<T> {
+pub trait BerthWrite<'b, T: Copy + Ord>: BerthRead<'b, T> {
     fn occupy(&mut self, interval: TimeInterval<T>) -> Result<(), BerthUpdateError<T>>;
     fn release(&mut self, interval: TimeInterval<T>) -> Result<(), BerthUpdateError<T>>;
+    fn apply(&mut self, other: Self) -> Result<(), BerthApplyError<T>>;
+    fn replace(&mut self, other: Self) -> Result<Self, BerthApplyError<T>>
+    where
+        Self: Sized;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +62,7 @@ impl<'b, T: Copy + Ord> BerthOccupancy<'b, T> {
     }
 }
 
-impl<'b, T: Copy + Ord> BerthRead<T> for BerthOccupancy<'b, T> {
+impl<'b, T: Copy + Ord> BerthRead<'b, T> for BerthOccupancy<'b, T> {
     #[inline]
     fn is_free(&self, interval: TimeInterval<T>) -> bool {
         if interval.is_empty() {
@@ -68,12 +78,15 @@ impl<'b, T: Copy + Ord> BerthRead<T> for BerthOccupancy<'b, T> {
     }
 
     #[inline]
-    fn berth(&self) -> &Berth<T> {
+    fn berth(&self) -> &'b Berth<T> {
         self.berth
     }
 
     #[inline]
-    fn iter_free_within(&self, window: TimeInterval<T>) -> impl Iterator<Item = TimeInterval<T>> {
+    fn iter_free_intervals_in(
+        &self,
+        window: TimeInterval<T>,
+    ) -> impl Iterator<Item = TimeInterval<T>> {
         std::iter::once(window)
             .filter(|w| !w.is_empty())
             .flat_map(move |w| {
@@ -87,7 +100,7 @@ impl<'b, T: Copy + Ord> BerthRead<T> for BerthOccupancy<'b, T> {
     }
 }
 
-impl<'b, T: Copy + Ord> BerthWrite<T> for BerthOccupancy<'b, T> {
+impl<'b, T: Copy + Ord> BerthWrite<'b, T> for BerthOccupancy<'b, T> {
     #[inline]
     fn occupy(&mut self, interval: TimeInterval<T>) -> Result<(), BerthUpdateError<T>> {
         if interval.is_empty() {
@@ -117,6 +130,50 @@ impl<'b, T: Copy + Ord> BerthWrite<T> for BerthOccupancy<'b, T> {
         self.free.insert(s..e);
         Ok(())
     }
+
+    #[inline]
+    fn apply(&mut self, other: Self) -> Result<(), BerthApplyError<T>> {
+        if self.berth.id() != other.berth.id() {
+            return Err(BerthApplyError::MismatchedBerthIds(
+                MismatchedBerthIdsError::new(self.berth.id(), other.berth.id()),
+            ));
+        }
+
+        for seg in other.free.iter() {
+            let iv = TimeInterval::new(seg.start, seg.end);
+            if !self.berth.covers(iv) {
+                return Err(BerthApplyError::FreeOutsideAvailability(
+                    FreeOutsideAvailabilityError::new(self.berth.id(), iv),
+                ));
+            }
+        }
+
+        self.free = other.free;
+        Ok(())
+    }
+
+    #[inline]
+    fn replace(&mut self, other: Self) -> Result<Self, BerthApplyError<T>>
+    where
+        Self: Sized,
+    {
+        if self.berth.id() != other.berth.id() {
+            return Err(BerthApplyError::MismatchedBerthIds(
+                MismatchedBerthIdsError::new(self.berth.id(), other.berth.id()),
+            ));
+        }
+
+        for seg in other.free.iter() {
+            let iv = TimeInterval::new(seg.start, seg.end);
+            if !self.berth.covers(iv) {
+                return Err(BerthApplyError::FreeOutsideAvailability(
+                    FreeOutsideAvailabilityError::new(self.berth.id(), iv),
+                ));
+            }
+        }
+
+        Ok(std::mem::replace(self, other))
+    }
 }
 
 #[cfg(test)]
@@ -141,7 +198,7 @@ mod tests {
     fn test_free_starts_as_availability() {
         let b = Berth::from_windows(bid(1), vec![iv(0, 10), iv(20, 30)]);
         let occ = BerthOccupancy::new(&b);
-        let v: Vec<_> = occ.iter_free_within(iv(0, 50)).collect();
+        let v: Vec<_> = occ.iter_free_intervals_in(iv(0, 50)).collect();
         assert_eq!(v, vec![iv(0, 10), iv(20, 30)]);
         assert!(occ.is_free(iv(0, 10)));
         assert!(occ.is_free(iv(22, 25)));
@@ -153,7 +210,7 @@ mod tests {
         let b = Berth::from_windows(bid(2), vec![iv(0, 10)]);
         let mut occ = BerthOccupancy::new(&b);
         occ.occupy(iv(3, 7)).unwrap();
-        let v: Vec<_> = occ.iter_free_within(iv(0, 10)).collect();
+        let v: Vec<_> = occ.iter_free_intervals_in(iv(0, 10)).collect();
         assert_eq!(v, vec![iv(0, 3), iv(7, 10)]);
         assert!(occ.is_free(iv(0, 3)));
         assert!(occ.is_free(iv(7, 10)));
@@ -161,13 +218,13 @@ mod tests {
     }
 
     #[test]
-    fn release_outside_availability_errors_then_in_bounds_succeeds() {
+    fn test_release_outside_availability_errors_then_in_bounds_succeeds() {
         let b = Berth::from_windows(bid(3), vec![iv(10, 20)]);
         let mut occ = BerthOccupancy::new(&b);
 
         // Occupy everything first.
         occ.occupy(iv(10, 20)).unwrap();
-        assert!(occ.iter_free_within(iv(0, 100)).next().is_none());
+        assert!(occ.iter_free_intervals_in(iv(0, 100)).next().is_none());
 
         // Releasing beyond availability now returns an error (no clamping).
         let err = occ.release(iv(5, 25)).unwrap_err();
@@ -180,7 +237,7 @@ mod tests {
 
         // Releasing inside availability succeeds and restores the window.
         occ.release(iv(10, 20)).unwrap();
-        let v: Vec<_> = occ.iter_free_within(iv(0, 100)).collect();
+        let v: Vec<_> = occ.iter_free_intervals_in(iv(0, 100)).collect();
         assert_eq!(v, vec![iv(10, 20)]);
     }
 
@@ -189,14 +246,14 @@ mod tests {
         let b = Berth::from_windows(bid(4), vec![iv(0, 10), iv(20, 30)]);
         let occ = BerthOccupancy::new(&b);
         // Query in the middle of the gap:
-        assert!(occ.iter_free_within(iv(12, 18)).next().is_none());
+        assert!(occ.iter_free_intervals_in(iv(12, 18)).next().is_none());
         // Query that spans end of first and gap:
-        let v: Vec<_> = occ.iter_free_within(iv(8, 15)).collect();
+        let v: Vec<_> = occ.iter_free_intervals_in(iv(8, 15)).collect();
         assert_eq!(v, vec![iv(8, 10)]);
     }
 
     #[test]
-    fn occupy_not_free_errors() {
+    fn test_occupy_not_free_errors() {
         let b = Berth::from_windows(bid(1), vec![iv(0, 10)]);
         let mut occ = BerthOccupancy::new(&b);
 
@@ -214,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn occupy_outside_availability_errors() {
+    fn test_occupy_outside_availability_errors() {
         let b = Berth::from_windows(bid(2), vec![iv(0, 10)]);
         let mut occ = BerthOccupancy::new(&b);
 
@@ -228,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn release_outside_availability_errors() {
+    fn test_release_outside_availability_errors() {
         let b = Berth::from_windows(bid(3), vec![iv(10, 20)]);
         let mut occ = BerthOccupancy::new(&b);
 
@@ -240,4 +297,34 @@ mod tests {
             _ => panic!("expected OutsideAvailability"),
         }
     }
+
+    #[test]
+    fn test_apply_replacement_that_changes_occupancy_but_stays_within_availability_is_ok() {
+        let b = Berth::from_windows(bid(1), vec![iv(0, 10)]);
+        let mut a = BerthOccupancy::new(&b);
+        let mut c = BerthOccupancy::new(&b);
+        a.occupy(iv(2, 4)).unwrap(); // free: [0,2) ∪ [4,10)
+        c.occupy(iv(6, 8)).unwrap(); // free: [0,6) ∪ [8,10)
+
+        // Should be OK: both are subsets of availability, even though c is not ⊆ a.free.
+        a.apply(c).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod static_assertions {
+    use super::*;
+    use ::static_assertions::assert_impl_all;
+
+    macro_rules! test_integer_types {
+        ($($t:ty),*) => {
+            $(
+                assert_impl_all!(BerthOccupancy<'static, $t>: Send, Sync);
+            )*
+        };
+    }
+
+    test_integer_types!(
+        i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize
+    );
 }

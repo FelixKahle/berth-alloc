@@ -19,23 +19,7 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod common;
-pub mod problem;
-pub mod solution;
-pub mod validation;
-
-pub mod prelude {
-    pub use crate::common::{FixedKind, FlexibleKind, Kind};
-    pub use crate::problem::{
-        asg::{Assignment, AssignmentContainer},
-        berth::{Berth, BerthContainer, BerthIdentifier},
-        err::{
-            AssignmenStartsBeforeFeasibleWindowError, AssignmentEndsAfterFeasibleWindowError,
-            IncomatibleBerthError,
-        },
-        prob::Problem,
-        req::{Request, RequestContainer, RequestIdentifier},
-    };
-    pub use crate::solution::{Solution, SolutionRef, SolutionView};
-    pub use crate::validation::{StateValidator, err::*};
-}
+pub mod config;
+pub mod engine;
+pub mod operator;
+pub mod oplib;

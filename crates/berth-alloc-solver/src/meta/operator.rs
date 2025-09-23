@@ -19,23 +19,20 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod common;
-pub mod problem;
-pub mod solution;
-pub mod validation;
+use std::fmt::Debug;
 
-pub mod prelude {
-    pub use crate::common::{FixedKind, FlexibleKind, Kind};
-    pub use crate::problem::{
-        asg::{Assignment, AssignmentContainer},
-        berth::{Berth, BerthContainer, BerthIdentifier},
-        err::{
-            AssignmenStartsBeforeFeasibleWindowError, AssignmentEndsAfterFeasibleWindowError,
-            IncomatibleBerthError,
-        },
-        prob::Problem,
-        req::{Request, RequestContainer, RequestIdentifier},
-    };
-    pub use crate::solution::{Solution, SolutionRef, SolutionView};
-    pub use crate::validation::{StateValidator, err::*};
+use crate::framework::planning::{Plan, PlanningContext};
+use rand_chacha::ChaCha8Rng;
+
+pub trait Operator: Debug + Send + Sync {
+    type Time: Copy + Ord;
+
+    fn name(&self) -> &'static str;
+
+    fn propose<'s, 'p>(
+        &self,
+        iteration: usize,
+        context: PlanningContext<'s, 'p, Self::Time>,
+        rng: &mut ChaCha8Rng,
+    ) -> Option<Plan<'p, Self::Time>>;
 }

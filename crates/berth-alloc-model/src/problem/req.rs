@@ -139,6 +139,11 @@ impl<K: Kind, T: Ord + Copy + CheckedSub> Request<K, T> {
     }
 
     #[inline]
+    pub fn iter_allowed_berths_ids(&self) -> impl Iterator<Item = BerthIdentifier> + '_ {
+        self.processing_times.keys().copied()
+    }
+
+    #[inline]
     pub fn processing_time_for(&self, berth_id: BerthIdentifier) -> Option<TimeDelta<T>> {
         self.processing_times.get(&berth_id).copied()
     }

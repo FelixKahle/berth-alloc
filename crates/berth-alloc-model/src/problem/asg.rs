@@ -292,6 +292,11 @@ impl<'r, 'b, K: Kind, T: Ord + Copy + CheckedSub + CheckedAdd> AssignmentRef<'r,
     }
 
     #[inline]
+    pub fn berth(&self) -> &'b Berth<T> {
+        self.berth
+    }
+
+    #[inline]
     pub fn to_owned(&self) -> Assignment<K, T> {
         Assignment {
             request: self.request.clone(),
@@ -319,7 +324,7 @@ impl<'r, 'b, K: Kind, T: Ord + Copy> AssignmentView<K, T> for AssignmentRef<'r, 
         self.request
     }
 
-    fn berth(&self) -> &Berth<T> {
+    fn berth(&self) -> &'b Berth<T> {
         self.berth
     }
 
@@ -402,6 +407,14 @@ where
     #[inline]
     pub fn remove(&mut self, rid: RequestIdentifier) -> Option<V> {
         self.inner.remove(&rid)
+    }
+
+    pub fn remove_assignment(&mut self, assignment: &V) -> Option<V>
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        let rid = assignment.request_id();
+        self.remove(rid)
     }
 
     #[inline]
