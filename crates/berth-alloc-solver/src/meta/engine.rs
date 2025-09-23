@@ -22,6 +22,7 @@
 #![allow(dead_code)]
 
 use std::{
+    ops::Mul,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -33,7 +34,10 @@ use crate::{
         solver::{ConstructionSolver, Solver},
         state::{SolverState, SolverStateView},
     },
-    meta::{config::MetaConfig, operator::Operator},
+    meta::{
+        config::{MetaConfig, PenaltyConfig},
+        operator::Operator,
+    },
 };
 use berth_alloc_core::prelude::Cost;
 use berth_alloc_model::{
@@ -106,16 +110,21 @@ impl Default for OperatorStats {
 
 impl OperatorStats {
     #[inline]
-    pub fn on_attempt(&mut self) {
-        self.attempts += 1;
+    pub fn on_accept(&mut self, delta: Cost, reward_alpha: f64) {
+        // Make reward positive when delta is an improvement (delta < 0).
+        let r = (-delta.to_f64().unwrap_or(0.0)).max(0.0);
+        self.ewma_reward = ewma(self.ewma_reward, r, reward_alpha);
+
+        // Count as "accepted" only if this was strictly beneficial.
+        if r > 0.0 {
+            self.accepted = self.accepted.saturating_add(1);
+            self.total_improvement += delta;
+        }
     }
 
     #[inline]
-    pub fn on_accept(&mut self, improvement: Cost, reward_alpha: f64) {
-        self.accepted += 1;
-        self.total_improvement += improvement;
-        let r = improvement.to_f64().unwrap_or(0.0);
-        self.ewma_reward = ewma(self.ewma_reward, r, reward_alpha);
+    pub fn on_attempt(&mut self) {
+        self.attempts = self.attempts.saturating_add(1);
     }
 
     #[inline]
@@ -303,36 +312,6 @@ impl<'p, T: Ord + Copy> ThreadAccum<'p, T> {
 }
 
 #[inline]
-fn choose_sa<'p, T: Copy + Ord>(
-    a: Option<Candidate<'p, T>>,
-    b: Option<Candidate<'p, T>>,
-    temp: f64,
-) -> Option<Candidate<'p, T>> {
-    match (a, b) {
-        (None, None) => None,
-        (Some(x), None) | (None, Some(x)) => Some(x),
-        (Some(x), Some(y)) => {
-            // 1) Prefer feasible over infeasible
-            if x.feasible != y.feasible {
-                return Some(if x.feasible { x } else { y });
-            }
-            // 2) Prefer fewer unassigned
-            if x.unassigned != y.unassigned {
-                return Some(if x.unassigned < y.unassigned { x } else { y });
-            }
-            // 3) Tie → SA on cost delta
-            let d = y.delta - x.delta;
-            let p = acceptance_prob(d, temp);
-            if p > 0.0 && rand::random::<f64>() < p {
-                Some(y)
-            } else {
-                Some(x)
-            }
-        }
-    }
-}
-
-#[inline]
 fn acceptance_prob_f64(delta_e: f64, temp: f64) -> f64 {
     if delta_e < 0.0 {
         1.0
@@ -353,8 +332,21 @@ fn choose_sa_energy<'p, T: Copy + Ord>(
         (None, None) => None,
         (Some(x), None) | (None, Some(x)) => Some(x),
         (Some(x), Some(y)) => {
-            let d = y.energy - x.energy;
-            let p = acceptance_prob_f64(d, temp);
+            // 1) Feasibility strictly dominates
+            if x.feasible != y.feasible {
+                return Some(if y.feasible { y } else { x });
+            }
+            // 2) Fewer unassigned strictly dominates
+            if x.unassigned != y.unassigned {
+                return Some(if y.unassigned < x.unassigned { y } else { x });
+            }
+            // 3) SA on energy, with explicit tie handling
+            let d_e = y.energy - x.energy;
+            if d_e.abs() < 1e-15 {
+                // true tie — flip a fair coin
+                return Some(if rand::random::<bool>() { y } else { x });
+            }
+            let p = acceptance_prob_f64(d_e, temp);
             if p > 0.0 && rand::random::<f64>() < p {
                 Some(y)
             } else {
@@ -368,6 +360,20 @@ fn choose_sa_energy<'p, T: Copy + Ord>(
 fn make_job_rng(base_seed: u64, j: usize) -> ChaCha8Rng {
     let s = base_seed ^ ((j as u64).rotate_left(17)) ^ 0x9E37_79B1_85EB_CA87u64;
     ChaCha8Rng::seed_from_u64(s)
+}
+
+#[inline]
+fn compute_initial_lambda<T>(state: &SolverState<'_, T>, config: &PenaltyConfig) -> f64
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
+{
+    let total_request_count = state.problem().request_count();
+    if total_request_count == 0 {
+        return 0.0;
+    }
+
+    let initial_cost = state.cost().to_f64().unwrap_or(f64::INFINITY);
+    initial_cost / config.w / (total_request_count as f64)
 }
 
 #[derive(Debug)]
@@ -427,7 +433,6 @@ where
     weights_buf: Vec<f64>,
     iters_since_best_feasible: usize,
     temp_scale: f64,
-    lambda: f64,
     explore_boost_until: Option<usize>,
 }
 
@@ -442,7 +447,6 @@ where
         construction_solver: S,
     ) -> Self {
         let records = ops.into_iter().map(|op| OperatorRecord::new(op)).collect();
-        let lambda = config.penalty.lambda_initial;
         Self {
             config,
             operator_pool: OperatorPool::new(records),
@@ -451,7 +455,6 @@ where
             weights_buf: Vec::new(),
             iters_since_best_feasible: 0,
             temp_scale: 1.0,
-            lambda,
             explore_boost_until: None,
         }
     }
@@ -466,9 +469,10 @@ where
         &mut self,
         state: &'state mut SolverState<'p, T>,
         iteration: usize,
+        lambda: f64,
     ) -> Result<Option<Cost>, SolverStatePlanApplyError<T>>
     where
-        T: CheckedAdd + CheckedSub + std::fmt::Display,
+        T: CheckedAdd + CheckedSub + std::fmt::Display + Into<Cost> + Mul<Output = Cost>,
     {
         use num_traits::ToPrimitive;
 
@@ -480,22 +484,21 @@ where
         let alloc_cfg = &self.config.alloc;
         let rng_cfg = &self.config.random;
 
-        // --- base temperature (geometric cooling) ---
+        // --- Base geometric cooling
         let temp_base = (anneal.initial_temperature * anneal.cooling_rate.powi(iteration as i32))
             .max(anneal.min_temperature);
 
-        // --- effective temperature with reheat multiplier (clamped) ---
-        let temp_eff_unclamped = temp_base * self.temp_scale;
-        let temp_eff = temp_eff_unclamped
+        // --- Effective temperature with reheats (clamped)
+        let temp_eff = (temp_base * self.temp_scale)
             .min(anneal.max_temperature)
             .max(anneal.min_temperature);
 
-        // Softmax τ should reflect *base* exploration, not reheats (keeps selection stable)
+        // τ for softmax depends on base temp (stabler selection)
         let norm = (temp_base / anneal.initial_temperature).clamp(0.0, 1.0);
         let tau = alloc_cfg.softmax_tau_min
             + (alloc_cfg.softmax_tau_max - alloc_cfg.softmax_tau_min) * norm;
 
-        // Maybe boost exploration during a reheat window
+        // Exploration boost window
         let mut explore_frac = alloc_cfg.explore_frac;
         if let Some(until) = self.explore_boost_until {
             if iteration < until {
@@ -505,7 +508,6 @@ where
             }
         }
 
-        // Better logging: show base, scale, and effective temp
         tracing::Span::current().record("iteration", iteration);
         tracing::Span::current().record("temp", temp_eff);
         tracing::Span::current().record("tau", tau);
@@ -520,7 +522,7 @@ where
             self.weights_buf.resize(n_ops, 0.0);
         }
 
-        // Raw scores from operator stats
+        // Compute softmax weights
         let mut maxv = f64::NEG_INFINITY;
         for i in 0..n_ops {
             let s = self.operator_pool.raw_score_at(i, alloc_cfg, stats_cfg);
@@ -529,19 +531,12 @@ where
             }
             self.weights_buf[i] = s;
         }
-
-        // Softmax with temperature tau
         let t = tau.max(1e-6);
         for w in &mut self.weights_buf {
             *w = ((*w - maxv) / t).exp();
         }
-
-        // Inject uniform exploration mass
         if explore_frac > 0.0 {
-            let mut sum = 0.0;
-            for &w in &self.weights_buf {
-                sum += w;
-            }
+            let sum: f64 = self.weights_buf.iter().copied().sum();
             let avg = if sum > 0.0 {
                 sum / n_ops as f64
             } else {
@@ -557,7 +552,7 @@ where
                 .expect("weights must be non-negative and finite"),
         );
 
-        // --- Build a concrete job list honoring min/max per-op caps ---
+        // Build job list with per-op caps
         let total_draws = usize::max(n_ops, alloc_cfg.target_total_proposals_per_round);
         let dist_seed = rng_cfg.seed_base_select ^ (iteration as u64).rotate_left(13);
         let mut job_rng = rand_chacha::ChaCha8Rng::seed_from_u64(dist_seed);
@@ -565,9 +560,8 @@ where
         let mut per_op_counts = vec![0usize; n_ops];
         let mut jobs: Vec<usize> = Vec::with_capacity(total_draws);
 
-        // mandatory minimums
+        // Mandatory minimums
         if alloc_cfg.min_per_op > 0 {
-            #[allow(clippy::needless_range_loop)]
             for i in 0..n_ops {
                 let need = alloc_cfg
                     .min_per_op
@@ -585,7 +579,7 @@ where
             }
         }
 
-        // sample the rest by weighted index, respecting max_per_op
+        // Sample remainder by weights, respecting max_per_op
         let mut guard = 0usize;
         while jobs.len() < total_draws && guard < total_draws * 20 {
             let idx = dist.sample(&mut job_rng);
@@ -596,11 +590,19 @@ where
             guard += 1;
         }
 
-        // Decorrelate per-op batches
         jobs.shuffle(&mut job_rng);
         let jobs = Arc::new(jobs);
 
         let base_seed = rng_cfg.seed_base_task ^ (iteration as u64);
+
+        // ----- NEW: snapshot current penalized score (for relative energy)
+        let u_cur = state.ledger().iter_unassigned_requests().count();
+        let cur_cost_f = state.cost().to_f64().unwrap_or(f64::INFINITY);
+        let score_before = if self.config.penalty.use_penalty {
+            cur_cost_f + lambda * (u_cur as f64)
+        } else {
+            cur_cost_f
+        };
 
         let reduced = (0..jobs.len())
             .into_par_iter()
@@ -619,7 +621,6 @@ where
                         .propose(iteration, ctx, &mut rng);
                     let gen_ns = t0.elapsed().as_nanos() as f64;
 
-                    // Count attempt *always*, even if no-op
                     acc.per_op[op_idx].add_attempt();
 
                     if plan.is_none() {
@@ -631,18 +632,29 @@ where
                     let delta = plan.delta_cost();
                     let eval_ns = t1.elapsed().as_nanos() as f64;
 
-                    // Fold timing into aggregates
                     acc.per_op[op_idx].add_timing(gen_ns, eval_ns);
 
-                    // Build candidate with penalized energy
                     let unassigned = plan.ledger().iter_unassigned_requests().count();
                     let feasible = unassigned == 0;
+
+                    // ----- relative energy: score_after - score_before
                     let delta_f = delta.to_f64().unwrap_or(f64::INFINITY);
-                    let energy = if self.config.penalty.use_penalty {
-                        delta_f + self.lambda * (unassigned as f64)
+                    let score_after = if self.config.penalty.use_penalty {
+                        cur_cost_f + delta_f + lambda * (unassigned as f64)
                     } else {
-                        delta_f
+                        cur_cost_f + delta_f
                     };
+                    let mut energy = score_after - score_before;
+
+                    // Tiny jitter to avoid deterministic ties
+                    if self.config.anneal.jitter > 0.0 {
+                        energy += (rand::random::<f64>() - 0.5) * self.config.anneal.jitter;
+                    }
+
+                    // Skip strictly neutral plans: no cost change and no change in infeasibility
+                    if delta.is_zero() && unassigned == u_cur {
+                        return acc;
+                    }
 
                     let cand = Candidate {
                         op_idx,
@@ -658,30 +670,32 @@ where
             )
             .reduce(|| ThreadAccum::empty(n_ops), |a, b| a.merge(b, temp_eff));
 
-        // If nothing useful was produced
         if reduced.per_op.iter().all(|agg| agg.attempts == 0) {
             trace!("All generated plans were no-ops; nothing to apply.");
             return Ok(None);
         }
 
-        // Update per-operator attempts & timings (EWMA) once
         self.operator_pool
             .apply_aggregates(&reduced.per_op, stats_cfg);
 
-        // Track proposals count accurately
-        let mut attempts_sum: u64 = 0;
-        for a in &reduced.per_op {
-            attempts_sum += a.attempts;
-        }
+        let attempts_sum: u64 = reduced.per_op.iter().map(|a| a.attempts).sum();
         self.proposals_made = self.proposals_made.saturating_add(attempts_sum);
 
-        // Apply winner if present
         let Some(winner) = reduced.candidate else {
             trace!("No candidate survived the reduction.");
             return Ok(None);
         };
 
         let winner_op_name = self.operator_pool.get(winner.op_idx).operator().name();
+
+        // Helpful logging: both relative and absolute penalized scores
+        let winner_score_after = if self.config.penalty.use_penalty {
+            cur_cost_f
+                + winner.delta.to_f64().unwrap_or(f64::INFINITY)
+                + lambda * (winner.unassigned as f64)
+        } else {
+            cur_cost_f + winner.delta.to_f64().unwrap_or(f64::INFINITY)
+        };
 
         info!(
             op_index = winner.op_idx,
@@ -690,16 +704,29 @@ where
             tau = tau,
             delta = %winner.delta,
             unassigned = winner.unassigned,
-            energy = winner.energy,
+            energy_delta = winner.energy,   // relative (better if < 0)
+            score_before = score_before,    // absolute penalized
+            score_after = winner_score_after,
             "Selected winner"
         );
 
+        // Optional extra guard: skip truly neutral winner
+        if winner.delta.is_zero() && winner.unassigned == u_cur {
+            trace!("Neutral plan (no cost & no infeasibility change); skipping apply.");
+            return Ok(None);
+        }
+
         match state.apply_plan(winner.plan) {
             Ok(()) => {
-                // Reward the winning operator
-                let rec = self.operator_pool.get_mut(winner.op_idx);
-                rec.stats_mut()
-                    .on_accept(winner.delta, stats_cfg.reward_alpha);
+                // Reward only if beneficial (relative energy < 0 OR clear improvement)
+                let beneficial = (winner.energy < 0.0)
+                    || (winner.unassigned < u_cur)
+                    || (winner.delta < Cost::zero());
+                if beneficial {
+                    let rec = self.operator_pool.get_mut(winner.op_idx);
+                    rec.stats_mut()
+                        .on_accept(winner.delta, stats_cfg.reward_alpha);
+                }
                 trace!("Applied plan successfully.");
                 Ok(Some(winner.delta))
             }
@@ -713,7 +740,15 @@ where
 
 impl<T, S> Solver<T> for MetaEngine<T, S>
 where
-    T: Copy + Ord + Send + Sync + std::fmt::Display + CheckedAdd + CheckedSub,
+    T: Copy
+        + Ord
+        + Send
+        + Sync
+        + std::fmt::Display
+        + CheckedAdd
+        + CheckedSub
+        + Mul<Output = Cost>
+        + Into<Cost>,
     S: ConstructionSolver<T>,
     S::Error: std::fmt::Debug,
 {
@@ -724,30 +759,36 @@ where
         &mut self,
         problem: &'p Problem<T>,
     ) -> Result<Option<SolutionRef<'p, T>>, Self::Error> {
-        // 1) Build initial state (may or may not be feasible)
+        // 1) Construct initial state (may or may not be feasible)
         let mut state = self
             .construction_solver
             .construct(problem)
             .map_err(MetaEngineError::ConstructionError)?;
 
-        // 2) Budget
+        // 2) Initial λ from the scale of the problem
+        let mut lambda = compute_initial_lambda(&state, &self.config.penalty)
+            .max(self.config.penalty.lambda_min);
+
+        // 3) Budget
         let budget = Duration::from_millis(self.config.max_solver_time_ms);
         let t0 = Instant::now();
 
-        // 3) Track best *feasible* only (we always return feasible best if any)
+        // 4) Best *feasible* tracking (we always return feasible if found)
         let mut cum_delta = Cost::zero();
         let mut best_feasible_state: Option<_> = state.is_feasible().then(|| state.clone());
         let mut best_feasible_cum: Option<Cost> = state.is_feasible().then_some(cum_delta);
 
-        // Reset meta dynamics
+        // 5) Repair stagnation tracking (infeasible phase)
         self.iters_since_best_feasible = 0;
         self.temp_scale = 1.0;
-        self.lambda = self.config.penalty.lambda_initial;
         self.explore_boost_until = None;
+
+        let mut prev_unassigned = state.ledger().iter_unassigned_requests().count();
+        let mut iters_without_unassigned_drop: usize = 0;
 
         let mut iter: usize = 0;
         while t0.elapsed() < budget {
-            match self.step(&mut state, iter) {
+            match self.step(&mut state, iter, lambda) {
                 Ok(Some(delta)) => {
                     cum_delta += delta;
                 }
@@ -757,7 +798,10 @@ where
                 }
             }
 
-            // Check feasible improvement
+            // Current infeasibility level
+            let curr_unassigned = state.ledger().iter_unassigned_requests().count();
+
+            // 6) Feasible improvement?
             let improved_feasible = if state.is_feasible() {
                 match best_feasible_cum {
                     None => true,
@@ -771,40 +815,63 @@ where
                 best_feasible_cum = Some(cum_delta);
                 best_feasible_state = Some(state.clone());
                 self.iters_since_best_feasible = 0;
-
                 self.temp_scale = 1.0;
                 self.explore_boost_until = None;
 
+                // When we get a new feasible best, relax λ slightly (but keep it bounded)
                 if self.config.penalty.use_penalty {
-                    self.lambda = (self.lambda * self.config.penalty.lambda_decay)
-                        .max(self.config.penalty.lambda_initial);
+                    lambda = (lambda * self.config.penalty.lambda_decay).clamp(
+                        self.config.penalty.lambda_min,
+                        self.config.penalty.lambda_max,
+                    );
                 }
             } else {
                 self.iters_since_best_feasible = self.iters_since_best_feasible.saturating_add(1);
 
-                // Reheat & exploration boost on stagnation
-                if self.iters_since_best_feasible >= self.config.stagnation.iter_threshold {
+                // 7) Adapt λ by unassigned trend (works even when still infeasible)
+                if self.config.penalty.use_penalty {
+                    if curr_unassigned < prev_unassigned {
+                        // Got better: relax λ a bit to let cost guide more
+                        lambda = (lambda * self.config.penalty.lambda_decay).clamp(
+                            self.config.penalty.lambda_min,
+                            self.config.penalty.lambda_max,
+                        );
+                        iters_without_unassigned_drop = 0;
+                    } else if curr_unassigned > prev_unassigned {
+                        // Got worse: tighten λ to prioritize repairs
+                        lambda = (lambda * self.config.penalty.lambda_growth).clamp(
+                            self.config.penalty.lambda_min,
+                            self.config.penalty.lambda_max,
+                        );
+                        iters_without_unassigned_drop =
+                            iters_without_unassigned_drop.saturating_add(1);
+                    } else {
+                        // No change
+                        iters_without_unassigned_drop =
+                            iters_without_unassigned_drop.saturating_add(1);
+                    }
+                }
+
+                // 8) Reheat when infeasibility isn’t dropping
+                if iters_without_unassigned_drop >= self.config.stagnation.iter_threshold {
                     self.temp_scale *= self.config.stagnation.reheat_multiplier;
                     self.explore_boost_until =
                         Some(iter.saturating_add(self.config.stagnation.explore_boost_iters));
-
-                    if self.config.penalty.use_penalty {
-                        self.lambda = (self.lambda * self.config.penalty.lambda_growth)
-                            .min(self.config.penalty.lambda_max);
-                    }
 
                     if self.config.stagnation.reset_operator_stats_on_reheat {
                         self.operator_pool.reset_stats();
                     }
 
-                    self.iters_since_best_feasible = 0;
+                    iters_without_unassigned_drop = 0;
                     debug!(
                         temp_scale = self.temp_scale,
-                        lambda = self.lambda,
-                        "Reheat & boost due to stagnation"
+                        lambda = lambda,
+                        "Reheat & explore boost due to repair stagnation"
                     );
                 }
             }
+
+            prev_unassigned = curr_unassigned;
 
             iter += 1;
             if (iter & 0xF) == 0 && t0.elapsed() >= budget {
@@ -812,7 +879,7 @@ where
             }
         }
 
-        // logging
+        // Log final effective temperature
         let final_temp_base = {
             let a = &self.config.anneal;
             (a.initial_temperature * a.cooling_rate.powi(iter as i32)).max(a.min_temperature)
@@ -824,11 +891,10 @@ where
             iterations = iter,
             proposals = self.proposals_made,
             temperature = final_temp_eff,
-            lambda = self.lambda,
+            lambda = lambda,
             "Meta solve finished",
         );
 
-        // prefer feasible incumbent
         let final_state = best_feasible_state.unwrap_or(state);
         if final_state.is_feasible() {
             Ok(Some(final_state.try_into()?))

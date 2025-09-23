@@ -76,7 +76,7 @@ fn enable_tracing() {
 }
 
 fn main() {
-    enable_tracing();
+    //enable_tracing();
 
     for problem in instances() {
         // Greedy Solve

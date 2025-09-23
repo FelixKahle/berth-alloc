@@ -19,9 +19,14 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+pub mod berthblockruinrecreate;
+pub mod hillclimb;
 pub mod holefiller;
+pub mod longestruinrecreate;
+pub mod nuke;
 pub mod packleftonberth;
 pub mod randomdestroyinsert;
+pub mod reconstructgreedy;
 pub mod relocateone;
 pub mod shawdestroyinsert;
 pub mod swappair;
@@ -34,7 +39,10 @@ pub mod prelude {
     use crate::meta::{
         operator::Operator,
         oplib::{
-            holefiller::HoleFillerOperator, packleftonberth::PackLeftOnBerthOperator,
+            berthblockruinrecreate::BerthBlockRuinRecreateOperator,
+            hillclimb::HillClimbRelocateOperator, holefiller::HoleFillerOperator,
+            longestruinrecreate::LongestRuinRecreateOperator, nuke::NukeOperator,
+            packleftonberth::PackLeftOnBerthOperator, reconstructgreedy::ReconstructGreedyOperator,
             relocateone::RelocateOneOperator, shawdestroyinsert::ShawDestroyInsertOperator,
             swappair::SwapPairOperator, targetrepair::TargetedRepairOperator,
             temporalslicedestroyinsert::TemporalSliceDestroyInsertOperator,
@@ -68,6 +76,11 @@ pub mod prelude {
             Box::new(HoleFillerOperator::default()),
             Box::new(TemporalSliceDestroyInsertOperator::default()),
             Box::new(TargetedRepairOperator::default()),
+            Box::new(NukeOperator::default()),
+            Box::new(ReconstructGreedyOperator::default()),
+            Box::new(HillClimbRelocateOperator::default()),
+            Box::new(LongestRuinRecreateOperator::default()),
+            Box::new(BerthBlockRuinRecreateOperator::default()),
         ]
     }
 }

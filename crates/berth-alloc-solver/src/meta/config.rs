@@ -65,14 +65,14 @@ pub struct AllocationConfig {
 impl Default for AllocationConfig {
     fn default() -> Self {
         Self {
-            target_total_proposals_per_round: 4096,
+            target_total_proposals_per_round: 16384,
             min_per_op: 128,
-            max_per_op: 4096,
-            explore_frac: 0.25,
-            speed_weight: 0.4,
-            success_weight: 0.6,
-            softmax_tau_min: 0.15,
-            softmax_tau_max: 0.60,
+            max_per_op: 16384,
+            explore_frac: 0.30,
+            speed_weight: 0.35,
+            success_weight: 0.65,
+            softmax_tau_min: 0.22,
+            softmax_tau_max: 0.70,
             softmax_eps: 1e-9,
         }
     }
@@ -84,15 +84,17 @@ pub struct AnnealingConfig {
     pub cooling_rate: f64,
     pub min_temperature: f64,
     pub max_temperature: f64,
+    pub jitter: f64,
 }
 
 impl Default for AnnealingConfig {
     fn default() -> Self {
         Self {
-            initial_temperature: 1.0,
-            cooling_rate: 0.9995,
+            initial_temperature: 50.0,
+            cooling_rate: 0.985,
             min_temperature: 1e-9,
-            max_temperature: 100.0,
+            max_temperature: 50.0,
+            jitter: 1e-9,
         }
     }
 }
@@ -117,22 +119,25 @@ pub struct PenaltyConfig {
     /// Enable E = delta_cost + lambda * (#unassigned) as the SA energy.
     pub use_penalty: bool,
     /// Initial lambda.
-    pub lambda_initial: f64,
+    pub w: f64,
     /// Multiplicative growth on stagnation.
     pub lambda_growth: f64,
     /// Multiplicative decay on improvement (≤ 1.0).
     pub lambda_decay: f64,
     /// Upper bound for lambda.
     pub lambda_max: f64,
+    /// Lower bound for lambda.
+    pub lambda_min: f64,
 }
 impl Default for PenaltyConfig {
     fn default() -> Self {
         Self {
             use_penalty: true,
-            lambda_initial: 0.5,
-            lambda_growth: 1.25,
-            lambda_decay: 0.8,
-            lambda_max: 50.0,
+            w: 0.05,
+            lambda_growth: 1.35,
+            lambda_decay: 0.88,
+            lambda_max: 200.0,
+            lambda_min: 0.01,
         }
     }
 }
@@ -153,10 +158,10 @@ pub struct StagnationConfig {
 impl Default for StagnationConfig {
     fn default() -> Self {
         Self {
-            iter_threshold: 300,
-            reheat_multiplier: 3.0,
-            explore_boost: 0.35,
-            explore_boost_iters: 150,
+            iter_threshold: 200,
+            reheat_multiplier: 2.0,
+            explore_boost: 0.45,
+            explore_boost_iters: 300,
             reset_operator_stats_on_reheat: true,
         }
     }
@@ -181,7 +186,7 @@ pub struct MetaConfig {
 impl Default for MetaConfig {
     fn default() -> Self {
         Self {
-            max_solver_time_ms: 30000,
+            max_solver_time_ms: 20000,
             stats: StatsConfig::default(),
             alloc: AllocationConfig::default(),
             anneal: AnnealingConfig::default(),
