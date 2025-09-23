@@ -44,6 +44,7 @@ use num_traits::{CheckedAdd, CheckedSub, ToPrimitive, Zero};
 use rand::{
     SeedableRng,
     distr::{Distribution, weighted::WeightedIndex},
+    seq::SliceRandom,
 };
 use rand_chacha::ChaCha8Rng;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -77,6 +78,7 @@ struct Candidate<'p, T: Ord + Copy> {
     delta: Cost,
     unassigned: usize,
     feasible: bool,
+    energy: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -189,6 +191,13 @@ impl<T: Copy + Ord> OperatorPool<T> {
     }
 
     #[inline]
+    pub fn reset_stats(&mut self) {
+        for r in &mut self.records {
+            r.stats = OperatorStats::default();
+        }
+    }
+
+    #[inline]
     fn raw_score_at(
         &self,
         i: usize,
@@ -288,7 +297,7 @@ impl<'p, T: Ord + Copy> ThreadAccum<'p, T> {
             s.gen_ns_count += o.gen_ns_count;
             s.eval_ns_count += o.eval_ns_count;
         }
-        self.candidate = choose_sa(self.candidate, other.candidate, temp);
+        self.candidate = choose_sa_energy(self.candidate, other.candidate, temp);
         self
     }
 }
@@ -314,6 +323,38 @@ fn choose_sa<'p, T: Copy + Ord>(
             // 3) Tie → SA on cost delta
             let d = y.delta - x.delta;
             let p = acceptance_prob(d, temp);
+            if p > 0.0 && rand::random::<f64>() < p {
+                Some(y)
+            } else {
+                Some(x)
+            }
+        }
+    }
+}
+
+#[inline]
+fn acceptance_prob_f64(delta_e: f64, temp: f64) -> f64 {
+    if delta_e < 0.0 {
+        1.0
+    } else if delta_e > 0.0 {
+        (-delta_e / temp.max(1e-12)).exp()
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn choose_sa_energy<'p, T: Copy + Ord>(
+    a: Option<Candidate<'p, T>>,
+    b: Option<Candidate<'p, T>>,
+    temp: f64,
+) -> Option<Candidate<'p, T>> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (Some(x), Some(y)) => {
+            let d = y.energy - x.energy;
+            let p = acceptance_prob_f64(d, temp);
             if p > 0.0 && rand::random::<f64>() < p {
                 Some(y)
             } else {
@@ -384,6 +425,10 @@ where
     construction_solver: S,
     proposals_made: u64,
     weights_buf: Vec<f64>,
+    iters_since_best_feasible: usize,
+    temp_scale: f64,
+    lambda: f64,
+    explore_boost_until: Option<usize>,
 }
 
 impl<T, S> MetaEngine<T, S>
@@ -397,12 +442,17 @@ where
         construction_solver: S,
     ) -> Self {
         let records = ops.into_iter().map(|op| OperatorRecord::new(op)).collect();
+        let lambda = config.penalty.lambda_initial;
         Self {
             config,
             operator_pool: OperatorPool::new(records),
             construction_solver,
             proposals_made: 0,
             weights_buf: Vec::new(),
+            iters_since_best_feasible: 0,
+            temp_scale: 1.0,
+            lambda,
+            explore_boost_until: None,
         }
     }
 
@@ -420,6 +470,8 @@ where
     where
         T: CheckedAdd + CheckedSub + std::fmt::Display,
     {
+        use num_traits::ToPrimitive;
+
         let stats_cfg = &self.config.stats;
         let ledger = state.ledger();
         let terminal = state.terminal_occupancy();
@@ -428,14 +480,30 @@ where
         let alloc_cfg = &self.config.alloc;
         let rng_cfg = &self.config.random;
 
-        let temp = (anneal.initial_temperature * anneal.cooling_rate.powi(iteration as i32))
+        // --- base temperature (geometric cooling) ---
+        let temp_base = (anneal.initial_temperature * anneal.cooling_rate.powi(iteration as i32))
             .max(anneal.min_temperature);
-        let norm = (temp / anneal.initial_temperature).clamp(0.0, 1.0);
+
+        // --- effective temperature with reheat multiplier ---
+        let temp_eff = (temp_base * self.temp_scale).max(anneal.min_temperature);
+
+        // Use a smoother softmax temperature that reflects effective temp
+        let norm = (temp_eff / anneal.initial_temperature).clamp(0.0, 1.0);
         let tau = alloc_cfg.softmax_tau_min
             + (alloc_cfg.softmax_tau_max - alloc_cfg.softmax_tau_min) * norm;
 
+        // Maybe boost exploration during a reheat window
+        let mut explore_frac = alloc_cfg.explore_frac;
+        if let Some(until) = self.explore_boost_until {
+            if iteration < until {
+                explore_frac = explore_frac.max(self.config.stagnation.explore_boost);
+            } else {
+                self.explore_boost_until = None;
+            }
+        }
+
         tracing::Span::current().record("iteration", iteration);
-        tracing::Span::current().record("temp", temp);
+        tracing::Span::current().record("temp", temp_eff);
         tracing::Span::current().record("tau", tau);
 
         let n_ops = self.operator_pool.len();
@@ -448,6 +516,7 @@ where
             self.weights_buf.resize(n_ops, 0.0);
         }
 
+        // Raw scores from operator stats
         let mut maxv = f64::NEG_INFINITY;
         for i in 0..n_ops {
             let s = self.operator_pool.raw_score_at(i, alloc_cfg, stats_cfg);
@@ -457,26 +526,25 @@ where
             self.weights_buf[i] = s;
         }
 
+        // Softmax with temperature tau
         let t = tau.max(1e-6);
         for w in &mut self.weights_buf {
             *w = ((*w - maxv) / t).exp();
         }
 
-        if alloc_cfg.explore_frac > 0.0 {
-            // average of current (softmaxed) weights
+        // Inject uniform exploration mass
+        if explore_frac > 0.0 {
             let mut sum = 0.0;
             for &w in &self.weights_buf {
                 sum += w;
             }
-            // guard against pathological zero sum
             let avg = if sum > 0.0 {
                 sum / n_ops as f64
             } else {
                 1.0 / n_ops as f64
             };
-            let e = alloc_cfg.explore_frac;
             for w in &mut self.weights_buf {
-                *w = (1.0 - e) * *w + e * avg;
+                *w = (1.0 - explore_frac) * *w + explore_frac * avg;
             }
         }
 
@@ -485,17 +553,58 @@ where
                 .expect("weights must be non-negative and finite"),
         );
 
-        let total_draws = usize::max(n_ops, self.config.alloc.target_total_proposals_per_round);
+        // --- Build a concrete job list honoring min/max per-op caps ---
+        let total_draws = usize::max(n_ops, alloc_cfg.target_total_proposals_per_round);
+        let dist_seed = rng_cfg.seed_base_select ^ (iteration as u64).rotate_left(13);
+        let mut job_rng = rand_chacha::ChaCha8Rng::seed_from_u64(dist_seed);
+
+        let mut per_op_counts = vec![0usize; n_ops];
+        let mut jobs: Vec<usize> = Vec::with_capacity(total_draws);
+
+        // mandatory minimums
+        if alloc_cfg.min_per_op > 0 {
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..n_ops {
+                let need = alloc_cfg
+                    .min_per_op
+                    .min(total_draws.saturating_sub(jobs.len()));
+                for _ in 0..need {
+                    jobs.push(i);
+                    per_op_counts[i] += 1;
+                    if jobs.len() >= total_draws {
+                        break;
+                    }
+                }
+                if jobs.len() >= total_draws {
+                    break;
+                }
+            }
+        }
+
+        // sample the rest by weighted index, respecting max_per_op
+        let mut guard = 0usize;
+        while jobs.len() < total_draws && guard < total_draws * 20 {
+            let idx = dist.sample(&mut job_rng);
+            if per_op_counts[idx] < alloc_cfg.max_per_op {
+                jobs.push(idx);
+                per_op_counts[idx] += 1;
+            }
+            guard += 1;
+        }
+
+        // Decorrelate per-op batches
+        jobs.shuffle(&mut job_rng);
+        let jobs = Arc::new(jobs);
 
         let base_seed = rng_cfg.seed_base_task ^ (iteration as u64);
 
-        let reduced = (0..total_draws)
+        let reduced = (0..jobs.len())
             .into_par_iter()
             .fold(
-                || ThreadAccum::empty(n_ops), // one per worker
+                || ThreadAccum::empty(n_ops),
                 |mut acc, j| {
                     let mut rng = make_job_rng(base_seed, j);
-                    let op_idx = dist.sample(&mut rng);
+                    let op_idx = jobs[j];
 
                     let ctx = PlanningContext::new(ledger, terminal);
                     let t0 = Instant::now();
@@ -521,9 +630,15 @@ where
                     // Fold timing into aggregates
                     acc.per_op[op_idx].add_timing(gen_ns, eval_ns);
 
-                    // Maintain a per-worker candidate using SA reduction semantics
+                    // Build candidate with penalized energy
                     let unassigned = plan.ledger().iter_unassigned_requests().count();
                     let feasible = unassigned == 0;
+                    let delta_f = delta.to_f64().unwrap_or(f64::INFINITY);
+                    let energy = if self.config.penalty.use_penalty {
+                        delta_f + self.lambda * (unassigned as f64)
+                    } else {
+                        delta_f
+                    };
 
                     let cand = Candidate {
                         op_idx,
@@ -531,12 +646,13 @@ where
                         delta,
                         unassigned,
                         feasible,
+                        energy,
                     };
-                    acc.candidate = choose_sa(acc.candidate, Some(cand), temp);
+                    acc.candidate = choose_sa_energy(acc.candidate, Some(cand), temp_eff);
                     acc
                 },
             )
-            .reduce(|| ThreadAccum::empty(n_ops), |a, b| a.merge(b, temp));
+            .reduce(|| ThreadAccum::empty(n_ops), |a, b| a.merge(b, temp_eff));
 
         // If nothing useful was produced
         if reduced.per_op.iter().all(|agg| agg.attempts == 0) {
@@ -566,9 +682,11 @@ where
         info!(
             op_index = winner.op_idx,
             op = winner_op_name,
-            %temp,
-            %tau,
+            temp = temp_eff,
+            tau = tau,
             delta = %winner.delta,
+            unassigned = winner.unassigned,
+            energy = winner.energy,
             "Selected winner"
         );
 
@@ -602,7 +720,7 @@ where
         &mut self,
         problem: &'p Problem<T>,
     ) -> Result<Option<SolutionRef<'p, T>>, Self::Error> {
-        // 1) Build initial feasible state
+        // 1) Build initial state (may or may not be feasible)
         let mut state = self
             .construction_solver
             .construct(problem)
@@ -612,51 +730,95 @@ where
         let budget = Duration::from_millis(self.config.max_solver_time_ms);
         let t0 = Instant::now();
 
-        // 3) Best-so-far tracking
+        // 3) Track best *feasible* only (we always return feasible best if any)
         let mut cum_delta = Cost::zero();
         let mut best_feasible_state: Option<_> = state.is_feasible().then(|| state.clone());
         let mut best_feasible_cum: Option<Cost> = state.is_feasible().then_some(cum_delta);
+
+        // Reset meta dynamics
+        self.iters_since_best_feasible = 0;
+        self.temp_scale = 1.0;
+        self.lambda = self.config.penalty.lambda_initial;
+        self.explore_boost_until = None;
 
         let mut iter: usize = 0;
         while t0.elapsed() < budget {
             match self.step(&mut state, iter) {
                 Ok(Some(delta)) => {
                     cum_delta += delta;
-                    if state.is_feasible()
-                        && best_feasible_cum.is_none_or(|best| cum_delta < best)
-                    {
-                        best_feasible_cum = Some(cum_delta);
-                        best_feasible_state = Some(state.clone());
-                        debug!(best = %cum_delta, "New best feasible cumulative delta");
-                    }
                 }
-                Ok(None) => {
-                    if state.is_feasible()
-                        && best_feasible_cum.is_none_or(|best| cum_delta < best)
-                    {
-                        best_feasible_cum = Some(cum_delta);
-                        best_feasible_state = Some(state.clone());
-                        debug!(best = %cum_delta, "New best feasible (no-op step)");
-                    }
+                Ok(None) => { /* no-op */ }
+                Err(e) => {
+                    warn!(error = %e, "Step failed; continuing.");
                 }
-                Err(e) => warn!(error = %e, "Step failed; continuing."),
             }
+
+            // Check feasible improvement
+            let improved_feasible = if state.is_feasible() {
+                match best_feasible_cum {
+                    None => true,
+                    Some(best) => cum_delta < best,
+                }
+            } else {
+                false
+            };
+
+            if improved_feasible {
+                best_feasible_cum = Some(cum_delta);
+                best_feasible_state = Some(state.clone());
+                self.iters_since_best_feasible = 0;
+
+                // decay lambda when we made progress (not below initial)
+                if self.config.penalty.use_penalty {
+                    self.lambda = (self.lambda * self.config.penalty.lambda_decay)
+                        .max(self.config.penalty.lambda_initial);
+                }
+            } else {
+                self.iters_since_best_feasible = self.iters_since_best_feasible.saturating_add(1);
+
+                // Reheat & exploration boost on stagnation
+                if self.iters_since_best_feasible >= self.config.stagnation.iter_threshold {
+                    self.temp_scale *= self.config.stagnation.reheat_multiplier;
+                    self.explore_boost_until =
+                        Some(iter.saturating_add(self.config.stagnation.explore_boost_iters));
+
+                    if self.config.penalty.use_penalty {
+                        self.lambda = (self.lambda * self.config.penalty.lambda_growth)
+                            .min(self.config.penalty.lambda_max);
+                    }
+
+                    if self.config.stagnation.reset_operator_stats_on_reheat {
+                        self.operator_pool.reset_stats();
+                    }
+
+                    self.iters_since_best_feasible = 0;
+                    debug!(
+                        temp_scale = self.temp_scale,
+                        lambda = self.lambda,
+                        "Reheat & boost due to stagnation"
+                    );
+                }
+            }
+
             iter += 1;
             if (iter & 0xF) == 0 && t0.elapsed() >= budget {
                 break;
             }
         }
 
-        // logging unchanged…
-        let final_temp = {
+        // logging
+        let final_temp_base = {
             let a = &self.config.anneal;
             (a.initial_temperature * a.cooling_rate.powi(iter as i32)).max(a.min_temperature)
         };
+        let final_temp_eff =
+            (final_temp_base * self.temp_scale).max(self.config.anneal.min_temperature);
 
         info!(
             iterations = iter,
             proposals = self.proposals_made,
-            temperature = final_temp,
+            temperature = final_temp_eff,
+            lambda = self.lambda,
             "Meta solve finished",
         );
 

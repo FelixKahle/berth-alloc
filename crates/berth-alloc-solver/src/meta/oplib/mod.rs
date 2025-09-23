@@ -25,6 +25,7 @@ pub mod randomdestroyinsert;
 pub mod relocateone;
 pub mod shawdestroyinsert;
 pub mod swappair;
+pub mod targetrepair;
 pub mod temporalslicedestroyinsert;
 
 pub mod prelude {
@@ -35,7 +36,7 @@ pub mod prelude {
         oplib::{
             holefiller::HoleFillerOperator, packleftonberth::PackLeftOnBerthOperator,
             relocateone::RelocateOneOperator, shawdestroyinsert::ShawDestroyInsertOperator,
-            swappair::SwapPairOperator,
+            swappair::SwapPairOperator, targetrepair::TargetedRepairOperator,
             temporalslicedestroyinsert::TemporalSliceDestroyInsertOperator,
         },
     };
@@ -66,6 +67,7 @@ pub mod prelude {
             Box::new(ShawDestroyInsertOperator::default()),
             Box::new(HoleFillerOperator::default()),
             Box::new(TemporalSliceDestroyInsertOperator::default()),
+            Box::new(TargetedRepairOperator::default()),
         ]
     }
 }
