@@ -98,11 +98,6 @@ fn main() {
         .expect("GreedySolver failed to construct a solution");
     let feasible = solver_state.is_feasible();
     let cost = solver_state.cost();
-    println!(
-        "GreedySolver produced a {} solution with cost {}",
-        if feasible { "feasible" } else { "infeasible" },
-        cost
-    );
 
     let construction_solver = GreedySolver::<i64>::new();
     let mut meta_solver = MatheuristicEngine::with_defaults(
@@ -111,9 +106,28 @@ fn main() {
         construction_solver,
     );
     let solution = meta_solver.solve(&problem).expect("MetaSolver failed");
-    // Print None or the cost!
+
+    // Print results
+
+    println!("============================================================");
+    println!("             Results for problem f200x15-02.txt             ");
+    println!("============================================================");
+
     println!(
-        "MetaSolver produced solution: {:?}",
-        solution.map(|s| s.cost())
+        "GreedySolver produced a {} solution with cost {}",
+        if feasible { "feasible" } else { "infeasible" },
+        cost
+    );
+
+    println!(
+        "MatheuhuristicEngine produced {} solution{}",
+        if solution.is_some() {
+            "feasible"
+        } else {
+            "infeasible"
+        },
+        solution
+            .map(|s| format!(" with cost {}", s.cost()))
+            .unwrap_or_default()
     );
 }

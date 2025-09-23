@@ -72,7 +72,6 @@ where
         let mut ok = true;
 
         let plan = ctx.with_builder(|builder| {
-            // Pick a random berth with assignments
             let maybe = builder.with_explorer(|ex| {
                 let mut by_berth: std::collections::BTreeMap<_, Vec<_>> =
                     std::collections::BTreeMap::new();

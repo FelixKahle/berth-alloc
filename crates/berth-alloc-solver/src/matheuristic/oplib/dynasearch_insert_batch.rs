@@ -83,14 +83,12 @@ where
         ctx: PlanningContext<'s, 'p, T>,
         rng: &mut ChaCha8Rng,
     ) -> Option<crate::framework::planning::Plan<'p, T>> {
-        // Tokens for a global permutation that keeps berth segmentation via Delim markers.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum Tok {
             Ship(RequestIdentifier),
             Delim,
         }
 
-        // Snapshot current per-berth order (scalars only).
         let mut berth_order: Vec<BerthIdentifier> = Vec::new();
         let mut per_berth: BTreeMap<BerthIdentifier, Vec<(TimePoint<T>, RequestIdentifier)>> =
             BTreeMap::new();
@@ -116,7 +114,6 @@ where
             v.sort_by_key(|(s, _)| *s);
         }
 
-        // Build token sequence S.
         let mut s: Vec<Tok> = Vec::new();
         for (idx, b) in berth_order.iter().enumerate() {
             if let Some(v) = per_berth.get(b) {
@@ -129,7 +126,6 @@ where
             }
         }
 
-        // Split tokens to segments in berth_order.
         let split_segments = |tokens: &[Tok]| -> Vec<Vec<RequestIdentifier>> {
             let mut segs: Vec<Vec<RequestIdentifier>> = vec![Vec::new(); berth_order.len()];
             let mut k = 0usize;
@@ -147,7 +143,6 @@ where
         };
         let orig_segs = split_segments(&s);
 
-        // Precompute berth index for each token position (ships and delims).
         let mut pos2berth_idx: Vec<usize> = Vec::with_capacity(s.len());
         {
             let mut k = 0usize;
@@ -164,11 +159,10 @@ where
             }
         }
 
-        // Neighborhood over ship tokens only.
         #[derive(Clone, Copy, Debug)]
         enum Move {
             Swap(usize, usize),
-            Insert(usize, usize), // move j before i
+            Insert(usize, usize),
         }
 
         let n = s.len();
@@ -197,7 +191,6 @@ where
             neigh.truncate(self.max_neighbors);
         }
 
-        // Build mutated segments only for the two berths that change.
         let apply_move_to_segments =
             |mv: Move| -> Option<(usize, Vec<RequestIdentifier>, usize, Vec<RequestIdentifier>)> {
                 match mv {
@@ -270,15 +263,12 @@ where
                 }
             };
 
-        // First-improvement: as soon as we find a feasible improving move, apply and return.
         let mut found_move: Option<Move> = None;
         let mut budget = self.work_budget;
 
         let eval_ok = ctx.with_builder(|builder| {
-            // Unassign everything on these berths; return original scalar schedule for restore.
             let unassign_all = |pb: &mut crate::framework::planning::PlanBuilder<'_, 'p, T>,
                                 berths: &BTreeSet<BerthIdentifier>| {
-                // Snapshot scalars (ordered) for restoration.
                 let perb: HashMap<BerthIdentifier, Vec<(RequestIdentifier, TimePoint<T>)>> = pb
                     .with_explorer(|ex| {
                         let mut m: HashMap<_, Vec<_>> = HashMap::new();
@@ -296,7 +286,6 @@ where
                         m
                     });
 
-                // Unassign all handles on those berths (one pass).
                 let mut handles: Vec<_> = pb.with_explorer(|ex| {
                     ex.iter_assigned_requests()
                         .filter(|a| berths.contains(&a.asg().berth_id()))
@@ -310,7 +299,6 @@ where
                 perb
             };
 
-            // Pack a given segment to left/right on a fixed berth (streaming min instead of Vec+sort).
             let reassign_segment = |pb: &mut crate::framework::planning::PlanBuilder<'_, 'p, T>,
                                     bid: BerthIdentifier,
                                     order: &[RequestIdentifier]|
@@ -319,7 +307,6 @@ where
                     return true;
                 }
 
-                // Iterate in requested direction.
                 let iter: Box<dyn Iterator<Item = RequestIdentifier>> = if self.pack_left {
                     Box::new(order.iter().cloned())
                 } else {
@@ -327,7 +314,6 @@ where
                 };
 
                 for rid in iter {
-                    // Read-only phase: find best (fb, start) via streaming argmin.
                     let trip = pb.with_explorer(|ex| {
                         let r = ex
                             .iter_unassigned_requests()
@@ -335,7 +321,6 @@ where
                         let pt = r.req().processing_time_for(bid)?;
                         let w = r.req().feasible_window();
 
-                        // streaming best: (start, iv_start) as tie-break
                         let mut best: Option<(
                             BrandedFreeBerth<'_, 'p, T>,
                             TimePoint<T>,
@@ -375,7 +360,6 @@ where
                         Some((r, fb, s))
                     });
 
-                    // Write phase
                     if let Some((r, fb, s)) = trip {
                         if pb.propose_assignment(r, s, &fb).is_err() {
                             return false;
@@ -387,13 +371,11 @@ where
                 true
             };
 
-            // Restore to the exact original scalars (unassign current → reassign originals).
             let restore_original = |pb: &mut crate::framework::planning::PlanBuilder<'_, 'p, T>,
                                     perb: &HashMap<
                 BerthIdentifier,
                 Vec<(RequestIdentifier, TimePoint<T>)>,
             >| {
-                // Unassign whatever is on those berths right now.
                 let mut handles: Vec<_> = pb.with_explorer(|ex| {
                     ex.iter_assigned_requests()
                         .filter(|a| perb.contains_key(&a.asg().berth_id()))
@@ -404,7 +386,6 @@ where
                     let _ = pb.propose_unassignment(&h);
                 }
 
-                // Put back originals.
                 for (bid, vecs) in perb {
                     for &(rid, start) in vecs {
                         #[allow(clippy::type_complexity)]
@@ -437,7 +418,6 @@ where
                 true
             };
 
-            // Try neighbors (first-improvement): as soon as we find improvement, record it and stop.
             for mv in neigh.iter().cloned() {
                 if budget == 0 || found_move.is_some() {
                     break;
@@ -453,7 +433,6 @@ where
                     changed.insert(berth_order[b2]);
                 }
 
-                // Trial: unassign changed berths and rebuild just those.
                 let originals = unassign_all(builder, &changed);
                 budget =
                     budget.saturating_sub(1 + originals.values().map(|v| v.len()).sum::<usize>());
@@ -467,13 +446,12 @@ where
                 }
 
                 if feasible {
-                    let improve = -builder.delta_cost(); // negative delta_cost => improvement
+                    let improve = -builder.delta_cost();
                     if improve > Cost::zero() {
                         found_move = Some(mv);
                     }
                 }
 
-                // Roll back the trial state.
                 let _ = restore_original(builder, &originals);
                 debug_assert!(builder.delta_cost() == Cost::zero());
             }
@@ -484,7 +462,6 @@ where
         }
         let mv_best = found_move.unwrap();
 
-        // === Apply the improving neighbor for real (touch only the two berths) ===
         let apply_ok = ctx.with_builder(|builder| {
             if let Some((b1, seg1_new, b2, seg2_new)) = apply_move_to_segments(mv_best) {
                 let mut changed: BTreeSet<BerthIdentifier> = BTreeSet::new();
@@ -493,7 +470,6 @@ where
                     changed.insert(berth_order[b2]);
                 }
 
-                // Unassign current on the changed berths.
                 let current: HashMap<BerthIdentifier, Vec<(RequestIdentifier, TimePoint<T>)>> =
                     builder.with_explorer(|ex| {
                         let mut m: HashMap<_, Vec<_>> = HashMap::new();
@@ -525,7 +501,6 @@ where
                     }
                 }
 
-                // Reassign helper (same streaming-min inside).
                 let mut reassign_segment = |bid: BerthIdentifier, order: &[RequestIdentifier]| {
                     for &rid in order {
                         let trip = builder.with_explorer(|ex| {
@@ -576,10 +551,10 @@ where
 
                         if let Some((r, fb, s)) = trip {
                             if builder.propose_assignment(r, s, &fb).is_err() {
-                                return; // abort apply
+                                return;
                             }
                         } else {
-                            return; // abort apply
+                            return;
                         }
                     }
                 };

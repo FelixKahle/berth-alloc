@@ -1,3 +1,24 @@
+// Copyright (c) 2025 Felix Kahle.
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+//
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 use std::ops::Mul;
 use std::sync::Arc;
 use std::time::Duration;
@@ -170,7 +191,6 @@ where
             .max(anneal.min_temperature)
             .min(anneal.max_temperature);
 
-        // softmax tau interpolation (same behavior as before)
         let norm = (temp_base / anneal.initial_temperature).clamp(0.0, 1.0);
         let tau = self.cfg.alloc.softmax_tau_min
             + (self.cfg.alloc.softmax_tau_max - self.cfg.alloc.softmax_tau_min) * norm;
@@ -190,7 +210,6 @@ where
             return Ok(None);
         }
 
-        // 1) scores -> weights
         let raw: Vec<f64> = self
             .pool
             .stats_slice()
@@ -198,7 +217,6 @@ where
             .collect();
         let weights = self.scorer.to_weights(&raw, tau.max(1e-6), explore_frac);
 
-        // 2) draw jobs with caps
         let total_draws = usize::max(n_ops, alloc_cfg.target_total_proposals_per_round);
         let iter_seed = self.seeds.for_iter(iteration) ^ rng_cfg.seed_base_select;
         let mut rng = crate::matheuristic::support::rng::SeedSequencer::rng(iter_seed);
@@ -211,11 +229,9 @@ where
         );
         let jobs = Arc::new(jobs);
 
-        // 3) snapshot current penalized score
         let u_cur = state.ledger().iter_unassigned_requests().count();
         let cur_cost_f = state.cost().to_f64().unwrap_or(f64::INFINITY);
 
-        // 4) parallel propose + evaluate + reduce
         #[derive(Clone, Default)]
         struct OpAgg {
             attempts: u64,
@@ -298,7 +314,6 @@ where
                     }
                     let plan = plan.unwrap();
 
-                    // evaluation (delta only; your original also had an eval timer split)
                     let t1 = self.clock.now();
                     let delta = plan.delta_cost();
                     let eval_ns = self.clock.now().duration_since(t1).as_nanos() as f64;
@@ -334,13 +349,11 @@ where
             .reduce(
                 || ThreadAccum::<'p, T>::empty(n_ops),
                 |a, b| {
-                    // Need an RNG for the reducer during merge
                     let mut r = ChaCha8Rng::seed_from_u64(base_seed ^ 0xDEADBEEFCAFEBABEu64);
                     a.merge(b, temp_eff, &*self.reducer, &mut r)
                 },
             );
 
-        // 5) apply aggregates to stats
         for (i, agg) in reduced.per_op.iter().enumerate() {
             if agg.attempts == 0 {
                 continue;
@@ -371,7 +384,6 @@ where
             return Ok(None);
         };
 
-        // Optional neutral guard
         let u_cur_now = u_cur;
         if winner.delta.is_zero() && winner.unassigned == u_cur_now {
             return Ok(None);
@@ -381,6 +393,8 @@ where
             op = self.pool.get(winner.op_idx).operator().name(),
             delta = %winner.delta,
             energy = %winner.energy,
+            teperature = %temp_eff,
+            lambda = %lambda,
             unassigned = winner.unassigned,
             "Applying candidate"
         );

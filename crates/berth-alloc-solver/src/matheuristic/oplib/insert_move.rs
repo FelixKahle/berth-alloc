@@ -69,7 +69,6 @@ where
         let mut placed = false;
 
         let res = ctx.with_builder(|builder| {
-            // Pick a random assigned ship (victim) to remove and re-insert elsewhere.
             let victim = builder.with_explorer(|ex| ex.iter_assigned_requests().choose(rng));
             let Some(v) = victim else {
                 return;
@@ -80,14 +79,12 @@ where
                 return;
             }
 
-            // Find request back in unassigned pool.
             let req = builder
                 .with_explorer(|ex| ex.iter_unassigned_requests().find(|r| r.req().id() == rid));
             let Some(req) = req else {
                 return;
             };
 
-            // Build (free-block, candidate-start) list across all berths (enhanced insertion).
             let mut candidates: Vec<_> = builder.with_explorer(|ex| {
                 let mut out = Vec::new();
                 for fb in ex.iter_free_for(req.clone()) {
@@ -101,7 +98,6 @@ where
                         if let (Some(hi_iv), Some(hi_w)) = (hi_iv, hi_w) {
                             let hi = std::cmp::min(hi_iv, hi_w);
                             if lo <= hi {
-                                // probe both ends; cheap stand-in for the DP evaluation in dynasearch
                                 out.push((fb.clone(), lo));
                                 if hi != lo {
                                     out.push((fb.clone(), hi));

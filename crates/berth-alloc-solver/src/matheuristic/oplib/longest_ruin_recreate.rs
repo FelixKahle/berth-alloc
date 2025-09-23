@@ -76,10 +76,8 @@ where
                 return;
             }
 
-            // Sort by duration (longest first)
             assigned.sort_by_key(|a| std::cmp::Reverse(a.asg().interval().length()));
 
-            // How many to ruin?
             let n = assigned.len();
             let f = self.fraction.clamp(0.0, 1.0);
             let mut k = ((f * n as f64).round() as usize).min(n);
@@ -93,12 +91,10 @@ where
                 return;
             }
 
-            // Unassign
             for v in &victims {
                 let _ = builder.propose_unassignment(v);
             }
 
-            // Reinsert ONLY the destroyed ones first
             let victim_ids: std::collections::HashSet<_> =
                 victims.iter().map(|a| a.asg().request_id()).collect();
             let mut todo = builder.with_explorer(|ex| {
@@ -106,7 +102,6 @@ where
                     .filter(|r| victim_ids.contains(&r.req().id()))
                     .collect::<Vec<_>>()
             });
-            // Slight randomization to avoid deterministic traps
             todo.shuffle(rng);
 
             'outer: for req in todo {
@@ -129,7 +124,6 @@ where
                             };
                             let hi = std::cmp::min(hi_iv, hi_w);
                             if lo <= hi {
-                                // try right-packed then earliest
                                 out.push((fb.clone(), hi));
                                 if hi != lo {
                                     out.push((fb.clone(), lo));
@@ -137,7 +131,6 @@ where
                             }
                         }
                     }
-                    // Randomize across gaps/berths a bit
                     out.shuffle(rng);
                     out
                 });

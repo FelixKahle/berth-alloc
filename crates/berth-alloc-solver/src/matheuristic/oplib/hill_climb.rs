@@ -72,10 +72,8 @@ where
     ) -> Option<crate::framework::planning::Plan<'p, T>> {
         let aps = self.attempts_per_call.max(1);
 
-        // Try several random victims; return the first improving plan we can build.
         for _ in 0..aps {
             let plan = ctx.with_builder(|builder| {
-                // Pool of currently assigned
                 let mut pool: Vec<_> =
                     builder.with_explorer(|ex| ex.iter_assigned_requests().collect());
                 if pool.is_empty() {
@@ -84,35 +82,28 @@ where
                 pool.shuffle(rng);
                 let victim = pool[0].clone();
 
-                // Remember original placement
                 let (rid, bid0, start0) = (
                     victim.asg().request_id(),
                     victim.asg().berth_id(),
                     victim.asg().start_time(),
                 );
 
-                // Baseline delta (relative to outer state)
                 let base_before = builder.delta_cost();
 
-                // Unassign victim → frees its window on that berth
                 if builder.propose_unassignment(&victim).is_err() {
                     return;
                 }
                 let base_after_unassign = builder.delta_cost();
                 debug_assert!(base_after_unassign <= base_before);
 
-                // Fetch the branded, now-unassigned request
                 let req = builder.with_explorer(|ex| {
                     ex.iter_unassigned_requests().find(|r| r.req().id() == rid)
                 });
                 let Some(req) = req else {
-                    // Should not happen, but restore to be safe
-                    // (We’ll attempt to put it back exactly where it was.)
                     let _ = restore_original(builder, rid, bid0, start0);
                     return;
                 };
 
-                // Enumerate feasible placements as (interval, berth_id, start)
                 let mut options = builder.with_explorer(|ex| {
                     let r = req.req();
                     let w = r.feasible_window();
@@ -132,7 +123,6 @@ where
                             };
                             let hi = std::cmp::min(hi_iv, hi_w);
                             if lo <= hi {
-                                // try right-packed first, but also include earliest as a tie-breaker
                                 out.push((iv, b, hi));
                                 if hi != lo {
                                     out.push((iv, b, lo));
@@ -146,17 +136,12 @@ where
                 if self.shuffle_options {
                     options.shuffle(rng);
                 } else {
-                    // deterministic preference: later starts first (right-packed),
-                    // then earlier ones for the same interval
                     options.sort_by_key(|&(_, _, s)| std::cmp::Reverse(s));
                 }
 
-                // Evaluate each placement by temporarily committing it and measuring total delta.
-                // Keep the best strict improvement; otherwise restore the original.
                 let mut best: Option<(TimeInterval<T>, _, TimePoint<T>, Cost)> = None;
 
                 for (iv, b, s) in options {
-                    // Re-find the concrete BrandedFreeBerth to assign into
                     let free_opt = builder.with_explorer(|ex| {
                         ex.iter_free_for(req.clone())
                             .find(|fb| fb.berth().id() == b && *fb.interval() == iv)
@@ -165,11 +150,8 @@ where
                         continue;
                     };
 
-                    // Tentative assign
                     if builder.propose_assignment(req.clone(), s, &free).is_ok() {
                         let delta_total = builder.delta_cost();
-
-                        // Strict improvement over original baseline?
                         if delta_total < base_before {
                             match &mut best {
                                 None => best = Some((iv, b, s, delta_total)),
@@ -182,7 +164,6 @@ where
                             }
                         }
 
-                        // Undo tentative: unassign the just-placed request
                         let maybe_asg = builder.with_explorer(|ex| {
                             ex.iter_assigned_requests()
                                 .find(|a| a.asg().request_id() == rid)
@@ -190,34 +171,27 @@ where
                         if let Some(a_ref) = maybe_asg {
                             let _ = builder.propose_unassignment(&a_ref);
                         }
-                        // After undo, we should be back to the state just after victim unassignment
-                        debug_assert!(builder.delta_cost() == base_after_unassign);
                     }
                 }
 
                 if let Some((iv_best, b_best, s_best, _)) = best {
-                    // Commit the improving move
                     let free_final = builder.with_explorer(|ex| {
                         ex.iter_free_for(req.clone())
                             .find(|fb| fb.berth().id() == b_best && *fb.interval() == iv_best)
                     });
                     if let Some(fb_final) = free_final {
                         let _ = builder.propose_assignment(req.clone(), s_best, &fb_final);
-                        return; // improved; keep changes
+                        return;
                     }
                 }
 
-                // No improvement found → restore original placement
                 let _ = restore_original(builder, rid, bid0, start0);
-                // leave as a no-op; caller will drop the plan by returning None
             });
 
-            if let Ok(p) = plan {
-                // Only return improving plans (delta < 0); filter out no-ops.
-                if p.delta_cost() < Cost::zero() {
+            if let Ok(p) = plan
+                && p.delta_cost() < Cost::zero() {
                     return Some(p);
                 }
-            }
         }
 
         None
@@ -235,19 +209,16 @@ fn restore_original<'p, T>(
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
 {
-    // Fetch the branded (still) unassigned request
     let req =
         builder.with_explorer(|ex| ex.iter_unassigned_requests().find(|r| r.req().id() == rid));
     let Some(req) = req else {
         return Err(());
     };
 
-    // Need the request's processing time on the original berth
     let Some(pt) = req.req().processing_time_for(bid0) else {
         return Err(());
     };
 
-    // Find a free interval on the original berth that contains [start0, start0+pt)
     let end0 = match start0.checked_add(pt) {
         Some(e) => e,
         None => return Err(()),

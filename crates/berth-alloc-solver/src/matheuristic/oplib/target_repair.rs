@@ -75,7 +75,6 @@ where
         let mut succeeded = true;
 
         let plan = ctx.with_builder(|builder| {
-            // --- pick an unassigned target request
             let target_opt = builder.with_explorer(|ex| {
                 if self.pick_heaviest {
                     ex.iter_unassigned_requests()
@@ -92,7 +91,6 @@ where
             let r = target.req();
             let window = r.feasible_window();
 
-            // Pick one allowed berth to try on (random among allowed)
             let allowed: Vec<_> = r.iter_allowed_berths_ids().collect();
             if allowed.is_empty() {
                 succeeded = false;
@@ -100,13 +98,11 @@ where
             }
             let bid = *allowed.iter().choose(rng).unwrap();
 
-            // --- collect victims: assignments on that berth overlapping the target window
             let mut victim_ids: Vec<_> = builder.with_explorer(|ex| {
                 ex.iter_assignments()
                     .filter(|a| a.asg().berth_id() == bid)
                     .filter(|a| {
                         let iv = a.asg().interval();
-                        // overlap test: [iv.start, iv.end) ∩ [window.start, window.end)
                         iv.end() > window.start() && iv.start() < window.end()
                     })
                     .map(|a| a.asg().request_id())
@@ -114,7 +110,6 @@ where
             });
 
             if victim_ids.is_empty() {
-                // maybe it already fits without removing; try to place directly
                 let mut fit = false;
                 let mut opts = builder.with_explorer(|ex| {
                     let mut out = Vec::new();
@@ -162,14 +157,11 @@ where
                 return;
             }
 
-            // optionally cap victims to keep the ruin limited
             if self.max_victims > 0 && victim_ids.len() > self.max_victims {
                 victim_ids.truncate(self.max_victims);
             }
 
-            // unassign all chosen victims (remember their request ids)
             for rid in &victim_ids {
-                // Find the current assignment by id
                 if let Some(asg) = builder.with_explorer(|ex| {
                     ex.iter_assignments().find(|a| a.asg().request_id() == *rid)
                 }) {
@@ -177,7 +169,6 @@ where
                 }
             }
 
-            // try to place the target on the selected berth
             let mut placed_target = false;
             let mut target_opts = builder.with_explorer(|ex| {
                 let mut out = Vec::new();
@@ -225,15 +216,12 @@ where
                 return;
             }
 
-            // greedily reinsert the victims anywhere
             for rid in victim_ids {
-                // fetch the now-unassigned branded request by id
                 let req_opt = builder.with_explorer(|ex| {
                     ex.iter_unassigned_requests()
                         .find(|r2| r2.req().id() == rid)
                 });
                 let Some(req2) = req_opt else {
-                    // already reinserted by chance? treat as fine
                     continue;
                 };
 
@@ -251,7 +239,6 @@ where
                             if let (Some(hiv), Some(hww)) = (hi2_iv, hi2_w) {
                                 let hi2 = std::cmp::min(hiv, hww);
                                 if lo2 <= hi2 {
-                                    // try both directions for diversity
                                     out.push((fb.clone(), hi2));
                                     if hi2 != lo2 {
                                         out.push((fb.clone(), lo2));

@@ -90,10 +90,10 @@ pub struct AnnealingConfig {
 impl Default for AnnealingConfig {
     fn default() -> Self {
         Self {
-            initial_temperature: 50.0,
-            cooling_rate: 1.0,
+            initial_temperature: 100.0,
+            cooling_rate: 0.995,
             min_temperature: 1e-9,
-            max_temperature: 50.0,
+            max_temperature: 100.0,
             jitter: 1e-9,
         }
     }
@@ -133,8 +133,8 @@ impl Default for PenaltyConfig {
     fn default() -> Self {
         Self {
             use_penalty: true,
-            w: 0.05,
-            lambda_growth: 1.35,
+            w: 0.03,
+            lambda_growth: 1.15,
             lambda_decay: 0.88,
             lambda_max: 200.0,
             lambda_min: 0.01,

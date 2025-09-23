@@ -31,14 +31,12 @@ pub mod random_destroy_insert;
 pub mod reconstruct_greedy;
 pub mod relocate_one;
 pub mod shaw_destroy_insert;
+pub mod swap_pair;
 pub mod swap_same_berth;
-pub mod swappair;
 pub mod target_repair;
 pub mod temporal_slice_destroy_insert;
 
 pub mod prelude {
-    use std::ops::Mul;
-
     use crate::matheuristic::{
         operator::Operator,
         oplib::{
@@ -52,11 +50,12 @@ pub mod prelude {
             longest_ruin_recreate::LongestRuinRecreateOperator,
             nuke::NukeOperator,
             pack_left_on_berth::PackLeftOnBerthOperator,
+            random_destroy_insert::RandomDestroyInsertOperator,
             reconstruct_greedy::ReconstructGreedyOperator,
             relocate_one::RelocateOneOperator,
             shaw_destroy_insert::ShawDestroyInsertOperator,
+            swap_pair::SwapPairOperator,
             swap_same_berth::SwapOrderSameBerthOperator,
-            swappair::SwapPairOperator,
             target_repair::TargetedRepairOperator,
             temporal_slice_destroy_insert::TemporalSliceDestroyInsertOperator,
         },
@@ -64,8 +63,7 @@ pub mod prelude {
     use berth_alloc_core::prelude::Cost;
     use berth_alloc_model::prelude::Problem;
     use num_traits::{CheckedAdd, CheckedSub};
-
-    pub use super::random_destroy_insert::*;
+    use std::ops::Mul;
 
     pub fn op_list<T>(_: &Problem<T>) -> Vec<Box<dyn Operator<Time = T>>>
     where

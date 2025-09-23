@@ -74,7 +74,6 @@ where
             v.into()
         }
 
-        // Build and run the plan.
         let plan = ctx.with_builder(|builder| {
             let (lo_opt, hi_opt) = builder.with_explorer(|ex| {
                 let mut lo: Option<berth_alloc_core::prelude::TimePoint<T>> = None;

@@ -85,11 +85,8 @@ where
         where
             T: Copy + Ord + CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
         {
-            // Collect (free_block, candidate_start) pairs on the target berth, using the
-            // builder's brand so the returned values can be used with `propose_assignment`.
             let mut options = builder.with_explorer(|ex| {
                 let mut out = Vec::new();
-                // Only free blocks on the same berth:
                 for fb in ex
                     .iter_free_for(req.clone())
                     .filter(|fb| fb.berth().id() == berth_id)
@@ -103,7 +100,6 @@ where
                         if let (Some(hi_iv), Some(hi_w)) = (hi_iv, hi_w) {
                             let hi = std::cmp::min(hi_iv, hi_w);
                             if lo <= hi {
-                                // 2-point probe (lo/hi)
                                 out.push((fb.clone(), lo));
                                 if lo != hi {
                                     out.push((fb.clone(), hi));
@@ -131,7 +127,6 @@ where
         }
 
         let res = ctx.with_builder(|builder| {
-            // 1) Pick two assigned requests on the *same* berth.
             let assigned: Vec<_> =
                 builder.with_explorer(|ex| ex.iter_assigned_requests().collect());
 
@@ -155,7 +150,6 @@ where
             let rid_a = a0.asg().request_id();
             let rid_b = b0.asg().request_id();
 
-            // 2) Unassign both.
             if builder.propose_unassignment(a0).is_err() {
                 return;
             }
@@ -163,7 +157,6 @@ where
                 return;
             }
 
-            // 3) Get the now-unassigned requests as *branded* requests (same brand as builder).
             let req_a = builder.with_explorer(|ex| {
                 ex.iter_unassigned_requests()
                     .find(|r| r.req().id() == rid_a)
@@ -176,7 +169,6 @@ where
                 return;
             };
 
-            // 4) Try to place B then A on the same berth (swap order).
             let ok_b = try_assign_on_berth(
                 builder,
                 req_b.clone(),
@@ -196,7 +188,6 @@ where
                 self.try_randomize_starts,
             );
             if !ok_a {
-                // Fallback: undo B (if present) then try A then B.
                 if let Some(xb) = builder.with_explorer(|ex| {
                     ex.iter_assigned_requests()
                         .find(|x| x.asg().request_id() == rid_b)

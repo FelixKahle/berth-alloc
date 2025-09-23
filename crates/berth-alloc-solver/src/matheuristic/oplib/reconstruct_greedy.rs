@@ -74,9 +74,7 @@ where
         let mut touched = false;
 
         let plan = ctx.with_builder(|builder| {
-            // 1) Optional full wipe
             if self.wipe_all_first {
-                // collect first to avoid borrowing issues while mutating
                 let to_unassign =
                     builder.with_explorer(|ex| ex.iter_assignments().collect::<Vec<_>>());
                 for a in to_unassign {
@@ -86,12 +84,9 @@ where
                 }
             }
 
-            // 2) Gather the current unassigned set (may be all requests after wipe)
             let mut reqs =
                 builder.with_explorer(|ex| ex.iter_unassigned_requests().collect::<Vec<_>>());
 
-            // A simple heuristic: sort by earliest deadline-like criterion,
-            // then by higher weight; optionally shuffle for diversification.
             if self.shuffle_requests {
                 reqs.shuffle(rng);
             } else {
@@ -103,7 +98,6 @@ where
                 });
             }
 
-            // 3) Greedy (right-packed first, then earliest) across all free gaps/berths
             for req in reqs {
                 let mut opts = builder.with_explorer(|ex| {
                     let r = req.req();
@@ -124,7 +118,6 @@ where
                             };
                             let hi = std::cmp::min(hi_iv, hi_w);
                             if lo <= hi {
-                                // right-packed and earliest as fallback
                                 out.push((fb.clone(), hi));
                                 if hi != lo {
                                     out.push((fb.clone(), lo));
@@ -138,7 +131,6 @@ where
                 if self.shuffle_options {
                     opts.shuffle(rng);
                 } else {
-                    // try right-packed first overall
                     opts.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
                 }
 
@@ -151,7 +143,6 @@ where
                         break;
                     }
                 }
-                // If none fit, we simply leave this req unassigned; plan can be infeasible.
             }
         });
 
