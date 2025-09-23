@@ -20,28 +20,20 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    framework::err::{FeasibilityError, IncompleteSolverStatePlanApplyError},
-    terminal::err::BerthIdentifierNotFoundError,
+    framework::err::SolverStatePlanApplyError, terminal::err::BerthIdentifierNotFoundError,
 };
 use berth_alloc_model::solution::SolutionError;
 
 #[derive(Debug)]
 pub enum GreedyError<T> {
-    PlanApply(IncompleteSolverStatePlanApplyError<T>),
-    Feasible(FeasibilityError),
+    PlanApply(SolverStatePlanApplyError<T>),
     Solution(SolutionError),
     BerthIdentifierNotFound(BerthIdentifierNotFoundError),
 }
 
-impl<T> From<IncompleteSolverStatePlanApplyError<T>> for GreedyError<T> {
-    fn from(e: IncompleteSolverStatePlanApplyError<T>) -> Self {
+impl<T> From<SolverStatePlanApplyError<T>> for GreedyError<T> {
+    fn from(e: SolverStatePlanApplyError<T>) -> Self {
         GreedyError::PlanApply(e)
-    }
-}
-
-impl<T> From<FeasibilityError> for GreedyError<T> {
-    fn from(e: FeasibilityError) -> Self {
-        GreedyError::Feasible(e)
     }
 }
 
@@ -61,7 +53,6 @@ impl<T: std::fmt::Display> std::fmt::Display for GreedyError<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GreedyError::PlanApply(e) => write!(f, "plan apply: {e}"),
-            GreedyError::Feasible(e) => write!(f, "feasibility: {e}"),
             GreedyError::Solution(e) => write!(f, "solution: {e}"),
             GreedyError::BerthIdentifierNotFound(e) => write!(f, "berth identifier not found: {e}"),
         }

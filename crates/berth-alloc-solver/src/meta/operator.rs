@@ -19,13 +19,20 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::framework::planning::{Plan, PlanningContext};
+use std::fmt::Debug;
 
-pub trait Operator {
+use crate::framework::planning::{Plan, PlanningContext};
+use rand_chacha::ChaCha8Rng;
+
+pub trait Operator: Debug + Send + Sync {
     type Time: Copy + Ord;
+
+    fn name(&self) -> &'static str;
 
     fn propose<'s, 'p>(
         &self,
+        iteration: usize,
         context: PlanningContext<'s, 'p, Self::Time>,
-    ) -> Option<Plan<'s, Self::Time>>;
+        rng: &mut ChaCha8Rng,
+    ) -> Option<Plan<'p, Self::Time>>;
 }

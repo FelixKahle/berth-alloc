@@ -32,5 +32,8 @@ pub trait ConstructionSolver<T: Copy + Ord> {
 pub trait Solver<T: Copy + Ord> {
     type Error;
 
-    fn solve<'p>(&mut self, problem: &'p Problem<T>) -> Result<SolutionRef<'p, T>, Self::Error>;
+    fn solve<'p>(
+        &mut self,
+        problem: &'p Problem<T>,
+    ) -> Result<Option<SolutionRef<'p, T>>, Self::Error>;
 }

@@ -23,16 +23,13 @@ use std::ops::Mul;
 
 use berth_alloc_core::prelude::Cost;
 use berth_alloc_model::{
-    prelude::{SolutionRef, StateValidator},
+    prelude::{Problem, SolutionRef, StateValidator},
     solution::SolutionError,
 };
 use num_traits::{CheckedAdd, CheckedSub};
 
 use crate::{
-    framework::{
-        err::{FeasibilityError, IncompleteSolverStatePlanApplyError, PlanRejectionError},
-        planning::Plan,
-    },
+    framework::{err::SolverStatePlanApplyError, planning::Plan},
     registry::ledger::Ledger,
     terminal::terminalocc::{TerminalOccupancy, TerminalWrite},
 };
@@ -76,15 +73,17 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub> SolverState<'p, T> {
     }
 
     #[inline]
+    pub fn problem(&self) -> &'p Problem<T> {
+        self.ledger.problem()
+    }
+
+    #[inline]
     pub fn terminal_occupancy(&self) -> &TerminalOccupancy<'p, T> {
         &self.terminal_occupancy
     }
 
     #[inline]
-    pub fn apply_plan(
-        &mut self,
-        plan: Plan<'p, T>,
-    ) -> Result<(), IncompleteSolverStatePlanApplyError<T>> {
+    pub fn apply_plan(&mut self, plan: Plan<'p, T>) -> Result<(), SolverStatePlanApplyError<T>> {
         StateValidator::validate_nonoverlap(
             plan.ledger().fixed_assignments(),
             plan.ledger().commited_assignments(),
@@ -121,117 +120,8 @@ impl<'p, T: Copy + Ord> SolverStateView<'p, T> for SolverState<'p, T> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FeasibleSolverState<'p, T: Copy + Ord> {
-    ledger: Ledger<'p, T>,
-    terminal_occupancy: TerminalOccupancy<'p, T>,
-}
-
-impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub> FeasibleSolverState<'p, T> {
-    #[inline]
-    pub fn new(ledger: Ledger<'p, T>, terminal_occupancy: TerminalOccupancy<'p, T>) -> Self {
-        Self {
-            ledger,
-            terminal_occupancy,
-        }
-    }
-
-    #[inline]
-    pub fn ledger(&self) -> &Ledger<'p, T> {
-        &self.ledger
-    }
-
-    #[inline]
-    pub fn terminal_occupancy(&self) -> &TerminalOccupancy<'p, T> {
-        &self.terminal_occupancy
-    }
-
-    pub fn validate_plan(&self, plan: &Plan<'p, T>) -> Result<(), PlanRejectionError<T>> {
-        let mut scratch = self.terminal_occupancy.clone();
-        scratch
-            .apply_delta(plan.terminal_delta().clone())
-            .map_err(PlanRejectionError::Terminal)?;
-
-        let l = plan.ledger();
-        StateValidator::validate_nonoverlap(
-            l.fixed_assignments(),
-            l.commited_assignments(),
-            l.problem(),
-        )?;
-        StateValidator::validate_no_extra_flexible_assignments(l.commited_assignments())?;
-        StateValidator::validate_request_ids_unique(
-            l.fixed_assignments(),
-            l.commited_assignments(),
-        )?;
-        StateValidator::validate_no_extra_flexible_requests(l.commited_assignments(), l.problem())?;
-
-        StateValidator::validate_all_flexible_assignments_present(
-            l.commited_assignments(),
-            l.problem(),
-        )?;
-
-        Ok(())
-    }
-
-    pub fn apply_plan_validated(&mut self, plan: Plan<'p, T>) -> Result<(), PlanRejectionError<T>> {
-        self.validate_plan(&plan)?;
-        let (ledger, delta, _cost) = plan.into_inner();
-        self.ledger = ledger;
-        self.terminal_occupancy
-            .apply_delta(delta)
-            .map_err(PlanRejectionError::Terminal)?;
-        Ok(())
-    }
-}
-
-impl<'p, T> TryFrom<SolverState<'p, T>> for FeasibleSolverState<'p, T>
-where
-    T: Copy + Ord + CheckedAdd + CheckedSub,
-{
-    type Error = FeasibilityError;
-
-    fn try_from(value: SolverState<'p, T>) -> Result<Self, Self::Error> {
-        let ledger = &value.ledger;
-
-        StateValidator::validate_nonoverlap(
-            ledger.fixed_assignments(),
-            ledger.commited_assignments(),
-            ledger.problem(),
-        )?;
-        StateValidator::validate_no_extra_flexible_assignments(ledger.commited_assignments())?;
-        StateValidator::validate_request_ids_unique(
-            ledger.fixed_assignments(),
-            ledger.commited_assignments(),
-        )?;
-        StateValidator::validate_no_extra_flexible_requests(
-            ledger.commited_assignments(),
-            ledger.problem(),
-        )?;
-        StateValidator::validate_all_flexible_assignments_present(
-            ledger.commited_assignments(),
-            ledger.problem(),
-        )?;
-
-        Ok(Self {
-            ledger: value.ledger,
-            terminal_occupancy: value.terminal_occupancy,
-        })
-    }
-}
-
-impl<'p, T: Copy + Ord> SolverStateView<'p, T> for FeasibleSolverState<'p, T> {
-    #[inline]
-    fn ledger(&self) -> &Ledger<'p, T> {
-        &self.ledger
-    }
-    #[inline]
-    fn terminal_occupancy(&self) -> &TerminalOccupancy<'p, T> {
-        &self.terminal_occupancy
-    }
-}
-
 impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub> TryInto<SolutionRef<'p, T>>
-    for FeasibleSolverState<'p, T>
+    for SolverState<'p, T>
 {
     type Error = SolutionError;
 
@@ -249,6 +139,7 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub> TryInto<SolutionRef<'p, T>>
     }
 }
 
+#[allow(dead_code)]
 #[cfg(test)]
 mod feasible_state_tests {
     use super::*;
@@ -313,52 +204,5 @@ mod feasible_state_tests {
 
     fn mk_occ<'b>(berths: &'b [Berth<i64>]) -> TerminalOccupancy<'b, i64> {
         TerminalOccupancy::new(berths)
-    }
-
-    #[test]
-    fn test_feasible_try_from_ok_when_all_flex_assigned_and_no_conflicts() {
-        let prob = problem_one_berth_two_flex();
-
-        let mut ledger = Ledger::new(&prob);
-        let b = prob.berths().get(bid(1)).unwrap();
-        let r1 = prob.flexible_requests().get(rid(1)).unwrap();
-        let r2 = prob.flexible_requests().get(rid(2)).unwrap();
-        ledger.commit_assignment(r1, b, tp(0)).unwrap(); // [0,10)
-        ledger.commit_assignment(r2, b, tp(10)).unwrap(); // [10,15)
-
-        let berths_vec: Vec<Berth<i64>> = prob.berths().iter().cloned().collect();
-        let occ = mk_occ(&berths_vec);
-
-        let inc = SolverState::new(ledger, occ);
-        let feas = FeasibleSolverState::try_from(inc).expect("should be feasible");
-
-        let ids: Vec<_> = feas
-            .ledger()
-            .iter_assigned_requests()
-            .map(|r| r.id())
-            .collect();
-        assert!(ids.contains(&rid(1)) && ids.contains(&rid(2)));
-    }
-
-    #[test]
-    fn test_feasible_try_from_err_when_some_flex_unassigned() {
-        let prob = problem_one_berth_two_flex();
-
-        let mut ledger = Ledger::new(&prob);
-        let b = prob.berths().get(bid(1)).unwrap();
-        let r1 = prob.flexible_requests().get(rid(1)).unwrap();
-        ledger.commit_assignment(r1, b, tp(0)).unwrap();
-
-        let berths_vec: Vec<Berth<i64>> = prob.berths().iter().cloned().collect();
-        let occ = mk_occ(&berths_vec);
-
-        let inc = SolverState::new(ledger, occ);
-        let err = FeasibleSolverState::try_from(inc).unwrap_err();
-        match err {
-            FeasibilityError::MissingFlexibleAssignment(e) => {
-                assert_eq!(e.request_id(), rid(2));
-            }
-            other => panic!("expected MissingFlexibleAssignment, got {other:?}"),
-        }
     }
 }

@@ -19,13 +19,19 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use berth_alloc_model::prelude::Problem;
+use berth_alloc_model::prelude::{Problem, SolutionView};
 use berth_alloc_model::problem::loader::ProblemLoader;
 use berth_alloc_solver::{
-    framework::{solver::ConstructionSolver, state::SolverStateView},
+    framework::{
+        solver::{ConstructionSolver, Solver},
+        state::SolverStateView,
+    },
     greedy::GreedySolver,
+    meta::{config::MetaConfig, engine::MetaEngine, oplib},
 };
 use std::path::{Path, PathBuf};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 fn find_instances_dir() -> Option<PathBuf> {
     let mut cur: Option<&Path> = Some(Path::new(env!("CARGO_MANIFEST_DIR")));
@@ -59,8 +65,21 @@ fn instances() -> impl Iterator<Item = Problem<i64>> {
     })
 }
 
+#[allow(dead_code)]
+fn enable_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
+        )
+        .with_span_events(FmtSpan::ENTER | FmtSpan::EXIT | FmtSpan::CLOSE)
+        .init();
+}
+
 fn main() {
+    //enable_tracing();
+
     for problem in instances() {
+        // Greedy Solve
         println!("Loaded problem with {} requests", problem.request_count());
 
         let solver_state = GreedySolver::<i64>::new()
@@ -72,6 +91,20 @@ fn main() {
             "GreedySolver produced a {} solution with cost {}",
             if feasible { "feasible" } else { "infeasible" },
             cost
+        );
+
+        // Meta Solve
+        let construction_solver = GreedySolver::<i64>::new();
+        let mut meta_solver = MetaEngine::new(
+            MetaConfig::default(),
+            oplib::prelude::op_list::<i64>(&problem),
+            construction_solver,
+        );
+        let solution = meta_solver.solve(&problem).expect("MetaSolver failed");
+        // Print None or the cost!
+        println!(
+            "MetaSolver produced solution: {:?}",
+            solution.map(|s| s.cost())
         );
     }
 }

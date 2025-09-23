@@ -208,13 +208,13 @@ impl<'brand, 'pb, 'p, T: Copy + Ord> PlanExplorer<'brand, 'pb, 'p, T> {
     #[inline]
     pub fn iter_assigned_requests(
         &self,
-    ) -> impl Iterator<Item = BrandedRequest<'brand, 'p, FlexibleKind, T>>
+    ) -> impl Iterator<Item = BrandedAssignmentRef<'brand, 'p, FlexibleKind, T>>
     where
         T: CheckedAdd + CheckedSub,
     {
         self.ledger
-            .iter_assigned_requests()
-            .map(BrandedRequest::new)
+            .iter_assignments()
+            .map(|a| BrandedAssignmentRef::new(a.clone()))
     }
 
     #[inline]

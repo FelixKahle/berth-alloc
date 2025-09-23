@@ -127,7 +127,7 @@ pub struct MetaConfig {
 impl Default for MetaConfig {
     fn default() -> Self {
         Self {
-            max_solver_time_ms: 10000, // 10 seconds
+            max_solver_time_ms: 20000, // 10 seconds
             stats: StatsConfig::default(),
             alloc: AllocationConfig::default(),
             anneal: AnnealingConfig::default(),

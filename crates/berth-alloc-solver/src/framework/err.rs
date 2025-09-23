@@ -27,7 +27,7 @@ use berth_alloc_core::prelude::TimeInterval;
 use berth_alloc_model::{
     prelude::{
         BerthIdentifier, CrossValidationError, ExtraFlexibleAssignmentError,
-        ExtraFlexibleRequestError, MissingFlexibleAssignmentError, RequestIdNotUniqueError,
+        ExtraFlexibleRequestError, RequestIdNotUniqueError,
     },
     problem::err::AssignmentError,
 };
@@ -159,7 +159,7 @@ impl<T> From<TerminalUpdateError<T>> for ProposeUnassignmentError<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum IncompleteSolverStatePlanApplyError<T> {
+pub enum SolverStatePlanApplyError<T> {
     CrossValidation(CrossValidationError),
     ExtraFlexibleAssignment(ExtraFlexibleAssignmentError),
     ExtraFlexibleRequest(ExtraFlexibleRequestError),
@@ -167,154 +167,46 @@ pub enum IncompleteSolverStatePlanApplyError<T> {
     TerminalApply(TerminalApplyError<T>),
 }
 
-impl<T: std::fmt::Display> std::fmt::Display for IncompleteSolverStatePlanApplyError<T> {
+impl<T: std::fmt::Display> std::fmt::Display for SolverStatePlanApplyError<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            IncompleteSolverStatePlanApplyError::CrossValidation(e) => write!(f, "{}", e),
-            IncompleteSolverStatePlanApplyError::ExtraFlexibleAssignment(e) => write!(f, "{}", e),
-            IncompleteSolverStatePlanApplyError::ExtraFlexibleRequest(e) => write!(f, "{}", e),
-            IncompleteSolverStatePlanApplyError::RequestIdNotUnique(e) => write!(f, "{}", e),
-            IncompleteSolverStatePlanApplyError::TerminalApply(e) => write!(f, "{}", e),
+            SolverStatePlanApplyError::CrossValidation(e) => write!(f, "{}", e),
+            SolverStatePlanApplyError::ExtraFlexibleAssignment(e) => write!(f, "{}", e),
+            SolverStatePlanApplyError::ExtraFlexibleRequest(e) => write!(f, "{}", e),
+            SolverStatePlanApplyError::RequestIdNotUnique(e) => write!(f, "{}", e),
+            SolverStatePlanApplyError::TerminalApply(e) => write!(f, "{}", e),
         }
     }
 }
 
-impl<T: std::fmt::Display + std::fmt::Debug> std::error::Error
-    for IncompleteSolverStatePlanApplyError<T>
-{
-}
+impl<T: std::fmt::Display + std::fmt::Debug> std::error::Error for SolverStatePlanApplyError<T> {}
 
-impl<T> From<CrossValidationError> for IncompleteSolverStatePlanApplyError<T> {
+impl<T> From<CrossValidationError> for SolverStatePlanApplyError<T> {
     fn from(err: CrossValidationError) -> Self {
-        IncompleteSolverStatePlanApplyError::CrossValidation(err)
+        SolverStatePlanApplyError::CrossValidation(err)
     }
 }
 
-impl<T> From<ExtraFlexibleRequestError> for IncompleteSolverStatePlanApplyError<T> {
+impl<T> From<ExtraFlexibleRequestError> for SolverStatePlanApplyError<T> {
     fn from(err: ExtraFlexibleRequestError) -> Self {
-        IncompleteSolverStatePlanApplyError::ExtraFlexibleRequest(err)
+        SolverStatePlanApplyError::ExtraFlexibleRequest(err)
     }
 }
 
-impl<T> From<ExtraFlexibleAssignmentError> for IncompleteSolverStatePlanApplyError<T> {
+impl<T> From<ExtraFlexibleAssignmentError> for SolverStatePlanApplyError<T> {
     fn from(err: ExtraFlexibleAssignmentError) -> Self {
-        IncompleteSolverStatePlanApplyError::ExtraFlexibleAssignment(err)
+        SolverStatePlanApplyError::ExtraFlexibleAssignment(err)
     }
 }
 
-impl<T> From<RequestIdNotUniqueError> for IncompleteSolverStatePlanApplyError<T> {
+impl<T> From<RequestIdNotUniqueError> for SolverStatePlanApplyError<T> {
     fn from(err: RequestIdNotUniqueError) -> Self {
-        IncompleteSolverStatePlanApplyError::RequestIdNotUnique(err)
+        SolverStatePlanApplyError::RequestIdNotUnique(err)
     }
 }
 
-impl<T> From<TerminalApplyError<T>> for IncompleteSolverStatePlanApplyError<T> {
+impl<T> From<TerminalApplyError<T>> for SolverStatePlanApplyError<T> {
     fn from(err: TerminalApplyError<T>) -> Self {
-        IncompleteSolverStatePlanApplyError::TerminalApply(err)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum FeasibilityError {
-    CrossValidation(CrossValidationError),
-    MissingFlexibleAssignment(MissingFlexibleAssignmentError),
-    ExtraFlexibleAssignment(ExtraFlexibleAssignmentError),
-    ExtraFlexibleRequest(ExtraFlexibleRequestError),
-    RequestIdNotUnique(RequestIdNotUniqueError),
-}
-
-impl std::fmt::Display for FeasibilityError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FeasibilityError::CrossValidation(e) => write!(f, "{}", e),
-            FeasibilityError::MissingFlexibleAssignment(e) => write!(f, "{}", e),
-            FeasibilityError::ExtraFlexibleAssignment(e) => write!(f, "{}", e),
-            FeasibilityError::ExtraFlexibleRequest(e) => write!(f, "{}", e),
-            FeasibilityError::RequestIdNotUnique(e) => write!(f, "{}", e),
-        }
-    }
-}
-
-impl std::error::Error for FeasibilityError {}
-
-impl From<CrossValidationError> for FeasibilityError {
-    fn from(err: CrossValidationError) -> Self {
-        FeasibilityError::CrossValidation(err)
-    }
-}
-impl From<MissingFlexibleAssignmentError> for FeasibilityError {
-    fn from(err: MissingFlexibleAssignmentError) -> Self {
-        FeasibilityError::MissingFlexibleAssignment(err)
-    }
-}
-impl From<ExtraFlexibleAssignmentError> for FeasibilityError {
-    fn from(err: ExtraFlexibleAssignmentError) -> Self {
-        FeasibilityError::ExtraFlexibleAssignment(err)
-    }
-}
-impl From<ExtraFlexibleRequestError> for FeasibilityError {
-    fn from(err: ExtraFlexibleRequestError) -> Self {
-        FeasibilityError::ExtraFlexibleRequest(err)
-    }
-}
-impl From<RequestIdNotUniqueError> for FeasibilityError {
-    fn from(err: RequestIdNotUniqueError) -> Self {
-        FeasibilityError::RequestIdNotUnique(err)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum PlanRejectionError<T> {
-    CrossValidation(CrossValidationError),
-    MissingFlexibleAssignment(MissingFlexibleAssignmentError),
-    ExtraFlexibleAssignment(ExtraFlexibleAssignmentError),
-    ExtraFlexibleRequest(ExtraFlexibleRequestError),
-    RequestIdNotUnique(RequestIdNotUniqueError),
-    Terminal(TerminalApplyError<T>),
-}
-
-impl<T: std::fmt::Display> std::fmt::Display for PlanRejectionError<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PlanRejectionError::CrossValidation(e) => write!(f, "{}", e),
-            PlanRejectionError::MissingFlexibleAssignment(e) => write!(f, "{}", e),
-            PlanRejectionError::ExtraFlexibleAssignment(e) => write!(f, "{}", e),
-            PlanRejectionError::ExtraFlexibleRequest(e) => write!(f, "{}", e),
-            PlanRejectionError::RequestIdNotUnique(e) => write!(f, "{}", e),
-            PlanRejectionError::Terminal(e) => write!(f, "{}", e),
-        }
-    }
-}
-
-impl<T: std::fmt::Debug + std::fmt::Display> std::error::Error for PlanRejectionError<T> {}
-
-impl<T> From<CrossValidationError> for PlanRejectionError<T> {
-    fn from(err: CrossValidationError) -> Self {
-        PlanRejectionError::CrossValidation(err)
-    }
-}
-impl<T> From<MissingFlexibleAssignmentError> for PlanRejectionError<T> {
-    fn from(err: MissingFlexibleAssignmentError) -> Self {
-        PlanRejectionError::MissingFlexibleAssignment(err)
-    }
-}
-impl<T> From<ExtraFlexibleAssignmentError> for PlanRejectionError<T> {
-    fn from(err: ExtraFlexibleAssignmentError) -> Self {
-        PlanRejectionError::ExtraFlexibleAssignment(err)
-    }
-}
-impl<T> From<ExtraFlexibleRequestError> for PlanRejectionError<T> {
-    fn from(err: ExtraFlexibleRequestError) -> Self {
-        PlanRejectionError::ExtraFlexibleRequest(err)
-    }
-}
-impl<T> From<RequestIdNotUniqueError> for PlanRejectionError<T> {
-    fn from(err: RequestIdNotUniqueError) -> Self {
-        PlanRejectionError::RequestIdNotUnique(err)
-    }
-}
-impl<T> From<TerminalApplyError<T>> for PlanRejectionError<T> {
-    fn from(err: TerminalApplyError<T>) -> Self {
-        PlanRejectionError::Terminal(err)
+        SolverStatePlanApplyError::TerminalApply(err)
     }
 }
