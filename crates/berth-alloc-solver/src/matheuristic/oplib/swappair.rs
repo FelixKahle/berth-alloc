@@ -19,7 +19,7 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::meta::operator::Operator;
+use crate::matheuristic::operator::Operator;
 use berth_alloc_core::prelude::{Cost, TimePoint};
 use berth_alloc_model::problem::asg::AssignmentView;
 use num_traits::{CheckedAdd, CheckedSub};
@@ -119,9 +119,10 @@ where
                     return true;
                 }
                 if let Some(lo) = lo_opt
-                    && builder.propose_assignment(req.clone(), lo, free).is_ok() {
-                        return true;
-                    }
+                    && builder.propose_assignment(req.clone(), lo, free).is_ok()
+                {
+                    return true;
+                }
             }
             false
         }
@@ -176,17 +177,16 @@ where
                     }
                 }
 
-                if !swapped
-                    && place_req(builder, &ra, &fb) {
-                        if place_req(builder, &rb, &fa) {
-                            swapped = true;
-                        } else if let Some(aasg) = builder.with_explorer(|ex| {
-                            ex.iter_assignments()
-                                .find(|x| x.asg().request_id() == rid_a)
-                        }) {
-                            let _ = builder.propose_unassignment(&aasg);
-                        }
+                if !swapped && place_req(builder, &ra, &fb) {
+                    if place_req(builder, &rb, &fa) {
+                        swapped = true;
+                    } else if let Some(aasg) = builder.with_explorer(|ex| {
+                        ex.iter_assignments()
+                            .find(|x| x.asg().request_id() == rid_a)
+                    }) {
+                        let _ = builder.propose_unassignment(&aasg);
                     }
+                }
 
                 if !swapped {
                     let sa = fa.interval().start();

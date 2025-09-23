@@ -19,9 +19,30 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod berth;
-pub mod framework;
-pub mod greedy;
-pub mod matheuristic;
-pub mod registry;
-pub mod terminal;
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
+
+#[derive(Clone, Copy, Debug)]
+pub struct SeedSequencer {
+    pub base: u64,
+}
+
+impl SeedSequencer {
+    pub fn new(base: u64) -> Self {
+        Self { base }
+    }
+
+    /// Deterministic per-iteration seed.
+    pub fn for_iter(&self, iter: usize) -> u64 {
+        self.base ^ (iter as u64)
+    }
+
+    /// Deterministic per-job seed.
+    pub fn for_job(&self, iter_seed: u64, j: usize) -> u64 {
+        iter_seed ^ ((j as u64).rotate_left(17)) ^ 0x9E37_79B1_85EB_CA87u64
+    }
+
+    pub fn rng(seed: u64) -> ChaCha8Rng {
+        ChaCha8Rng::seed_from_u64(seed)
+    }
+}

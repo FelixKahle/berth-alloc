@@ -65,9 +65,9 @@ pub struct AllocationConfig {
 impl Default for AllocationConfig {
     fn default() -> Self {
         Self {
-            target_total_proposals_per_round: 16384,
-            min_per_op: 128,
-            max_per_op: 16384,
+            target_total_proposals_per_round: 4096,
+            min_per_op: 32,
+            max_per_op: 4096,
             explore_frac: 0.30,
             speed_weight: 0.35,
             success_weight: 0.65,
@@ -91,7 +91,7 @@ impl Default for AnnealingConfig {
     fn default() -> Self {
         Self {
             initial_temperature: 50.0,
-            cooling_rate: 0.985,
+            cooling_rate: 1.0,
             min_temperature: 1e-9,
             max_temperature: 50.0,
             jitter: 1e-9,
@@ -168,7 +168,7 @@ impl Default for StagnationConfig {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct MetaConfig {
+pub struct MatheuristicConfig {
     /// Hard time budget for the whole meta solve (milliseconds).
     pub max_solver_time_ms: u64,
     /// Stats / smoothing configuration.
@@ -183,10 +183,10 @@ pub struct MetaConfig {
     pub stagnation: StagnationConfig,
 }
 
-impl Default for MetaConfig {
+impl Default for MatheuristicConfig {
     fn default() -> Self {
         Self {
-            max_solver_time_ms: 20000,
+            max_solver_time_ms: 40000,
             stats: StatsConfig::default(),
             alloc: AllocationConfig::default(),
             anneal: AnnealingConfig::default(),

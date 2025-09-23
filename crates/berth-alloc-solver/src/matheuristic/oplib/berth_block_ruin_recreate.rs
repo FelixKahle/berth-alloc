@@ -19,7 +19,7 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::meta::operator::Operator;
+use crate::matheuristic::operator::Operator;
 use berth_alloc_core::prelude::Cost;
 use berth_alloc_model::problem::asg::AssignmentView;
 use num_traits::{CheckedAdd, CheckedSub};
@@ -79,7 +79,6 @@ where
                 for a in ex.iter_assignments() {
                     by_berth.entry(a.asg().berth_id()).or_default().push(a);
                 }
-                // shuffle keys by sampling one
                 by_berth
                     .into_iter()
                     .collect::<Vec<_>>()
@@ -92,7 +91,6 @@ where
                 return;
             };
 
-            // Sort by start time to get contiguous block
             list.sort_by_key(|a| a.asg().start_time());
             if list.is_empty() {
                 ok = false;
@@ -101,7 +99,6 @@ where
 
             let len = list.len();
             let bl = self.max_block_len.min(len).max(1);
-            // choose start index uniformly
             let start_idx = rng.random_range(0..=len - 1);
             let end_idx = (start_idx + bl).min(len);
             if start_idx >= end_idx {
@@ -119,7 +116,6 @@ where
                 let _ = builder.propose_unassignment(v);
             }
 
-            // Reinsert only these victims, prefer same berth and pack-left/right
             let victim_ids: std::collections::HashSet<_> =
                 victims.iter().map(|a| a.asg().request_id()).collect();
 
@@ -128,7 +124,6 @@ where
                     .iter_unassigned_requests()
                     .filter(|r| victim_ids.contains(&r.req().id()))
                     .collect();
-                // keep original order by id (stable) to reduce variance
                 v.sort_by_key(|r| r.req().id());
                 v
             });
@@ -169,7 +164,6 @@ where
                             }
                         }
                     }
-                    // ensure across gaps we try earlier (or later) starts first on this berth
                     if self.pack_left {
                         out.sort_by_key(|(_, s)| *s);
                     } else {

@@ -19,7 +19,7 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::meta::operator::Operator;
+use crate::matheuristic::operator::Operator;
 use berth_alloc_core::prelude::Cost;
 use berth_alloc_model::problem::asg::AssignmentView;
 use num_traits::{CheckedAdd, CheckedSub};

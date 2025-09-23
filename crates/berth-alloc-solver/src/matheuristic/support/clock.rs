@@ -19,20 +19,16 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use std::fmt::Debug;
+use std::time::Instant;
 
-use crate::framework::planning::{Plan, PlanningContext};
-use rand_chacha::ChaCha8Rng;
+pub trait Clock: Send + Sync {
+    fn now(&self) -> Instant;
+}
 
-pub trait Operator: Debug + Send + Sync {
-    type Time: Copy + Ord;
-
-    fn name(&self) -> &'static str;
-
-    fn propose<'s, 'p>(
-        &self,
-        iteration: usize,
-        context: PlanningContext<'s, 'p, Self::Time>,
-        rng: &mut ChaCha8Rng,
-    ) -> Option<Plan<'p, Self::Time>>;
+#[derive(Default, Debug, Clone, Copy)]
+pub struct SystemClock;
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
 }

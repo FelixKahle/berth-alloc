@@ -19,30 +19,35 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::meta::operator::Operator;
+use crate::matheuristic::operator::Operator;
 use berth_alloc_core::prelude::Cost;
-use berth_alloc_model::problem::asg::AssignmentView;
 use num_traits::{CheckedAdd, CheckedSub};
 use rand::seq::SliceRandom;
 use std::ops::Mul;
 
 #[derive(Debug, Clone)]
-pub struct LongestRuinRecreateOperator<T> {
-    /// Fraction of assigned requests to ruin (0..=1). If >0, at least one is removed.
-    pub fraction: f64,
+pub struct ReconstructGreedyOperator<T> {
+    /// If true, unassign everything first; otherwise only (re)insert currently unassigned.
+    pub wipe_all_first: bool,
+    /// Randomize request order for diversification.
+    pub shuffle_requests: bool,
+    /// Randomize options (free windows) per request.
+    pub shuffle_options: bool,
     _p: std::marker::PhantomData<T>,
 }
 
-impl<T> Default for LongestRuinRecreateOperator<T> {
+impl<T> Default for ReconstructGreedyOperator<T> {
     fn default() -> Self {
         Self {
-            fraction: 0.15,
-            _p: Default::default(),
+            wipe_all_first: true,
+            shuffle_requests: true,
+            shuffle_options: true,
+            _p: std::marker::PhantomData,
         }
     }
 }
 
-impl<T> Operator for LongestRuinRecreateOperator<T>
+impl<T> Operator for ReconstructGreedyOperator<T>
 where
     T: Copy
         + Ord
@@ -57,7 +62,7 @@ where
     type Time = T;
 
     fn name(&self) -> &'static str {
-        "LongestRuinRecreate"
+        "ReconstructGreedy"
     }
 
     fn propose<'s, 'p>(
@@ -66,50 +71,40 @@ where
         ctx: crate::framework::planning::PlanningContext<'s, 'p, T>,
         rng: &mut rand_chacha::ChaCha8Rng,
     ) -> Option<crate::framework::planning::Plan<'p, T>> {
-        let mut repaired_all = true;
+        let mut touched = false;
 
         let plan = ctx.with_builder(|builder| {
-            // Collect all assignments
-            let mut assigned: Vec<_> = builder.with_explorer(|ex| ex.iter_assignments().collect());
-            if assigned.is_empty() {
-                repaired_all = false;
-                return;
+            // 1) Optional full wipe
+            if self.wipe_all_first {
+                // collect first to avoid borrowing issues while mutating
+                let to_unassign =
+                    builder.with_explorer(|ex| ex.iter_assignments().collect::<Vec<_>>());
+                for a in to_unassign {
+                    if builder.propose_unassignment(&a).is_ok() {
+                        touched = true;
+                    }
+                }
             }
 
-            // Sort by duration (longest first)
-            assigned.sort_by_key(|a| std::cmp::Reverse(a.asg().interval().length()));
+            // 2) Gather the current unassigned set (may be all requests after wipe)
+            let mut reqs =
+                builder.with_explorer(|ex| ex.iter_unassigned_requests().collect::<Vec<_>>());
 
-            // How many to ruin?
-            let n = assigned.len();
-            let f = self.fraction.clamp(0.0, 1.0);
-            let mut k = ((f * n as f64).round() as usize).min(n);
-            if f > 0.0 {
-                k = k.max(1);
+            // A simple heuristic: sort by earliest deadline-like criterion,
+            // then by higher weight; optionally shuffle for diversification.
+            if self.shuffle_requests {
+                reqs.shuffle(rng);
+            } else {
+                reqs.sort_by_key(|r| {
+                    (
+                        r.req().feasible_window().end(),
+                        std::cmp::Reverse(r.req().weight()),
+                    )
+                });
             }
 
-            let victims = assigned.into_iter().take(k).collect::<Vec<_>>();
-            if victims.is_empty() {
-                repaired_all = false;
-                return;
-            }
-
-            // Unassign
-            for v in &victims {
-                let _ = builder.propose_unassignment(v);
-            }
-
-            // Reinsert ONLY the destroyed ones first
-            let victim_ids: std::collections::HashSet<_> =
-                victims.iter().map(|a| a.asg().request_id()).collect();
-            let mut todo = builder.with_explorer(|ex| {
-                ex.iter_unassigned_requests()
-                    .filter(|r| victim_ids.contains(&r.req().id()))
-                    .collect::<Vec<_>>()
-            });
-            // Slight randomization to avoid deterministic traps
-            todo.shuffle(rng);
-
-            'outer: for req in todo {
+            // 3) Greedy (right-packed first, then earliest) across all free gaps/berths
+            for req in reqs {
                 let mut opts = builder.with_explorer(|ex| {
                     let r = req.req();
                     let w = r.feasible_window();
@@ -129,7 +124,7 @@ where
                             };
                             let hi = std::cmp::min(hi_iv, hi_w);
                             if lo <= hi {
-                                // try right-packed then earliest
+                                // right-packed and earliest as fallback
                                 out.push((fb.clone(), hi));
                                 if hi != lo {
                                     out.push((fb.clone(), lo));
@@ -137,30 +132,31 @@ where
                             }
                         }
                     }
-                    // Randomize across gaps/berths a bit
-                    out.shuffle(rng);
                     out
                 });
 
-                let mut placed = false;
-                for (free, start) in opts.drain(..) {
+                if self.shuffle_options {
+                    opts.shuffle(rng);
+                } else {
+                    // try right-packed first overall
+                    opts.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
+                }
+
+                for (free, start) in opts {
                     if builder
                         .propose_assignment(req.clone(), start, &free)
                         .is_ok()
                     {
-                        placed = true;
+                        touched = true;
                         break;
                     }
                 }
-                if !placed {
-                    repaired_all = false;
-                    break 'outer;
-                }
+                // If none fit, we simply leave this req unassigned; plan can be infeasible.
             }
         });
 
         match plan {
-            Ok(p) if repaired_all => Some(p),
+            Ok(p) if touched => Some(p),
             _ => None,
         }
     }
