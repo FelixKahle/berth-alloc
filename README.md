@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Rust 2024](https://img.shields.io/badge/Rust-Edition%202024-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024)
-[![Test Status](https://img.shields.io/github/actions/workflow/status/FelixKahle/dock-alloc/test.yml?label=tests)](https://github.com/FelixKahle/berth-alloc/actions/workflows/test.yml)
+[![Test Status](https://img.shields.io/github/actions/workflow/status/FelixKahle/berth-alloc/test.yml?label=tests)](https://github.com/FelixKahle/berth-alloc/actions/workflows/test.yml)
 
 ---
 
