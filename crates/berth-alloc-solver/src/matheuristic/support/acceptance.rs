@@ -19,9 +19,22 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod berth;
-pub mod framework;
-pub mod greedy;
-pub mod matheuristic;
-pub mod registry;
-pub mod terminal;
+#[inline]
+pub fn ewma(prev: f64, x: f64, alpha: f64) -> f64 {
+    if prev == 0.0 {
+        x
+    } else {
+        alpha * x + (1.0 - alpha) * prev
+    }
+}
+
+#[inline]
+pub fn acceptance_prob(delta_e: f64, temp: f64) -> f64 {
+    if delta_e < 0.0 {
+        1.0
+    } else if delta_e > 0.0 {
+        (-delta_e / temp.max(1e-12)).exp()
+    } else {
+        0.0
+    }
+}

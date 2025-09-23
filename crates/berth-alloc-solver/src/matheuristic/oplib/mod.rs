@@ -19,32 +19,51 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod holefiller;
-pub mod packleftonberth;
-pub mod randomdestroyinsert;
-pub mod relocateone;
-pub mod shawdestroyinsert;
-pub mod swappair;
-pub mod targetrepair;
-pub mod temporalslicedestroyinsert;
+pub mod berth_block_ruin_recreate;
+pub mod dynasearch_insert_batch;
+pub mod hill_climb;
+pub mod hole_filler;
+pub mod insert_move;
+pub mod longest_ruin_recreate;
+pub mod nuke;
+pub mod pack_left_on_berth;
+pub mod random_destroy_insert;
+pub mod reconstruct_greedy;
+pub mod relocate_one;
+pub mod shaw_destroy_insert;
+pub mod swap_pair;
+pub mod swap_same_berth;
+pub mod target_repair;
+pub mod temporal_slice_destroy_insert;
 
 pub mod prelude {
-    use std::ops::Mul;
-
-    use crate::meta::{
+    use crate::matheuristic::{
         operator::Operator,
         oplib::{
-            holefiller::HoleFillerOperator, packleftonberth::PackLeftOnBerthOperator,
-            relocateone::RelocateOneOperator, shawdestroyinsert::ShawDestroyInsertOperator,
-            swappair::SwapPairOperator, targetrepair::TargetedRepairOperator,
-            temporalslicedestroyinsert::TemporalSliceDestroyInsertOperator,
+            berth_block_ruin_recreate::BerthBlockRuinRecreateOperator,
+            dynasearch_insert_batch::{
+                DynasearchInsertBatchOperator, EnhancedDynasearchOnceOperator,
+            },
+            hill_climb::HillClimbRelocateOperator,
+            hole_filler::HoleFillerOperator,
+            insert_move::InsertMoveOperator,
+            longest_ruin_recreate::LongestRuinRecreateOperator,
+            nuke::NukeOperator,
+            pack_left_on_berth::PackLeftOnBerthOperator,
+            random_destroy_insert::RandomDestroyInsertOperator,
+            reconstruct_greedy::ReconstructGreedyOperator,
+            relocate_one::RelocateOneOperator,
+            shaw_destroy_insert::ShawDestroyInsertOperator,
+            swap_pair::SwapPairOperator,
+            swap_same_berth::SwapOrderSameBerthOperator,
+            target_repair::TargetedRepairOperator,
+            temporal_slice_destroy_insert::TemporalSliceDestroyInsertOperator,
         },
     };
     use berth_alloc_core::prelude::Cost;
     use berth_alloc_model::prelude::Problem;
     use num_traits::{CheckedAdd, CheckedSub};
-
-    pub use super::randomdestroyinsert::*;
+    use std::ops::Mul;
 
     pub fn op_list<T>(_: &Problem<T>) -> Vec<Box<dyn Operator<Time = T>>>
     where
@@ -68,6 +87,15 @@ pub mod prelude {
             Box::new(HoleFillerOperator::default()),
             Box::new(TemporalSliceDestroyInsertOperator::default()),
             Box::new(TargetedRepairOperator::default()),
+            Box::new(NukeOperator::default()),
+            Box::new(ReconstructGreedyOperator::default()),
+            Box::new(HillClimbRelocateOperator::default()),
+            Box::new(LongestRuinRecreateOperator::default()),
+            Box::new(BerthBlockRuinRecreateOperator::default()),
+            Box::new(InsertMoveOperator::default()),
+            Box::new(SwapOrderSameBerthOperator::default()),
+            Box::new(EnhancedDynasearchOnceOperator::default()),
+            Box::new(DynasearchInsertBatchOperator::default()),
         ]
     }
 }

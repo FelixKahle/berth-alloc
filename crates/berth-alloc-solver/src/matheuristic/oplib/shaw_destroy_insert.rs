@@ -19,29 +19,36 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::meta::operator::Operator;
+use crate::matheuristic::operator::Operator;
 use berth_alloc_core::prelude::Cost;
 use berth_alloc_model::problem::asg::AssignmentView;
-use num_traits::{CheckedAdd, CheckedSub};
+use num_traits::{CheckedAdd, CheckedSub, ToPrimitive};
 use rand::seq::{IteratorRandom, SliceRandom};
-use std::{collections::HashSet, ops::Mul};
+use std::ops::Mul;
 
 #[derive(Debug, Clone)]
-pub struct RandomDestroyInsertOperator<T> {
-    pub fraction: f64,
-    _phantom: std::marker::PhantomData<T>,
+pub struct ShawDestroyInsertOperator<T> {
+    /// Number of assignments to destroy (seed + k-1 most related).
+    pub k: usize,
+    /// Weight of temporal distance in relatedness score.
+    pub alpha_time: f64,
+    /// Weight for same-berth “bonus” (0 if same berth, 1 otherwise).
+    pub alpha_berth: f64,
+    _p: std::marker::PhantomData<T>,
 }
 
-impl<T> Default for RandomDestroyInsertOperator<T> {
+impl<T> Default for ShawDestroyInsertOperator<T> {
     fn default() -> Self {
         Self {
-            fraction: 0.7,
-            _phantom: std::marker::PhantomData,
+            k: 4,
+            alpha_time: 1.0,
+            alpha_berth: 1.0,
+            _p: Default::default(),
         }
     }
 }
 
-impl<T> Operator for RandomDestroyInsertOperator<T>
+impl<T> Operator for ShawDestroyInsertOperator<T>
 where
     T: Copy
         + Ord
@@ -56,30 +63,52 @@ where
     type Time = T;
 
     fn name(&self) -> &'static str {
-        "RandomDestroyInsert"
+        "ShawDestroyInsert"
     }
 
     fn propose<'s, 'p>(
         &self,
-        _iteration: usize,
-        ctx: crate::framework::planning::PlanningContext<'s, 'p, Self::Time>,
+        _iter: usize,
+        ctx: crate::framework::planning::PlanningContext<'s, 'p, T>,
         rng: &mut rand_chacha::ChaCha8Rng,
-    ) -> Option<crate::framework::planning::Plan<'p, Self::Time>> {
+    ) -> Option<crate::framework::planning::Plan<'p, T>> {
         let mut fully_repaired = true;
-        let frac = self.fraction.clamp(0.0, 1.0);
 
         let plan_res = ctx.with_builder(|builder| {
-            let (victims, destroyed_ids): (Vec<_>, HashSet<_>) = builder.with_explorer(|ex| {
-                let n = ex.iter_assignments().count();
-                let mut k = (frac * n as f64).round() as usize;
-                if frac > 0.0 {
-                    k = k.max(1);
-                }
-                let v: Vec<_> = ex.iter_assignments().choose_multiple(rng, k);
-                let ids = v.iter().map(|a| a.asg().request_id()).collect();
-                (v, ids)
+            let mut assigned =
+                builder.with_explorer(|ex| ex.iter_assignments().collect::<Vec<_>>());
+            if assigned.is_empty() {
+                fully_repaired = false;
+                return;
+            }
+
+            let Some(seed) = assigned.iter().choose(rng) else {
+                fully_repaired = false;
+                return;
+            };
+            let sbid = seed.asg().berth_id();
+            let sstart = seed.asg().start_time();
+
+            let time_dist = |tp: berth_alloc_core::prelude::TimePoint<T>| -> f64 {
+                let a: Cost = tp.value().into();
+                let b: Cost = sstart.value().into();
+                (a - b).abs().to_f64().unwrap_or(0.0)
+            };
+
+            assigned.sort_by(|a, b| {
+                let (abid, astart) = (a.asg().berth_id(), a.asg().start_time());
+                let (bbid, bstart) = (b.asg().berth_id(), b.asg().start_time());
+
+                let rd_a = self.alpha_berth * if abid == sbid { 0.0 } else { 1.0 }
+                    + self.alpha_time * time_dist(astart);
+                let rd_b = self.alpha_berth * if bbid == sbid { 0.0 } else { 1.0 }
+                    + self.alpha_time * time_dist(bstart);
+
+                rd_a.partial_cmp(&rd_b).unwrap_or(std::cmp::Ordering::Equal)
             });
 
+            let k = self.k.min(assigned.len());
+            let victims = assigned.into_iter().take(k).collect::<Vec<_>>();
             if victims.is_empty() {
                 fully_repaired = false;
                 return;
@@ -88,14 +117,11 @@ where
                 let _ = builder.propose_unassignment(v);
             }
 
-            let mut destroyed_reqs = builder.with_explorer(|ex| {
-                ex.iter_unassigned_requests()
-                    .filter(|r| destroyed_ids.contains(&r.req().id()))
-                    .collect::<Vec<_>>()
-            });
-            destroyed_reqs.shuffle(rng);
+            let mut todo =
+                builder.with_explorer(|ex| ex.iter_unassigned_requests().collect::<Vec<_>>());
+            todo.shuffle(rng);
 
-            for req in destroyed_reqs {
+            'repair: for req in todo.into_iter() {
                 let mut opts = builder.with_explorer(|ex| {
                     let r = req.req();
                     let w = r.feasible_window();
@@ -108,6 +134,7 @@ where
                             let lo = std::cmp::max(iv.start(), w.start());
                             let hi_iv = iv.end().checked_sub(pt);
                             let hi_w = w.end().checked_sub(pt);
+
                             if let (Some(hi_iv), Some(hi_w)) = (hi_iv, hi_w) {
                                 let hi = std::cmp::min(hi_iv, hi_w);
                                 if lo <= hi {
@@ -121,7 +148,6 @@ where
                     }
                     out
                 });
-
                 opts.shuffle(rng);
 
                 let mut placed = false;
@@ -134,55 +160,10 @@ where
                         break;
                     }
                 }
+
                 if !placed {
                     fully_repaired = false;
-                    return;
-                }
-            }
-
-            let mut others = builder.with_explorer(|ex| {
-                ex.iter_unassigned_requests()
-                    .filter(|r| !destroyed_ids.contains(&r.req().id()))
-                    .collect::<Vec<_>>()
-            });
-            others.shuffle(rng);
-
-            for req in others {
-                let mut opts = builder.with_explorer(|ex| {
-                    let r = req.req();
-                    let w = r.feasible_window();
-                    let mut out = Vec::new();
-
-                    for fb in ex.iter_free_for(req.clone()) {
-                        let bid = fb.berth().id();
-                        if let Some(pt) = r.processing_time_for(bid) {
-                            let iv = *fb.interval();
-                            let lo = std::cmp::max(iv.start(), w.start());
-                            let hi_iv = iv.end().checked_sub(pt);
-                            let hi_w = w.end().checked_sub(pt);
-                            if let (Some(hi_iv), Some(hi_w)) = (hi_iv, hi_w) {
-                                let hi = std::cmp::min(hi_iv, hi_w);
-                                if lo <= hi {
-                                    out.push((fb.clone(), hi));
-                                    if hi != lo {
-                                        out.push((fb.clone(), lo));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    out
-                });
-
-                opts.shuffle(rng);
-
-                for (free, start) in opts {
-                    if builder
-                        .propose_assignment(req.clone(), start, &free)
-                        .is_ok()
-                    {
-                        break;
-                    }
+                    break 'repair;
                 }
             }
         });

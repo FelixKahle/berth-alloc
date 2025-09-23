@@ -19,30 +19,33 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::meta::operator::Operator;
+use crate::matheuristic::operator::Operator;
 use berth_alloc_core::prelude::Cost;
 use berth_alloc_model::problem::asg::AssignmentView;
-use num_traits::{CheckedAdd, CheckedSub, ToPrimitive};
-use rand::Rng;
+use num_traits::{CheckedAdd, CheckedSub};
+use rand::{Rng, seq::IteratorRandom};
 use std::ops::Mul;
 
 #[derive(Debug, Clone)]
-pub struct TemporalSliceDestroyInsertOperator<T> {
-    /// Slice length in the same numeric space as `Cost` (meaningful e.g. for T=i64).
-    pub window_len: i64,
+pub struct BerthBlockRuinRecreateOperator<T> {
+    /// Max number of consecutive assignments on a berth to ruin.
+    pub max_block_len: usize,
+    /// Pack-left or pack-right preference on rebuild.
+    pub pack_left: bool,
     _p: std::marker::PhantomData<T>,
 }
 
-impl<T> Default for TemporalSliceDestroyInsertOperator<T> {
+impl<T> Default for BerthBlockRuinRecreateOperator<T> {
     fn default() -> Self {
         Self {
-            window_len: 20,
+            max_block_len: 6,
+            pack_left: true,
             _p: Default::default(),
         }
     }
 }
 
-impl<T> Operator for TemporalSliceDestroyInsertOperator<T>
+impl<T> Operator for BerthBlockRuinRecreateOperator<T>
 where
     T: Copy
         + Ord
@@ -57,7 +60,7 @@ where
     type Time = T;
 
     fn name(&self) -> &'static str {
-        "TemporalSliceDestroyInsert"
+        "BerthBlockRuinRecreate"
     }
 
     fn propose<'s, 'p>(
@@ -66,105 +69,105 @@ where
         ctx: crate::framework::planning::PlanningContext<'s, 'p, T>,
         rng: &mut rand_chacha::ChaCha8Rng,
     ) -> Option<crate::framework::planning::Plan<'p, T>> {
-        let mut succeeded = true;
+        let mut ok = true;
 
-        #[inline]
-        fn tp_to_cost<T: Copy + Into<Cost>>(tp: berth_alloc_core::prelude::TimePoint<T>) -> Cost {
-            let v: T = tp.value();
-            v.into()
-        }
-
-        // Build and run the plan.
         let plan = ctx.with_builder(|builder| {
-            let (lo_opt, hi_opt) = builder.with_explorer(|ex| {
-                let mut lo: Option<berth_alloc_core::prelude::TimePoint<T>> = None;
-                let mut hi: Option<berth_alloc_core::prelude::TimePoint<T>> = None;
-
+            let maybe = builder.with_explorer(|ex| {
+                let mut by_berth: std::collections::BTreeMap<_, Vec<_>> =
+                    std::collections::BTreeMap::new();
                 for a in ex.iter_assignments() {
-                    let iv = a.asg().interval();
-                    let s = iv.start();
-                    let e = iv.end();
-                    lo = Some(lo.map_or(s, |cur| if s < cur { s } else { cur }));
-                    hi = Some(hi.map_or(e, |cur| if e > cur { e } else { cur }));
+                    by_berth.entry(a.asg().berth_id()).or_default().push(a);
                 }
-                (lo, hi)
+                by_berth
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .choose(rng)
             });
 
-            let (Some(lo_tp), Some(hi_tp)) = (lo_opt, hi_opt) else {
-                succeeded = false;
+            let Some((bid, mut list)) = maybe else {
+                ok = false;
                 return;
             };
 
-            let lo_c = tp_to_cost(lo_tp);
-            let hi_c = tp_to_cost(hi_tp);
-            if hi_c <= lo_c {
-                succeeded = false;
+            list.sort_by_key(|a| a.asg().start_time());
+            if list.is_empty() {
+                ok = false;
                 return;
             }
 
-            let span_cost = hi_c - lo_c;
-            let Some(span_i64) = span_cost.to_i64() else {
-                succeeded = false;
-                return;
-            };
-            if span_i64 <= 0 {
-                succeeded = false;
+            let len = list.len();
+            let bl = self.max_block_len.min(len).max(1);
+            let start_idx = rng.random_range(0..=len - 1);
+            let end_idx = (start_idx + bl).min(len);
+            if start_idx >= end_idx {
+                ok = false;
                 return;
             }
 
-            let slice_len = self.window_len.max(1);
-            let offset = rng.random_range(0..span_i64);
-            let slice_lo = lo_c + Cost::from(offset);
-            let slice_hi = slice_lo + Cost::from(slice_len);
-
-            let victims: Vec<_> = builder.with_explorer(|ex| {
-                ex.iter_assignments()
-                    .filter(|a| {
-                        let iv = a.asg().interval();
-                        let s = tp_to_cost(iv.start());
-                        let e = tp_to_cost(iv.end());
-                        e > slice_lo && s < slice_hi
-                    })
-                    .collect()
-            });
-
+            let victims = list[start_idx..end_idx].to_vec();
             if victims.is_empty() {
-                succeeded = false;
+                ok = false;
                 return;
             }
 
-            for v in victims {
-                let _ = builder.propose_unassignment(&v);
+            for v in &victims {
+                let _ = builder.propose_unassignment(v);
             }
 
-            let mut todo =
-                builder.with_explorer(|ex| ex.iter_unassigned_requests().collect::<Vec<_>>());
+            let victim_ids: std::collections::HashSet<_> =
+                victims.iter().map(|a| a.asg().request_id()).collect();
 
-            for req in todo.drain(..) {
+            let mut reqs = builder.with_explorer(|ex| {
+                let mut v: Vec<_> = ex
+                    .iter_unassigned_requests()
+                    .filter(|r| victim_ids.contains(&r.req().id()))
+                    .collect();
+                v.sort_by_key(|r| r.req().id());
+                v
+            });
+
+            'outer: for req in reqs.drain(..) {
                 let mut opts = builder.with_explorer(|ex| {
                     let r = req.req();
                     let w = r.feasible_window();
                     let mut out = Vec::new();
                     for fb in ex.iter_free_for(req.clone()) {
-                        let bid = fb.berth().id();
+                        if fb.berth().id() != bid {
+                            continue;
+                        }
                         if let Some(pt) = r.processing_time_for(bid) {
                             let iv = *fb.interval();
                             let lo = std::cmp::max(iv.start(), w.start());
-                            let hi_iv = iv.end().checked_sub(pt);
-                            let hi_w = w.end().checked_sub(pt);
-                            let (Some(hi_iv), Some(hi_w)) = (hi_iv, hi_w) else {
-                                continue;
+                            let hi_iv = match iv.end().checked_sub(pt) {
+                                Some(x) => x,
+                                None => continue,
+                            };
+                            let hi_w = match w.end().checked_sub(pt) {
+                                Some(x) => x,
+                                None => continue,
                             };
                             let hi = std::cmp::min(hi_iv, hi_w);
                             if lo <= hi {
-                                out.push((fb.clone(), hi));
-                                if hi != lo {
+                                if self.pack_left {
                                     out.push((fb.clone(), lo));
+                                    if hi != lo {
+                                        out.push((fb.clone(), hi));
+                                    }
+                                } else {
+                                    out.push((fb.clone(), hi));
+                                    if hi != lo {
+                                        out.push((fb.clone(), lo));
+                                    }
                                 }
                             }
                         }
                     }
-                    out.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
+                    if self.pack_left {
+                        out.sort_by_key(|(_, s)| *s);
+                    } else {
+                        out.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
+                    }
                     out
                 });
 
@@ -178,14 +181,13 @@ where
                         break;
                     }
                 }
-
                 if !placed {
-                    succeeded = false;
-                    break;
+                    ok = false;
+                    break 'outer;
                 }
             }
         });
 
-        if succeeded { plan.ok() } else { None }
+        if ok { plan.ok() } else { None }
     }
 }

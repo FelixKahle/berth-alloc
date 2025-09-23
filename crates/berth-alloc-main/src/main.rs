@@ -27,7 +27,7 @@ use berth_alloc_solver::{
         state::SolverStateView,
     },
     greedy::GreedySolver,
-    meta::{config::MetaConfig, engine::MetaEngine, oplib},
+    matheuristic::{config::MatheuristicConfig, engine::MatheuristicEngine, oplib},
 };
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
@@ -45,6 +45,7 @@ fn find_instances_dir() -> Option<PathBuf> {
     None
 }
 
+#[allow(dead_code)]
 fn instances() -> impl Iterator<Item = Problem<i64>> {
     let inst_dir = find_instances_dir()
         .expect("Could not find an `instances/` directory in any ancestor of CARGO_MANIFEST_DIR");
@@ -78,33 +79,55 @@ fn enable_tracing() {
 fn main() {
     enable_tracing();
 
-    for problem in instances() {
-        // Greedy Solve
-        println!("Loaded problem with {} requests", problem.request_count());
+    // Solve the f200x15-02.txt problem with both solvers
+    let inst_dir = find_instances_dir()
+        .expect("Could not find an `instances/` directory in any ancestor of CARGO_MANIFEST_DIR");
+    let f20015_02 = inst_dir.join("f200x15-02.txt");
+    let loader = ProblemLoader::default();
+    let problem = loader.from_path(&f20015_02);
+    let problem = match problem {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to load problem from {}: {}", f20015_02.display(), e);
+            return;
+        }
+    };
+    println!("Loaded problem with {} requests", problem.request_count());
+    let solver_state = GreedySolver::<i64>::new()
+        .construct(&problem)
+        .expect("GreedySolver failed to construct a solution");
+    let feasible = solver_state.is_feasible();
+    let cost = solver_state.cost();
 
-        let solver_state = GreedySolver::<i64>::new()
-            .construct(&problem)
-            .expect("GreedySolver failed to construct a solution");
-        let feasible = solver_state.is_feasible();
-        let cost = solver_state.cost();
-        println!(
-            "GreedySolver produced a {} solution with cost {}",
-            if feasible { "feasible" } else { "infeasible" },
-            cost
-        );
+    let construction_solver = GreedySolver::<i64>::new();
+    let mut meta_solver = MatheuristicEngine::with_defaults(
+        MatheuristicConfig::default(),
+        oplib::prelude::op_list::<i64>(&problem),
+        construction_solver,
+    );
+    let solution = meta_solver.solve(&problem).expect("MetaSolver failed");
 
-        // Meta Solve
-        let construction_solver = GreedySolver::<i64>::new();
-        let mut meta_solver = MetaEngine::new(
-            MetaConfig::default(),
-            oplib::prelude::op_list::<i64>(&problem),
-            construction_solver,
-        );
-        let solution = meta_solver.solve(&problem).expect("MetaSolver failed");
-        // Print None or the cost!
-        println!(
-            "MetaSolver produced solution: {:?}",
-            solution.map(|s| s.cost())
-        );
-    }
+    // Print results
+
+    println!("============================================================");
+    println!("             Results for problem f200x15-02.txt             ");
+    println!("============================================================");
+
+    println!(
+        "GreedySolver produced a {} solution with cost {}",
+        if feasible { "feasible" } else { "infeasible" },
+        cost
+    );
+
+    println!(
+        "MatheuhuristicEngine produced {} solution{}",
+        if solution.is_some() {
+            "feasible"
+        } else {
+            "infeasible"
+        },
+        solution
+            .map(|s| format!(" with cost {}", s.cost()))
+            .unwrap_or_default()
+    );
 }
