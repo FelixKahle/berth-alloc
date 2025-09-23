@@ -615,7 +615,7 @@ where
         // 3) Best-so-far tracking
         let mut cum_delta = Cost::zero();
         let mut best_feasible_state: Option<_> = state.is_feasible().then(|| state.clone());
-        let mut best_feasible_cum: Option<Cost> = state.is_feasible().then(|| cum_delta);
+        let mut best_feasible_cum: Option<Cost> = state.is_feasible().then_some(cum_delta);
 
         let mut iter: usize = 0;
         while t0.elapsed() < budget {
@@ -623,7 +623,7 @@ where
                 Ok(Some(delta)) => {
                     cum_delta += delta;
                     if state.is_feasible()
-                        && best_feasible_cum.map_or(true, |best| cum_delta < best)
+                        && best_feasible_cum.is_none_or(|best| cum_delta < best)
                     {
                         best_feasible_cum = Some(cum_delta);
                         best_feasible_state = Some(state.clone());
@@ -632,7 +632,7 @@ where
                 }
                 Ok(None) => {
                     if state.is_feasible()
-                        && best_feasible_cum.map_or(true, |best| cum_delta < best)
+                        && best_feasible_cum.is_none_or(|best| cum_delta < best)
                     {
                         best_feasible_cum = Some(cum_delta);
                         best_feasible_state = Some(state.clone());

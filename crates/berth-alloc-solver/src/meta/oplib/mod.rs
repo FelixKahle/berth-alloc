@@ -45,7 +45,7 @@ pub mod prelude {
 
     pub use super::randomdestroyinsert::*;
 
-    pub fn op_list<'p, T>(_: &'p Problem<T>) -> Vec<Box<dyn Operator<Time = T>>>
+    pub fn op_list<T>(_: &Problem<T>) -> Vec<Box<dyn Operator<Time = T>>>
     where
         T: Copy
             + Ord

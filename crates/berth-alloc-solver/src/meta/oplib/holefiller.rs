@@ -51,6 +51,7 @@ where
         + Into<Cost>,
 {
     type Time = T;
+
     fn name(&self) -> &'static str {
         "HoleFiller"
     }
@@ -62,92 +63,77 @@ where
         rng: &mut rand_chacha::ChaCha8Rng,
     ) -> Option<crate::framework::planning::Plan<'p, T>> {
         let mut placed = false;
-        let plan = ctx.with_builder(|builder| {
-            // Grab a random free interval from any request’s perspective:
-            // We synthesize free intervals by iterating a dummy unassigned request set—cheaper: pick a berth, derive free windows via sandbox? We must use explorer API.
-            let berths: Vec<_> = builder
-                .ledger()
-                .problem()
-                .berths()
-                .iter()
-                .map(|b| b.id())
-                .collect();
-            // we’ll approximate by sampling one unassigned request and using its view:
-            let some_req = builder.with_explorer(|ex| ex.iter_unassigned_requests().choose(rng));
-            let Some(req) = some_req else {
+
+        let plan_res = ctx.with_builder(|builder| {
+            let Some(req_for_view) =
+                builder.with_explorer(|ex| ex.iter_unassigned_requests().choose(rng))
+            else {
                 return;
             };
 
-            let free_any: Vec<_> =
-                builder.with_explorer(|ex| ex.iter_free_for(req.clone()).collect());
-            if free_any.is_empty() {
+            let Some(fb) =
+                builder.with_explorer(|ex| ex.iter_free_for(req_for_view.clone()).choose(rng))
+            else {
                 return;
-            }
-            let fb = free_any.into_iter().choose(rng).unwrap();
+            };
 
-            // choose best-fit unassigned for this specific (berth, interval)
-            let bid = fb.berth().id();
             let iv = *fb.interval();
+            let bid = fb.berth().id();
+            let span = iv.length();
 
-            // collect unassigned that allow this berth
-            let mut candidates = builder.with_explorer(|ex| {
+            let mut cands = builder.with_explorer(|ex| {
                 ex.iter_unassigned_requests()
                     .filter(|r| r.req().processing_time_for(bid).is_some())
                     .collect::<Vec<_>>()
             });
-            if candidates.is_empty() {
+            if cands.is_empty() {
                 return;
             }
 
-            // best-fit by processing time (largest ≤ span), then weight desc
-            candidates.sort_by(|a, b| {
+            cands.sort_by(|a, b| {
                 let pa = a.req().processing_time_for(bid).unwrap();
                 let pb = b.req().processing_time_for(bid).unwrap();
-                let span = iv.length();
-                let fits_a = pa <= span;
-                let fits_b = pb <= span;
-                fits_b
-                    .cmp(&fits_a) // prefer fitting
-                    .then_with(|| pa.cmp(&pb)) // larger first use reverse if you prefer
-                    .then_with(|| {
-                        std::cmp::Reverse(a.req().weight())
-                            .cmp(&std::cmp::Reverse(b.req().weight()))
-                    })
+                let fa = pa <= span;
+                let fb = pb <= span;
+
+                fa.cmp(&fb)
+                    .reverse()
+                    .then_with(|| pa.cmp(&pb).reverse())
+                    .then_with(|| a.req().weight().cmp(&b.req().weight()).reverse())
             });
 
-            for r in candidates {
-                let Some(pt) = r.req().processing_time_for(bid) else {
-                    continue;
-                };
-                // compute hi/lo feasible starts in this gap
-                let w = r.req().feasible_window();
+            let feasible_starts = |r: &crate::framework::planning::BrandedRequest<'_, 'p, _, T>| {
+                let rr = r.req();
+                let w = rr.feasible_window();
+                let pt = rr.processing_time_for(bid)?;
+
                 let lo = std::cmp::max(iv.start(), w.start());
-                let hi_iv = iv.end().checked_sub(pt);
-                if hi_iv.is_none() {
-                    continue;
-                }
-                let hi_w = w.end().checked_sub(pt);
-                if hi_w.is_none() {
-                    continue;
-                }
-                let hi = std::cmp::min(hi_iv.unwrap(), hi_w.unwrap());
+                let hi_iv = iv.end().checked_sub(pt)?;
+                let hi_w = w.end().checked_sub(pt)?;
+                let hi = std::cmp::min(hi_iv, hi_w);
+
                 if lo <= hi {
-                    // prefer right-packed
-                    if builder.propose_assignment(r.clone(), hi, &fb).is_ok() {
-                        placed = true;
-                        break;
-                    }
-                    if hi != lo {
-                        let _ = builder.propose_assignment(r.clone(), lo, &fb).map(|_| {
+                    Some(if hi != lo { vec![hi, lo] } else { vec![hi] })
+                } else {
+                    None
+                }
+            };
+
+            for r in cands {
+                if let Some(starts) = feasible_starts(&r) {
+                    for s in starts {
+                        if builder.propose_assignment(r.clone(), s, &fb).is_ok() {
                             placed = true;
-                        });
-                        if placed {
-                            break;
+                            return;
                         }
                     }
                 }
             }
         });
-        if placed { plan.ok() } else { None }
+
+        match (placed, plan_res) {
+            (true, Ok(plan)) => Some(plan),
+            _ => None,
+        }
     }
 }

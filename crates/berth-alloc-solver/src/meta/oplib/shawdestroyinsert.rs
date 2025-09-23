@@ -28,9 +28,12 @@ use std::ops::Mul;
 
 #[derive(Debug, Clone)]
 pub struct ShawDestroyInsertOperator<T> {
+    /// Number of assignments to destroy (seed + k-1 most related).
     pub k: usize,
-    pub alpha_time: f64,  // weight for temporal distance
-    pub alpha_berth: f64, // weight for same-berth bonus
+    /// Weight of temporal distance in relatedness score.
+    pub alpha_time: f64,
+    /// Weight for same-berth “bonus” (0 if same berth, 1 otherwise).
+    pub alpha_berth: f64,
     _p: std::marker::PhantomData<T>,
 }
 
@@ -58,6 +61,7 @@ where
         + Into<Cost>,
 {
     type Time = T;
+
     fn name(&self) -> &'static str {
         "ShawDestroyInsert"
     }
@@ -68,85 +72,84 @@ where
         ctx: crate::framework::planning::PlanningContext<'s, 'p, T>,
         rng: &mut rand_chacha::ChaCha8Rng,
     ) -> Option<crate::framework::planning::Plan<'p, T>> {
-        let mut ok = true;
+        let mut fully_repaired = true;
 
-        let plan = ctx.with_builder(|builder| {
-            let assigned: Vec<_> = builder.with_explorer(|ex| ex.iter_assignments().collect());
+        let plan_res = ctx.with_builder(|builder| {
+            let mut assigned =
+                builder.with_explorer(|ex| ex.iter_assignments().collect::<Vec<_>>());
             if assigned.is_empty() {
-                ok = false;
+                fully_repaired = false;
                 return;
             }
 
-            let seed = assigned.iter().choose(rng).unwrap().clone();
-            let (sbid, sstart) =
-                builder.with_explorer(|ex| (seed.asg().berth_id(), seed.asg().start_time()));
+            let Some(seed) = assigned.iter().choose(rng) else {
+                fully_repaired = false;
+                return;
+            };
+            let sbid = seed.asg().berth_id();
+            let sstart = seed.asg().start_time();
 
-            // Score relatedness
-            let mut cand: Vec<_> = assigned;
-
-            // helper: TimePoint<T> -> Cost (via T)
-            let tp_to_cost = |tp: berth_alloc_core::prelude::TimePoint<T>| -> Cost {
-                let t: T = tp.value();
-                Into::<Cost>::into(t)
+            let time_dist = |tp: berth_alloc_core::prelude::TimePoint<T>| -> f64 {
+                let a: Cost = tp.value().into();
+                let b: Cost = sstart.value().into();
+                (a - b).abs().to_f64().unwrap_or(0.0)
             };
 
-            cand.sort_by(|a, b| {
+            assigned.sort_by(|a, b| {
                 let (abid, astart) = (a.asg().berth_id(), a.asg().start_time());
                 let (bbid, bstart) = (b.asg().berth_id(), b.asg().start_time());
 
-                let rd_a = (self.alpha_berth * if abid == sbid { 0.0 } else { 1.0 })
-                    + self.alpha_time
-                        * (tp_to_cost(astart) - tp_to_cost(sstart))
-                            .abs()
-                            .to_f64()
-                            .unwrap_or(0.0);
-
-                let rd_b = (self.alpha_berth * if bbid == sbid { 0.0 } else { 1.0 })
-                    + self.alpha_time
-                        * (tp_to_cost(bstart) - tp_to_cost(sstart))
-                            .abs()
-                            .to_f64()
-                            .unwrap_or(0.0);
+                let rd_a = self.alpha_berth * if abid == sbid { 0.0 } else { 1.0 }
+                    + self.alpha_time * time_dist(astart);
+                let rd_b = self.alpha_berth * if bbid == sbid { 0.0 } else { 1.0 }
+                    + self.alpha_time * time_dist(bstart);
 
                 rd_a.partial_cmp(&rd_b).unwrap_or(std::cmp::Ordering::Equal)
             });
 
-            // Pick top-k related (excluding the seed itself appears near top)
-            let k = self.k.min(cand.len());
-            let victims: Vec<_> = cand.into_iter().take(k).collect();
-
+            let k = self.k.min(assigned.len());
+            let victims = assigned.into_iter().take(k).collect::<Vec<_>>();
+            if victims.is_empty() {
+                fully_repaired = false;
+                return;
+            }
             for v in &victims {
                 let _ = builder.propose_unassignment(v);
             }
 
-            // greedy repair all currently unassigned
             let mut todo =
                 builder.with_explorer(|ex| ex.iter_unassigned_requests().collect::<Vec<_>>());
-            for req in todo.drain(..) {
+            todo.shuffle(rng);
+
+            'repair: for req in todo.into_iter() {
                 let mut opts = builder.with_explorer(|ex| {
                     let r = req.req();
                     let w = r.feasible_window();
-                    let mut o = Vec::new();
+                    let mut out = Vec::new();
+
                     for fb in ex.iter_free_for(req.clone()) {
                         let bid = fb.berth().id();
                         if let Some(pt) = r.processing_time_for(bid) {
                             let iv = *fb.interval();
                             let lo = std::cmp::max(iv.start(), w.start());
-                            let hi_iv = iv.end().checked_sub(pt).expect("end-pt ok");
-                            let hi_w = w.end().checked_sub(pt).expect("win-pt ok");
-                            let hi = std::cmp::min(hi_iv, hi_w);
-                            if lo <= hi {
-                                o.push((fb.clone(), hi));
-                                if hi != lo {
-                                    o.push((fb.clone(), lo));
+                            let hi_iv = iv.end().checked_sub(pt);
+                            let hi_w = w.end().checked_sub(pt);
+
+                            if let (Some(hi_iv), Some(hi_w)) = (hi_iv, hi_w) {
+                                let hi = std::cmp::min(hi_iv, hi_w);
+                                if lo <= hi {
+                                    out.push((fb.clone(), hi));
+                                    if hi != lo {
+                                        out.push((fb.clone(), lo));
+                                    }
                                 }
                             }
                         }
                     }
-                    o
+                    out
                 });
-                // randomized order for diversification
                 opts.shuffle(rng);
+
                 let mut placed = false;
                 for (free, start) in opts {
                     if builder
@@ -157,13 +160,17 @@ where
                         break;
                     }
                 }
+
                 if !placed {
-                    ok = false;
-                    break;
+                    fully_repaired = false;
+                    break 'repair;
                 }
             }
         });
 
-        if ok { plan.ok() } else { None }
+        match (fully_repaired, plan_res) {
+            (true, Ok(plan)) => Some(plan),
+            _ => None,
+        }
     }
 }

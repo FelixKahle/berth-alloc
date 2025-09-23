@@ -19,14 +19,12 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use std::ops::Mul;
-
+use crate::meta::operator::Operator;
 use berth_alloc_core::prelude::{Cost, TimePoint};
 use berth_alloc_model::problem::asg::AssignmentView;
 use num_traits::{CheckedAdd, CheckedSub};
 use rand::seq::SliceRandom;
-
-use crate::meta::operator::Operator;
+use std::ops::Mul;
 
 #[derive(Debug, Clone)]
 pub struct SwapPairOperator<T> {
@@ -37,7 +35,7 @@ pub struct SwapPairOperator<T> {
 impl<T> Default for SwapPairOperator<T> {
     fn default() -> Self {
         Self {
-            attempts_per_call: 10,
+            attempts_per_call: 60,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -67,40 +65,71 @@ where
         ctx: crate::framework::planning::PlanningContext<'s, 'p, T>,
         rng: &mut rand_chacha::ChaCha8Rng,
     ) -> Option<crate::framework::planning::Plan<'p, T>> {
-        let aps = self.attempts_per_call.max(1);
+        let attempts = self.attempts_per_call.max(1);
 
-        // helper: given (req, free window), compute a feasible start (prefer right-packed/hi).
-        let mut pick_start = |builder: &crate::framework::planning::PlanBuilder<'_, 'p, T>,
-                              req: crate::framework::planning::BrandedRequest<
-            '_,
-            'p,
-            berth_alloc_model::common::FlexibleKind,
-            T,
-        >,
-                              free: &crate::framework::planning::BrandedFreeBerth<'_, 'p, T>|
-         -> Option<TimePoint<T>> {
-            builder.with_explorer(|ex| {
-                let r = req.req();
-                let w = r.feasible_window();
-                let bid = free.berth().id();
-                let Some(pt) = r.processing_time_for(bid) else {
-                    return None;
-                };
-                let iv = *free.interval();
-                let lo = std::cmp::max(iv.start(), w.start());
-                let hi_iv = iv.end().checked_sub(pt)?;
-                let hi_w = w.end().checked_sub(pt)?;
-                let hi = std::cmp::min(hi_iv, hi_w);
-                if lo <= hi { Some(hi) } else { None }
-            })
-        };
+        #[inline]
+        fn feasible_starts<'brand, 'p, T2>(
+            req: &crate::framework::planning::BrandedRequest<
+                'brand,
+                'p,
+                berth_alloc_model::common::FlexibleKind,
+                T2,
+            >,
+            free: &crate::framework::planning::BrandedFreeBerth<'brand, 'p, T2>,
+        ) -> Option<(TimePoint<T2>, Option<TimePoint<T2>>)>
+        where
+            T2: Copy + Ord + CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
+        {
+            let r = req.req();
+            let w = r.feasible_window();
+            let bid = free.berth().id();
+            let pt = r.processing_time_for(bid)?;
+            let iv = *free.interval();
 
-        // Try a few random pairs; stop on first successful full swap.
-        for _ in 0..aps {
-            let plan = ctx.with_builder(|builder| {
-                // sample two distinct assigned
-                let mut pool: Vec<_> =
-                    builder.with_explorer(|ex| ex.iter_assigned_requests().collect());
+            let lo = std::cmp::max(iv.start(), w.start());
+            let hi_iv = iv.end().checked_sub(pt)?;
+            let hi_w = w.end().checked_sub(pt)?;
+            let hi = std::cmp::min(hi_iv, hi_w);
+
+            if lo > hi {
+                None
+            } else if hi == lo {
+                Some((hi, None))
+            } else {
+                Some((hi, Some(lo)))
+            }
+        }
+
+        #[inline]
+        fn place_req<'brand, 'p, T2>(
+            builder: &mut crate::framework::planning::PlanBuilder<'brand, 'p, T2>,
+            req: &crate::framework::planning::BrandedRequest<
+                'brand,
+                'p,
+                berth_alloc_model::common::FlexibleKind,
+                T2,
+            >,
+            free: &crate::framework::planning::BrandedFreeBerth<'brand, 'p, T2>,
+        ) -> bool
+        where
+            T2: Copy + Ord + CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
+        {
+            if let Some((hi, lo_opt)) = feasible_starts(req, free) {
+                if builder.propose_assignment(req.clone(), hi, free).is_ok() {
+                    return true;
+                }
+                if let Some(lo) = lo_opt
+                    && builder.propose_assignment(req.clone(), lo, free).is_ok() {
+                        return true;
+                    }
+            }
+            false
+        }
+
+        for _ in 0..attempts {
+            let plan_res = ctx.with_builder(|builder| {
+                let mut pool =
+                    builder.with_explorer(|ex| ex.iter_assignments().collect::<Vec<_>>());
                 if pool.len() < 2 {
                     return;
                 }
@@ -108,11 +137,8 @@ where
                 let a = pool[0].clone();
                 let b = pool[1].clone();
 
-                // read ids first (immutable)
-                let (rid_a, rid_b) =
-                    builder.with_explorer(|ex| (a.asg().request_id(), b.asg().request_id()));
+                let (rid_a, rid_b) = (a.asg().request_id(), b.asg().request_id());
 
-                // unassign both -> we get branded free windows fa, fb
                 let fa = match builder.propose_unassignment(&a) {
                     Ok(x) => x,
                     Err(_) => return,
@@ -122,7 +148,6 @@ where
                     Err(_) => return,
                 };
 
-                // fetch now-unassigned branded requests
                 let (ra, rb) = builder.with_explorer(|ex| {
                     let ra = ex
                         .iter_unassigned_requests()
@@ -136,33 +161,46 @@ where
                     return;
                 };
 
-                // try insert B into fa, then A into fb
-                if let Some(start_b) = pick_start(builder, rb.clone(), &fa) {
-                    if let Ok(_ab) = builder.propose_assignment(rb.clone(), start_b, &fa) {
-                        if let Some(start_a) = pick_start(builder, ra.clone(), &fb) {
-                            if builder.propose_assignment(ra.clone(), start_a, &fb).is_ok() {
-                                // success: both swapped
-                                return;
-                            }
-                        }
-                        // rollback partial insert B
-                        let last = builder.with_explorer(|ex| {
-                            ex.iter_assigned_requests()
+                let mut swapped = false;
+                if place_req(builder, &rb, &fa) {
+                    if place_req(builder, &ra, &fb) {
+                        swapped = true;
+                    } else {
+                        // rollback partial insert of B
+                        if let Some(basg) = builder.with_explorer(|ex| {
+                            ex.iter_assignments()
                                 .find(|x| x.asg().request_id() == rid_b)
-                        });
-                        if let Some(basg) = last {
+                        }) {
                             let _ = builder.propose_unassignment(&basg);
                         }
                     }
                 }
-                // If we get here we leave builder with only the two unassignments
-                // -> meta engine will discard the plan when we return None below.
+
+                if !swapped
+                    && place_req(builder, &ra, &fb) {
+                        if place_req(builder, &rb, &fa) {
+                            swapped = true;
+                        } else if let Some(aasg) = builder.with_explorer(|ex| {
+                            ex.iter_assignments()
+                                .find(|x| x.asg().request_id() == rid_a)
+                        }) {
+                            let _ = builder.propose_unassignment(&aasg);
+                        }
+                    }
+
+                if !swapped {
+                    let sa = fa.interval().start();
+                    let sb = fb.interval().start();
+                    let _ = builder.propose_assignment(ra.clone(), sa, &fa);
+                    let _ = builder.propose_assignment(rb.clone(), sb, &fb);
+                }
             });
 
-            if let Ok(plan) = plan {
+            if let Ok(plan) = plan_res {
                 return Some(plan);
             }
         }
+
         None
     }
 }

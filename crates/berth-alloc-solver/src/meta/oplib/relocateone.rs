@@ -28,6 +28,7 @@ use std::ops::Mul;
 
 #[derive(Debug, Clone)]
 pub struct RelocateOneOperator<T> {
+    /// Randomize the order of candidate (gap, start) options for diversification.
     pub try_randomize_options: bool,
     _p: std::marker::PhantomData<T>,
 }
@@ -54,6 +55,7 @@ where
         + Into<Cost>,
 {
     type Time = T;
+
     fn name(&self) -> &'static str {
         "RelocateOne"
     }
@@ -64,45 +66,45 @@ where
         ctx: crate::framework::planning::PlanningContext<'s, 'p, T>,
         rng: &mut rand_chacha::ChaCha8Rng,
     ) -> Option<crate::framework::planning::Plan<'p, T>> {
-        let plan = ctx.with_builder(|builder| {
-            // pick one assigned uniformly at random
+        let mut placed = false;
+
+        let plan_res = ctx.with_builder(|builder| {
             let victim = builder.with_explorer(|ex| ex.iter_assigned_requests().choose(rng));
             let Some(v) = victim else {
                 return;
             };
 
-            let rid = builder.with_explorer(|ex| v.asg().request_id());
+            let rid = v.asg().request_id();
+            if builder.propose_unassignment(&v).is_err() {
+                return;
+            }
 
-            // unassign -> free hole (we may or may not re-use it)
-            let _freed = match builder.propose_unassignment(&v) {
-                Ok(x) => x,
-                Err(_) => return,
-            };
-
-            // fetch branded request (now unassigned)
             let req = builder
                 .with_explorer(|ex| ex.iter_unassigned_requests().find(|r| r.req().id() == rid));
             let Some(req) = req else {
                 return;
             };
 
-            // gather all current options for this request
             let mut opts = builder.with_explorer(|ex| {
                 let r = req.req();
                 let w = r.feasible_window();
                 let mut out = Vec::new();
+
                 for fb in ex.iter_free_for(req.clone()) {
                     let bid = fb.berth().id();
                     if let Some(pt) = r.processing_time_for(bid) {
                         let iv = *fb.interval();
                         let lo = std::cmp::max(iv.start(), w.start());
-                        let hi_iv = iv.end().checked_sub(pt).expect("end-pt ok");
-                        let hi_w = w.end().checked_sub(pt).expect("win-pt ok");
-                        let hi = std::cmp::min(hi_iv, hi_w);
-                        if lo <= hi {
-                            out.push((fb.clone(), hi));
-                            if hi != lo {
-                                out.push((fb.clone(), lo));
+                        let hi_iv = iv.end().checked_sub(pt);
+                        let hi_w = w.end().checked_sub(pt);
+
+                        if let (Some(hi_iv), Some(hi_w)) = (hi_iv, hi_w) {
+                            let hi = std::cmp::min(hi_iv, hi_w);
+                            if lo <= hi {
+                                out.push((fb.clone(), hi));
+                                if hi != lo {
+                                    out.push((fb.clone(), lo));
+                                }
                             }
                         }
                     }
@@ -119,15 +121,15 @@ where
                     .propose_assignment(req.clone(), start, &free)
                     .is_ok()
                 {
-                    return; // success
+                    placed = true;
+                    break;
                 }
             }
-            // else: leave as unassigned ⇒ propose() will return None.
         });
 
-        match plan {
-            Ok(p) => Some(p),
-            Err(_) => None,
+        match (placed, plan_res) {
+            (true, Ok(plan)) => Some(plan),
+            _ => None,
         }
     }
 }

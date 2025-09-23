@@ -28,9 +28,11 @@ use std::ops::Mul;
 
 #[derive(Debug, Clone)]
 pub struct TemporalSliceDestroyInsertOperator<T> {
-    pub window_len: i64, // measured in whatever 'Cost' maps to; meaningful for T=i64
+    /// Slice length in the same numeric space as `Cost` (meaningful e.g. for T=i64).
+    pub window_len: i64,
     _p: std::marker::PhantomData<T>,
 }
+
 impl<T> Default for TemporalSliceDestroyInsertOperator<T> {
     fn default() -> Self {
         Self {
@@ -53,6 +55,7 @@ where
         + Into<Cost>,
 {
     type Time = T;
+
     fn name(&self) -> &'static str {
         "TemporalSliceDestroyInsert"
     }
@@ -63,67 +66,70 @@ where
         ctx: crate::framework::planning::PlanningContext<'s, 'p, T>,
         rng: &mut rand_chacha::ChaCha8Rng,
     ) -> Option<crate::framework::planning::Plan<'p, T>> {
-        let mut ok = true;
+        let mut succeeded = true;
 
+        #[inline]
+        fn tp_to_cost<T: Copy + Into<Cost>>(tp: berth_alloc_core::prelude::TimePoint<T>) -> Cost {
+            let v: T = tp.value();
+            v.into()
+        }
+
+        // Build and run the plan.
         let plan = ctx.with_builder(|builder| {
-            // Helper: TimePoint<T> -> Cost (via T)
-            let tp_to_cost = |tp: berth_alloc_core::prelude::TimePoint<T>| -> Cost {
-                let t: T = tp.value();
-                Into::<Cost>::into(t)
-            };
-
-            // 1) Get min/max time (from assigned intervals)
-            let (min_t, max_t) = builder.with_explorer(|ex| {
+            let (lo_opt, hi_opt) = builder.with_explorer(|ex| {
                 let mut lo: Option<berth_alloc_core::prelude::TimePoint<T>> = None;
                 let mut hi: Option<berth_alloc_core::prelude::TimePoint<T>> = None;
+
                 for a in ex.iter_assignments() {
                     let iv = a.asg().interval();
-                    lo = Some(lo.map_or(
-                        iv.start(),
-                        |x: berth_alloc_core::prelude::TimePoint<T>| {
-                            if x <= iv.start() { x } else { iv.start() }
-                        },
-                    ));
-                    hi = Some(hi.map_or(
-                        iv.end(),
-                        |x: berth_alloc_core::prelude::TimePoint<T>| {
-                            if x >= iv.end() { x } else { iv.end() }
-                        },
-                    ));
+                    let s = iv.start();
+                    let e = iv.end();
+                    lo = Some(lo.map_or(s, |cur| if s < cur { s } else { cur }));
+                    hi = Some(hi.map_or(e, |cur| if e > cur { e } else { cur }));
                 }
                 (lo, hi)
             });
 
-            let (Some(lo_tp), Some(hi_tp)) = (min_t, max_t) else {
-                ok = false;
+            let (Some(lo_tp), Some(hi_tp)) = (lo_opt, hi_opt) else {
+                succeeded = false;
                 return;
             };
 
             let lo_c = tp_to_cost(lo_tp);
             let hi_c = tp_to_cost(hi_tp);
+            if hi_c <= lo_c {
+                succeeded = false;
+                return;
+            }
 
-            // 2) Random slice [slice_lo, slice_hi) in Cost space
-            let span_c = (hi_c - lo_c);
-            let span_i64 = span_c.to_i64().unwrap_or(0).max(1);
-            let off = rng.random_range(0..span_i64);
-            let slice_lo = lo_c + Cost::from(off);
-            let slice_hi = slice_lo + Cost::from(self.window_len.max(1));
+            let span_cost = hi_c - lo_c;
+            let Some(span_i64) = span_cost.to_i64() else {
+                succeeded = false;
+                return;
+            };
+            if span_i64 <= 0 {
+                succeeded = false;
+                return;
+            }
 
-            // 3) Pick victims whose assigned interval overlaps the slice
+            let slice_len = self.window_len.max(1);
+            let offset = rng.random_range(0..span_i64);
+            let slice_lo = lo_c + Cost::from(offset);
+            let slice_hi = slice_lo + Cost::from(slice_len);
+
             let victims: Vec<_> = builder.with_explorer(|ex| {
                 ex.iter_assignments()
                     .filter(|a| {
                         let iv = a.asg().interval();
                         let s = tp_to_cost(iv.start());
                         let e = tp_to_cost(iv.end());
-                        // overlap test: [s,e) intersects [slice_lo, slice_hi)
                         e > slice_lo && s < slice_hi
                     })
-                    .collect::<Vec<_>>()
+                    .collect()
             });
 
             if victims.is_empty() {
-                ok = false;
+                succeeded = false;
                 return;
             }
 
@@ -131,11 +137,10 @@ where
                 let _ = builder.propose_unassignment(&v);
             }
 
-            // 4) Greedy repair all currently unassigned requests
-            let mut unassigned =
+            let mut todo =
                 builder.with_explorer(|ex| ex.iter_unassigned_requests().collect::<Vec<_>>());
 
-            for req in unassigned.drain(..) {
+            for req in todo.drain(..) {
                 let mut opts = builder.with_explorer(|ex| {
                     let r = req.req();
                     let w = r.feasible_window();
@@ -145,11 +150,13 @@ where
                         if let Some(pt) = r.processing_time_for(bid) {
                             let iv = *fb.interval();
                             let lo = std::cmp::max(iv.start(), w.start());
-                            let hi_iv = iv.end().checked_sub(pt).expect("end-pt ok");
-                            let hi_w = w.end().checked_sub(pt).expect("win-pt ok");
+                            let hi_iv = iv.end().checked_sub(pt);
+                            let hi_w = w.end().checked_sub(pt);
+                            let (Some(hi_iv), Some(hi_w)) = (hi_iv, hi_w) else {
+                                continue;
+                            };
                             let hi = std::cmp::min(hi_iv, hi_w);
                             if lo <= hi {
-                                // right-packed first, then earliest if distinct
                                 out.push((fb.clone(), hi));
                                 if hi != lo {
                                     out.push((fb.clone(), lo));
@@ -157,7 +164,6 @@ where
                             }
                         }
                     }
-                    // optional: try latest first
                     out.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
                     out
                 });
@@ -174,12 +180,12 @@ where
                 }
 
                 if !placed {
-                    ok = false;
+                    succeeded = false;
                     break;
                 }
             }
         });
 
-        if ok { plan.ok() } else { None }
+        if succeeded { plan.ok() } else { None }
     }
 }

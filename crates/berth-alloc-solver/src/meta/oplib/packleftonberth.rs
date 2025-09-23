@@ -65,7 +65,6 @@ where
         let mut ok = true;
 
         let plan = ctx.with_builder(|builder| {
-            // pick a random berth that currently has assignments
             let maybe_berth = builder.with_explorer(|ex| {
                 let mut by_berth: std::collections::BTreeMap<_, Vec<_>> =
                     std::collections::BTreeMap::new();
@@ -80,13 +79,11 @@ where
                 return;
             };
 
-            // Unassign all on that berth
             list.sort_by_key(|a| a.asg().start_time());
             for a in &list {
                 let _ = builder.propose_unassignment(a);
             }
 
-            // Now reinsert those requests in nondecreasing request-id order (or any heuristic)
             let mut reqs = builder.with_explorer(|ex| {
                 let ids: Vec<_> = list.iter().map(|a| a.asg().request_id()).collect();
                 let mut v: Vec<_> = ex
@@ -98,7 +95,6 @@ where
             });
 
             'all: for req in reqs.drain(..) {
-                // Options only on this berth; pack-left (earliest start first)
                 let mut opts = builder.with_explorer(|ex| {
                     let r = req.req();
                     let w = r.feasible_window();
@@ -116,14 +112,12 @@ where
                         let hi_w = w.end().checked_sub(pt).expect("win-pt ok");
                         let hi = std::cmp::min(hi_iv, hi_w);
                         if lo <= hi {
-                            // NOTE: to pack-left, try lo first.
                             out.push((fb.clone(), lo));
                             if hi != lo {
                                 out.push((fb.clone(), hi));
                             }
                         }
                     }
-                    // sort by start asc (lo first already, but ensure across gaps)
                     out.sort_by_key(|(_, s)| *s);
                     out
                 });

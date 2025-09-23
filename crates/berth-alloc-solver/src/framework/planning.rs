@@ -214,7 +214,7 @@ impl<'brand, 'pb, 'p, T: Copy + Ord> PlanExplorer<'brand, 'pb, 'p, T> {
     {
         self.ledger
             .iter_assignments()
-            .map(|a| BrandedAssignmentRef::new(a.clone()))
+            .map(|a| BrandedAssignmentRef::new(*a))
     }
 
     #[inline]

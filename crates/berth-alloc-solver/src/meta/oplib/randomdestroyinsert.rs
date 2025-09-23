@@ -19,13 +19,12 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use std::ops::Mul;
-
+use crate::meta::operator::Operator;
 use berth_alloc_core::prelude::Cost;
+use berth_alloc_model::problem::asg::AssignmentView;
 use num_traits::{CheckedAdd, CheckedSub};
 use rand::seq::{IteratorRandom, SliceRandom};
-
-use crate::meta::operator::Operator;
+use std::{collections::HashSet, ops::Mul};
 
 #[derive(Debug, Clone)]
 pub struct RandomDestroyInsertOperator<T> {
@@ -36,7 +35,7 @@ pub struct RandomDestroyInsertOperator<T> {
 impl<T> Default for RandomDestroyInsertOperator<T> {
     fn default() -> Self {
         Self {
-            fraction: 0.3,
+            fraction: 0.7,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -63,99 +62,134 @@ where
     fn propose<'s, 'p>(
         &self,
         _iteration: usize,
-        context: crate::framework::planning::PlanningContext<'s, 'p, Self::Time>,
+        ctx: crate::framework::planning::PlanningContext<'s, 'p, Self::Time>,
         rng: &mut rand_chacha::ChaCha8Rng,
     ) -> Option<crate::framework::planning::Plan<'p, Self::Time>> {
-        // We'll mark success/failure inside the builder closure and decide afterwards.
-        let mut all_inserted = true;
+        let mut fully_repaired = true;
+        let frac = self.fraction.clamp(0.0, 1.0);
 
-        let plan_res = context.with_builder(|builder| {
-            // ----- Random destroy phase
-            let victims = builder.with_explorer(|explorer| {
-                let n = explorer.iter_assigned_requests().count();
-                let f = self.fraction.clamp(0.0, 1.0);
-                let mut k = (f * n as f64).round() as usize;
-                if f > 0.0 {
+        let plan_res = ctx.with_builder(|builder| {
+            let (victims, destroyed_ids): (Vec<_>, HashSet<_>) = builder.with_explorer(|ex| {
+                let n = ex.iter_assignments().count();
+                let mut k = (frac * n as f64).round() as usize;
+                if frac > 0.0 {
                     k = k.max(1);
                 }
-                explorer.iter_assigned_requests().choose_multiple(rng, k)
+                let v: Vec<_> = ex.iter_assignments().choose_multiple(rng, k);
+                let ids = v.iter().map(|a| a.asg().request_id()).collect();
+                (v, ids)
             });
 
-            // IMPORTANT: consume the iterator so unassignments actually happen
-            for v in victims {
-                // Best-effort unassignment; if something races, just continue
-                let _ = builder.propose_unassignment(&v);
+            if victims.is_empty() {
+                fully_repaired = false;
+                return;
+            }
+            for v in &victims {
+                let _ = builder.propose_unassignment(v);
             }
 
-            // ----- Reinsert *all* currently unassigned requests
-            // (includes ones that were already unassigned + freshly destroyed)
-            // We'll randomize the order to diversify search.
-            let mut todo = builder
-                .with_explorer(|explorer| explorer.iter_unassigned_requests().collect::<Vec<_>>());
-            todo.shuffle(rng);
+            let mut destroyed_reqs = builder.with_explorer(|ex| {
+                ex.iter_unassigned_requests()
+                    .filter(|r| destroyed_ids.contains(&r.req().id()))
+                    .collect::<Vec<_>>()
+            });
+            destroyed_reqs.shuffle(rng);
 
-            // Greedy repair: for each unassigned request, try all current free options
-            // (right-packed first, then earliest in the same gap).
-            'repair: for req in todo {
-                // Snapshot current free options for this request
-                let mut options = builder.with_explorer(|ex| {
+            for req in destroyed_reqs {
+                let mut opts = builder.with_explorer(|ex| {
                     let r = req.req();
                     let w = r.feasible_window();
+                    let mut out = Vec::new();
 
-                    // build (free_berth, start_time) pairs in the preferred order
-                    let mut opts = Vec::new();
                     for fb in ex.iter_free_for(req.clone()) {
                         let bid = fb.berth().id();
                         if let Some(pt) = r.processing_time_for(bid) {
                             let iv = *fb.interval();
                             let lo = std::cmp::max(iv.start(), w.start());
-                            let hi_iv = iv.end().checked_sub(pt).expect("end-pt ok");
-                            let hi_w = w.end().checked_sub(pt).expect("win-pt ok");
-                            let hi = std::cmp::min(hi_iv, hi_w);
-                            if lo <= hi {
-                                // try right-packed first, then earliest if distinct
-                                opts.push((fb.clone(), hi));
-                                if hi != lo {
-                                    opts.push((fb.clone(), lo));
+                            let hi_iv = iv.end().checked_sub(pt);
+                            let hi_w = w.end().checked_sub(pt);
+                            if let (Some(hi_iv), Some(hi_w)) = (hi_iv, hi_w) {
+                                let hi = std::cmp::min(hi_iv, hi_w);
+                                if lo <= hi {
+                                    out.push((fb.clone(), hi));
+                                    if hi != lo {
+                                        out.push((fb.clone(), lo));
+                                    }
                                 }
                             }
                         }
                     }
-                    opts
+                    out
                 });
 
-                // Optionally randomize within the same heuristic ordering for diversification.
-                // (Keeps the hi/lo pairing but shuffles among different gaps/berths.)
-                options.shuffle(rng);
+                opts.shuffle(rng);
 
-                // Try to place this request
                 let mut placed = false;
-                for (free, start) in options {
-                    match builder.propose_assignment(req.clone(), start, &free) {
-                        Ok(_a) => {
-                            placed = true;
-                            break;
-                        }
-                        Err(crate::framework::err::ProposeAssignmentError::NotFree(_)) => {
-                            continue;
-                        }
-                        Err(_other) => {
-                            continue;
-                        }
+                for (free, start) in opts {
+                    if builder
+                        .propose_assignment(req.clone(), start, &free)
+                        .is_ok()
+                    {
+                        placed = true;
+                        break;
                     }
                 }
-
                 if !placed {
-                    all_inserted = false;
-                    break 'repair;
+                    fully_repaired = false;
+                    return;
+                }
+            }
+
+            let mut others = builder.with_explorer(|ex| {
+                ex.iter_unassigned_requests()
+                    .filter(|r| !destroyed_ids.contains(&r.req().id()))
+                    .collect::<Vec<_>>()
+            });
+            others.shuffle(rng);
+
+            for req in others {
+                let mut opts = builder.with_explorer(|ex| {
+                    let r = req.req();
+                    let w = r.feasible_window();
+                    let mut out = Vec::new();
+
+                    for fb in ex.iter_free_for(req.clone()) {
+                        let bid = fb.berth().id();
+                        if let Some(pt) = r.processing_time_for(bid) {
+                            let iv = *fb.interval();
+                            let lo = std::cmp::max(iv.start(), w.start());
+                            let hi_iv = iv.end().checked_sub(pt);
+                            let hi_w = w.end().checked_sub(pt);
+                            if let (Some(hi_iv), Some(hi_w)) = (hi_iv, hi_w) {
+                                let hi = std::cmp::min(hi_iv, hi_w);
+                                if lo <= hi {
+                                    out.push((fb.clone(), hi));
+                                    if hi != lo {
+                                        out.push((fb.clone(), lo));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    out
+                });
+
+                opts.shuffle(rng);
+
+                for (free, start) in opts {
+                    if builder
+                        .propose_assignment(req.clone(), start, &free)
+                        .is_ok()
+                    {
+                        break;
+                    }
                 }
             }
         });
 
-        let Ok(plan) = plan_res else {
-            return None;
-        };
-
-        if all_inserted { Some(plan) } else { None }
+        match (fully_repaired, plan_res) {
+            (true, Ok(plan)) => Some(plan),
+            _ => None,
+        }
     }
 }
