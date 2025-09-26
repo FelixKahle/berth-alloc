@@ -206,6 +206,28 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub> Problem<T> {
     }
 
     #[inline]
+    pub fn berth_similarity_in_window(
+        &self,
+        b1: BerthIdentifier,
+        b2: BerthIdentifier,
+        win: TimeInterval<T>,
+    ) -> f64 {
+        use std::collections::BTreeSet;
+        let s1: BTreeSet<_> = self
+            .requests_allowed_on_berth_in_window(b1, win)
+            .map(|r| r.id())
+            .collect();
+        let s2: BTreeSet<_> = self
+            .requests_allowed_on_berth_in_window(b2, win)
+            .map(|r| r.id())
+            .collect();
+
+        let inter = s1.intersection(&s2).count() as f64;
+        let uni = s1.union(&s2).count() as f64;
+        if uni == 0.0 { 0.0 } else { inter / uni }
+    }
+
+    #[inline]
     pub fn request_count(&self) -> usize {
         self.flexible_requests.len() + self.fixed_assignments.len()
     }
@@ -761,5 +783,296 @@ mod tests {
 
         // 3 flex + 2 fixed = 5
         assert_eq!(p.request_count(), 5);
+    }
+
+    #[test]
+    fn test_iter_flexible_requests_returns_only_flex() {
+        let b = berth(1, 0, 1000);
+
+        // 1 fixed
+        let rf = req_fixed(800, (0, 1000), &[(1, 10)]);
+        let af = asg_fixed(&rf, &b, 0);
+
+        // 2 flex
+        let fx1 = req_flex(801, (0, 50), &[(1, 5)]);
+        let fx2 = req_flex(802, (40, 80), &[(1, 5)]);
+
+        let mut berths = BerthContainer::new();
+        berths.insert(b);
+
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        fixed.insert(af);
+
+        let mut flex = RequestContainer::<FlexibleKind, i64>::new();
+        flex.insert(fx1);
+        flex.insert(fx2);
+
+        let p = Problem::new(berths, fixed, flex).unwrap();
+
+        let ids: std::collections::BTreeSet<_> =
+            p.iter_flexible_requests().map(|r| r.id()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&rid(801)));
+        assert!(ids.contains(&rid(802)));
+    }
+
+    #[test]
+    fn test_iter_fixed_assignments_returns_only_fixed() {
+        let b = berth(1, 0, 1000);
+
+        let r1 = req_fixed(810, (0, 1000), &[(1, 10)]);
+        let r2 = req_fixed(811, (0, 1000), &[(1, 7)]);
+
+        let a1 = asg_fixed(&r1, &b, 10);
+        let a2 = asg_fixed(&r2, &b, 30);
+
+        // Some flex that should not appear in fixed assignments
+        let f1 = req_flex(812, (0, 100), &[(1, 5)]);
+
+        let mut berths = BerthContainer::new();
+        berths.insert(b);
+
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        fixed.insert(a1);
+        fixed.insert(a2);
+
+        let mut flex = RequestContainer::<FlexibleKind, i64>::new();
+        flex.insert(f1);
+
+        let p = Problem::new(berths, fixed, flex).unwrap();
+
+        let ids: std::collections::BTreeSet<_> =
+            p.iter_fixed_assignments().map(|a| a.request_id()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&rid(810)));
+        assert!(ids.contains(&rid(811)));
+        assert!(!ids.contains(&rid(812)));
+    }
+
+    #[test]
+    fn test_iter_fixed_requests_yields_fixed_requests() {
+        let b = berth(1, 0, 1000);
+
+        let r1 = req_fixed(820, (0, 1000), &[(1, 10)]);
+        let r2 = req_fixed(821, (0, 1000), &[(1, 7)]);
+
+        let a1 = asg_fixed(&r1, &b, 10);
+        let a2 = asg_fixed(&r2, &b, 30);
+
+        let mut berths = BerthContainer::new();
+        berths.insert(b);
+
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        fixed.insert(a1);
+        fixed.insert(a2);
+
+        let flex = RequestContainer::<FlexibleKind, i64>::new();
+
+        let p = Problem::new(berths, fixed, flex).unwrap();
+
+        let ids: std::collections::BTreeSet<_> = p.iter_fixed_requests().map(|r| r.id()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&rid(820)));
+        assert!(ids.contains(&rid(821)));
+    }
+
+    #[test]
+    fn test_allowed_berths_of_unions_ids() {
+        // berths 1,2,3 exist
+        let b1 = berth(1, 0, 1000);
+        let b2 = berth(2, 0, 1000);
+        let b3 = berth(3, 0, 1000);
+
+        // fixed request allowed on {1}
+        let rf = req_fixed(830, (0, 1000), &[(1, 10)]);
+        let af = asg_fixed(&rf, &b1, 0);
+
+        // flex A allowed on {1,2}, flex B on {2,3}
+        let fa = req_flex(831, (0, 100), &[(1, 5), (2, 6)]);
+        let fb = req_flex(832, (10, 200), &[(2, 7), (3, 8)]);
+
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
+        berths.insert(b2);
+        berths.insert(b3);
+
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        fixed.insert(af);
+
+        let mut flex = RequestContainer::<FlexibleKind, i64>::new();
+        flex.insert(fa);
+        flex.insert(fb);
+
+        let p = Problem::new(berths, fixed, flex).unwrap();
+
+        let union: std::collections::BTreeSet<_> = p
+            .allowed_berths_of(p.iter_any_requests())
+            .into_iter()
+            .collect();
+
+        assert_eq!(union.len(), 3);
+        assert!(union.contains(&bid(1)));
+        assert!(union.contains(&bid(2)));
+        assert!(union.contains(&bid(3)));
+    }
+
+    #[test]
+    fn test_union_feasible_window_of_some_and_none() {
+        // Non-empty case
+        let b = berth(1, 0, 10_000);
+
+        // windows: [5,15), [10,20), [30,40) => union over all = [5,40)
+        let r_fix = req_fixed(840, (10, 20), &[(1, 1)]);
+        let a_fix = asg_fixed(&r_fix, &b, 10);
+
+        let f1 = req_flex(841, (5, 15), &[(1, 1)]);
+        let f2 = req_flex(842, (30, 40), &[(1, 1)]);
+
+        let mut berths = BerthContainer::new();
+        berths.insert(b);
+
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        fixed.insert(a_fix);
+
+        let mut flex = RequestContainer::<FlexibleKind, i64>::new();
+        flex.insert(f1);
+        flex.insert(f2);
+
+        let p = Problem::new(berths, fixed, flex).unwrap();
+
+        let u = p.union_feasible_window_of(p.iter_any_requests()).unwrap();
+        assert_eq!(u.start(), tp(5));
+        assert_eq!(u.end(), tp(40));
+
+        // Empty case: no requests present => None
+        let p_empty = Problem::new(
+            BerthContainer::new(),
+            AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
+            RequestContainer::<FlexibleKind, i64>::new(),
+        )
+        .unwrap();
+        assert!(
+            p_empty
+                .union_feasible_window_of(p_empty.iter_any_requests())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_requests_allowed_on_berth_in_window_filters_both() {
+        // b1 targeted with window [5,21)
+        let b1 = berth(1, 0, 1000);
+        let b2 = berth(2, 0, 1000);
+
+        // On b1:
+        // r1 [0,10) -> overlaps
+        // r2 [10,20) -> overlaps
+        // r3 [21,30) -> does NOT overlap
+        let r1 = req_flex(850, (0, 10), &[(1, 2)]);
+        let r2 = req_flex(851, (10, 20), &[(1, 2)]);
+        let r3 = req_flex(852, (21, 30), &[(1, 2)]);
+        // On b2 only, should be ignored for b1
+        let r4 = req_flex(853, (0, 100), &[(2, 2)]);
+
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
+        berths.insert(b2);
+
+        let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+
+        let mut flex = RequestContainer::<FlexibleKind, i64>::new();
+        flex.insert(r1);
+        flex.insert(r2);
+        flex.insert(r3);
+        flex.insert(r4);
+
+        let p = Problem::new(berths, fixed, flex).unwrap();
+        let win = iv(5, 21);
+
+        let ids: std::collections::BTreeSet<_> = p
+            .requests_allowed_on_berth_in_window(bid(1), win)
+            .map(|r| r.id())
+            .collect();
+
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&rid(850)));
+        assert!(ids.contains(&rid(851)));
+        assert!(!ids.contains(&rid(852)));
+        assert!(!ids.contains(&rid(853)));
+    }
+
+    #[test]
+    fn test_berth_similarity() {
+        // b1 has {rA, rS}, b2 has {rB, rS}, b3 has {}
+        let b1 = berth(1, 0, 1000);
+        let b2 = berth(2, 0, 1000);
+        let b3 = berth(3, 0, 1000);
+
+        let r_a = req_flex(860, (0, 100), &[(1, 1)]);
+        let r_b = req_flex(861, (0, 100), &[(2, 1)]);
+        let r_s = req_flex(862, (0, 100), &[(1, 1), (2, 1)]);
+
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
+        berths.insert(b2);
+        berths.insert(b3);
+
+        let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+
+        let mut flex = RequestContainer::<FlexibleKind, i64>::new();
+        flex.insert(r_a);
+        flex.insert(r_b);
+        flex.insert(r_s);
+
+        let p = Problem::new(berths, fixed, flex).unwrap();
+
+        let sim_12 = p.berth_similarity(bid(1), bid(2));
+        // intersection = {rS} = 1, union = {rA,rB,rS} = 3 => 1/3
+        assert!((sim_12 - (1.0 / 3.0)).abs() < 1e-9);
+
+        // b1 vs b3: {rA,rS} vs {} => 0/2 = 0
+        let sim_13 = p.berth_similarity(bid(1), bid(3));
+        assert!((sim_13 - 0.0).abs() < 1e-12);
+
+        // b3 vs b3: {} vs {} => union=0 => 0 by definition
+        let sim_33 = p.berth_similarity(bid(3), bid(3));
+        assert!((sim_33 - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_berth_similarity_in_window() {
+        // Same as above but filtered by window
+        let b1 = berth(1, 0, 1000);
+        let b2 = berth(2, 0, 1000);
+        let b3 = berth(3, 0, 1000);
+
+        // All fall within [0,100)
+        let r_a = req_flex(870, (0, 100), &[(1, 1)]);
+        let r_b = req_flex(871, (0, 100), &[(2, 1)]);
+        let r_s = req_flex(872, (0, 100), &[(1, 1), (2, 1)]);
+
+        let mut berths = BerthContainer::new();
+        berths.insert(b1);
+        berths.insert(b2);
+        berths.insert(b3);
+
+        let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+
+        let mut flex = RequestContainer::<FlexibleKind, i64>::new();
+        flex.insert(r_a);
+        flex.insert(r_b);
+        flex.insert(r_s);
+
+        let p = Problem::new(berths, fixed, flex).unwrap();
+
+        // In-window similarity -> same 1/3
+        let win = iv(0, 100);
+        let sim_12 = p.berth_similarity_in_window(bid(1), bid(2), win);
+        assert!((sim_12 - (1.0 / 3.0)).abs() < 1e-9);
+
+        // Window excluding all requests -> union=0 => 0
+        let win_empty = iv(200, 300);
+        let sim_12_empty = p.berth_similarity_in_window(bid(1), bid(2), win_empty);
+        assert!((sim_12_empty - 0.0).abs() < 1e-12);
     }
 }

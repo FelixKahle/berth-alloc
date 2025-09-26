@@ -26,8 +26,9 @@ use crate::{
         err::{EmptyBerthMapError, NoFeasibleAssignmentError, RequestError},
     },
 };
+use average::{Estimate, Mean, Variance};
 use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval};
-use num_traits::CheckedSub;
+use num_traits::{CheckedAdd, CheckedSub};
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::Display,
@@ -151,6 +152,315 @@ impl<K: Kind, T: Ord + Copy + CheckedSub> Request<K, T> {
     #[inline]
     pub fn is_berth_feasible(&self, berth_id: BerthIdentifier) -> bool {
         self.processing_times.contains_key(&berth_id)
+    }
+
+    #[inline]
+    pub fn request_allowed_degree(&self) -> usize {
+        self.processing_times().len()
+    }
+
+    #[inline]
+    pub fn request_slack(&self) -> TimeDelta<T>
+    where
+        T: CheckedAdd + CheckedSub + Copy + Ord + num_traits::Zero,
+    {
+        let best_pt = self
+            .processing_times()
+            .values()
+            .copied()
+            .min()
+            .unwrap_or_else(TimeDelta::zero);
+
+        self.feasible_window().length() - best_pt
+    }
+
+    #[inline]
+    pub fn best_processing_time(&self) -> Option<TimeDelta<T>> {
+        self.processing_times.values().copied().min()
+    }
+
+    #[inline]
+    pub fn worst_processing_time(&self) -> Option<TimeDelta<T>> {
+        self.processing_times.values().copied().max()
+    }
+
+    #[inline]
+    pub fn range_processing_time(&self) -> Option<TimeDelta<T>>
+    where
+        T: Ord + Copy,
+    {
+        Some(self.worst_processing_time()? - self.best_processing_time()?)
+    }
+
+    pub fn mad_processing_time(&self) -> Option<TimeDelta<T>>
+    where
+        T: Ord + Copy + num_traits::Zero + std::ops::Sub<Output = T>,
+    {
+        if self.processing_times.is_empty() {
+            return None;
+        }
+        let med = self.median_processing_time().value();
+        let mut devs: Vec<T> = self
+            .processing_times
+            .values()
+            .map(|d| {
+                let v = d.value();
+                if v >= med { v - med } else { med - v }
+            })
+            .collect();
+        let n = devs.len();
+        let mid = (n - 1) / 2;
+        let (_, m, _) = devs.select_nth_unstable(mid);
+        Some(TimeDelta::new(*m))
+    }
+
+    #[inline]
+    pub fn median_processing_time(&self) -> TimeDelta<T> {
+        assert!(!self.processing_times.is_empty());
+
+        let mut vals: Vec<TimeDelta<T>> = self.processing_times.values().copied().collect();
+        let n = vals.len();
+        let mid = (n - 1) / 2;
+        let (_, m, _) = vals.select_nth_unstable(mid);
+        *m
+    }
+
+    #[inline]
+    pub fn mean_processing_time(&self) -> Option<f64>
+    where
+        T: CheckedSub + num_traits::ToPrimitive,
+    {
+        if self.processing_times.is_empty() {
+            return None;
+        }
+
+        let mut m = average::Mean::new();
+        for x in self
+            .processing_times
+            .values()
+            .filter_map(|d| d.value().to_f64())
+        {
+            m.add(x);
+        }
+        Some(m.mean())
+    }
+
+    #[inline]
+    pub fn stddev_processing_time(&self) -> Option<f64>
+    where
+        T: CheckedSub + num_traits::ToPrimitive,
+    {
+        if self.processing_times.is_empty() {
+            return None;
+        }
+
+        let mut v = Variance::new();
+        for x in self
+            .processing_times
+            .values()
+            .filter_map(|d| d.value().to_f64())
+        {
+            v.add(x);
+        }
+        Some(v.estimate().sqrt())
+    }
+
+    #[inline]
+    pub fn coefficient_of_variation_processing_time(&self) -> Option<f64>
+    where
+        T: CheckedSub + num_traits::ToPrimitive,
+    {
+        if self.processing_times.is_empty() {
+            return None;
+        }
+
+        let mut mean = Mean::new();
+        let mut var = Variance::new();
+        for x in self
+            .processing_times
+            .values()
+            .filter_map(|d| d.value().to_f64())
+        {
+            mean.add(x);
+            var.add(x);
+        }
+        let m = mean.mean();
+        if m == 0.0 {
+            return Some(0.0);
+        }
+        Some(var.estimate().sqrt() / m)
+    }
+
+    #[inline]
+    pub fn slack_ratio(&self) -> f64
+    where
+        T: CheckedAdd + CheckedSub + num_traits::Zero + num_traits::ToPrimitive,
+    {
+        let len = self
+            .feasible_window()
+            .length()
+            .value()
+            .to_f64()
+            .unwrap_or(0.0);
+        if len == 0.0 {
+            return 0.0;
+        }
+        let slack = self.request_slack().value().to_f64().unwrap_or(0.0);
+        (slack / len).clamp(0.0, 1.0)
+    }
+
+    pub fn iqr_processing_time(&self) -> Option<TimeDelta<T>>
+    where
+        T: Ord + Copy + CheckedSub,
+    {
+        if self.processing_times.is_empty() {
+            return None;
+        }
+
+        let mut vals: Vec<TimeDelta<T>> = self.processing_times.values().copied().collect();
+        let n = vals.len();
+
+        let q1_idx = (n - 1) / 4;
+        let q3_idx = (3 * (n - 1)) / 4;
+
+        let q1 = {
+            let (_, m, _) = vals.select_nth_unstable(q1_idx);
+            *m
+        };
+        let q3 = {
+            let (_, m, _) = vals.select_nth_unstable(q3_idx);
+            *m
+        };
+
+        Some(q3 - q1)
+    }
+
+    #[inline]
+    pub fn tightness_min(&self) -> f64
+    where
+        T: CheckedSub + num_traits::ToPrimitive + num_traits::Zero,
+    {
+        let len = self
+            .feasible_window()
+            .length()
+            .value()
+            .to_f64()
+            .unwrap_or(0.0);
+        if len == 0.0 {
+            return 1.0;
+        }
+        let pt = self
+            .best_processing_time()
+            .unwrap_or_else(TimeDelta::zero)
+            .value()
+            .to_f64()
+            .unwrap_or(0.0);
+        (pt / len).clamp(0.0, 1.0)
+    }
+
+    #[inline]
+    pub fn tightness_max(&self) -> f64
+    where
+        T: CheckedSub + num_traits::ToPrimitive + num_traits::Zero,
+    {
+        let len = self
+            .feasible_window()
+            .length()
+            .value()
+            .to_f64()
+            .unwrap_or(0.0);
+        if len == 0.0 {
+            return 1.0;
+        }
+        let pt = self
+            .worst_processing_time()
+            .unwrap_or_else(TimeDelta::zero)
+            .value()
+            .to_f64()
+            .unwrap_or(0.0);
+        (pt / len).clamp(0.0, 1.0)
+    }
+
+    pub fn tightness_median(&self) -> f64
+    where
+        T: num_traits::ToPrimitive,
+    {
+        let len = self
+            .feasible_window()
+            .length()
+            .value()
+            .to_f64()
+            .unwrap_or(0.0);
+        if len == 0.0 {
+            return 1.0;
+        }
+        let med = self
+            .median_processing_time()
+            .value()
+            .to_f64()
+            .unwrap_or(0.0);
+        (med / len).clamp(0.0, 1.0)
+    }
+
+    #[inline]
+    pub fn argmin_processing_time(&self) -> (BerthIdentifier, TimeDelta<T>) {
+        self.processing_times
+            .iter()
+            .fold(None, |best, (&bid, &pt)| match best {
+                None => Some((bid, pt)),
+                Some((bbid, bpt)) => {
+                    if pt < bpt || (pt == bpt && bid < bbid) {
+                        Some((bid, pt))
+                    } else {
+                        Some((bbid, bpt))
+                    }
+                }
+            })
+            .unwrap()
+    }
+
+    #[inline]
+    pub fn berth_preference(&self) -> Vec<(BerthIdentifier, TimeDelta<T>)> {
+        let mut v: Vec<_> = self
+            .processing_times
+            .iter()
+            .map(|(b, d)| (*b, *d))
+            .collect();
+        v.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        v
+    }
+
+    #[inline]
+    pub fn time_fraction_on(&self, bid: BerthIdentifier) -> Option<f64>
+    where
+        T: CheckedSub + num_traits::ToPrimitive,
+    {
+        let len = self
+            .feasible_window()
+            .length()
+            .value()
+            .to_f64()
+            .unwrap_or(0.0);
+        if len == 0.0 {
+            return Some(0.0);
+        }
+        let pt = self.processing_time_for(bid)?;
+        let x = pt.value().to_f64().unwrap_or(0.0);
+        Some((x / len).clamp(0.0, 1.0))
+    }
+
+    #[inline]
+    pub fn allowed_signature(&self) -> std::collections::BTreeSet<BerthIdentifier> {
+        self.processing_times.keys().copied().collect()
+    }
+
+    #[inline]
+    pub fn latest_start_offset_for(&self, bid: BerthIdentifier) -> Option<TimeDelta<T>>
+    where
+        T: CheckedSub,
+    {
+        self.processing_time_for(bid)
+            .map(|pt| self.feasible_window().length() - pt)
     }
 }
 
@@ -616,5 +926,444 @@ mod tests {
         assert!(s.contains("Processing Times"));
         assert!(s.contains(&format!("{}", bid(1))));
         assert!(s.contains(&format!("{}", bid(2))));
+    }
+
+    #[test]
+    fn test_iter_allowed_berths_ids_and_is_berth_feasible_and_degree() {
+        let mut pt = BTreeMap::new();
+        pt.insert(bid(1), td(5));
+        pt.insert(bid(3), td(7));
+        let r = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(100), iv(0, 100), 1, pt)
+            .unwrap();
+
+        let ids: Vec<_> = r.iter_allowed_berths_ids().collect();
+        assert_eq!(ids, vec![bid(1), bid(3)]); // BTreeMap is ordered by key
+
+        assert!(r.is_berth_feasible(bid(1)));
+        assert!(!r.is_berth_feasible(bid(2)));
+        assert!(r.is_berth_feasible(bid(3)));
+        assert_eq!(r.request_allowed_degree(), 2);
+    }
+
+    #[test]
+    fn test_request_slack_and_slack_ratio() {
+        // Window [0,30), PTs {1: 10, 2: 15} -> best=10 => slack=20
+        let mut pt = BTreeMap::new();
+        pt.insert(bid(1), td(10));
+        pt.insert(bid(2), td(15));
+        let r = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(101), iv(0, 30), 1, pt)
+            .unwrap();
+
+        assert_eq!(r.request_slack(), td(20));
+
+        let ratio = r.slack_ratio();
+        // ratio = slack/len = 20/30 = 0.666..
+        assert!((ratio - (20.0 / 30.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_best_and_worst_processing_time_some() {
+        let mut pt = BTreeMap::new();
+        pt.insert(bid(2), td(8));
+        pt.insert(bid(1), td(5));
+        pt.insert(bid(5), td(12));
+        let r = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(102), iv(0, 50), 1, pt)
+            .unwrap();
+
+        assert_eq!(r.best_processing_time(), Some(td(5)));
+        assert_eq!(r.worst_processing_time(), Some(td(12)));
+    }
+
+    #[test]
+    fn test_median_processing_time_odd_and_even_lower_median() {
+        // Odd count: {3,7,9} -> median = 7
+        let mut pt1 = BTreeMap::new();
+        pt1.insert(bid(1), td(9));
+        pt1.insert(bid(2), td(3));
+        pt1.insert(bid(3), td(7));
+        let r1 = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(103), iv(0, 50), 1, pt1)
+            .unwrap();
+        assert_eq!(r1.median_processing_time(), td(7));
+
+        // Even count (lower median): {2,5,5,9} -> lower median = element index 1 => 5
+        let mut pt2 = BTreeMap::new();
+        pt2.insert(bid(1), td(5));
+        pt2.insert(bid(2), td(9));
+        pt2.insert(bid(3), td(2));
+        pt2.insert(bid(4), td(5));
+        let r2 = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(104), iv(0, 50), 1, pt2)
+            .unwrap();
+        assert_eq!(r2.median_processing_time(), td(5));
+    }
+
+    #[test]
+    fn test_mean_stddev_and_cv_processing_time_with_average_crate() {
+        // Values: 2, 4, 4, 4, 5, 5, 7, 9 (classic example: mean = 5, stddev sample ~ 2.138...)
+        let vals = [2, 4, 4, 4, 5, 5, 7, 9];
+
+        let mut pt = BTreeMap::new();
+        for (i, v) in vals.iter().enumerate() {
+            pt.insert(BerthIdentifier::new(i as u32 + 1), TimeDelta::new(*v));
+        }
+        let r = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(105), iv(0, 100), 1, pt)
+            .unwrap();
+
+        // mean_processing_time
+        let mut m = Mean::new();
+        for &x in &vals {
+            m.add(x as f64);
+        }
+        let expected_mean = m.mean();
+        assert_eq!(r.mean_processing_time().unwrap(), expected_mean);
+
+        // stddev_processing_time uses Variance.estimate().sqrt() in the impl.
+        let mut v = Variance::new();
+        for &x in &vals {
+            v.add(x as f64);
+        }
+        let expected_std = v.estimate().sqrt();
+        assert!((r.stddev_processing_time().unwrap() - expected_std).abs() < 1e-12);
+
+        // coefficient_of_variation_processing_time = stddev / mean (with mean != 0)
+        let expected_cv = expected_std / expected_mean;
+        assert!(
+            (r.coefficient_of_variation_processing_time().unwrap() - expected_cv).abs() < 1e-12
+        );
+    }
+
+    #[test]
+    fn test_tightness_min_max_and_zero_len_window_behavior() {
+        // |window| = 20, best=5, worst=15 -> min = 5/20=0.25, max = 15/20=0.75
+        let mut pt = BTreeMap::new();
+        pt.insert(bid(1), td(15));
+        pt.insert(bid(2), td(5));
+        let r = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(106), iv(0, 20), 1, pt)
+            .unwrap();
+
+        assert!((r.tightness_min() - 0.25).abs() < 1e-12);
+        assert!((r.tightness_max() - 0.75).abs() < 1e-12);
+
+        // Zero-length window -> both return 1.0
+        let mut pt0 = BTreeMap::new();
+        pt0.insert(bid(1), td(0));
+        let r0 = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(107), iv(10, 10), 1, pt0)
+            .unwrap();
+        assert_eq!(r0.tightness_min(), 1.0);
+        assert_eq!(r0.tightness_max(), 1.0);
+    }
+
+    #[test]
+    fn test_argmin_processing_time_tie_breaks_by_berth_id() {
+        // { (2,5), (1,5), (3,7) } -> argmin = (1,5) since tie on PT, lower berth id wins
+        let mut pt = BTreeMap::new();
+        pt.insert(bid(2), td(5));
+        pt.insert(bid(1), td(5));
+        pt.insert(bid(3), td(7));
+        let r = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(108), iv(0, 50), 1, pt)
+            .unwrap();
+
+        let (b, d) = r.argmin_processing_time();
+        assert_eq!(b, bid(1));
+        assert_eq!(d, td(5));
+    }
+
+    #[test]
+    fn test_berth_preference_sorted_by_pt_then_id() {
+        // Expect sorting by PT ascending, then by berth id
+        // Entries: (id, pt) = (2,5), (1,5), (3,7) -> order: (1,5), (2,5), (3,7)
+        let mut pt = BTreeMap::new();
+        pt.insert(bid(2), td(5));
+        pt.insert(bid(1), td(5));
+        pt.insert(bid(3), td(7));
+        let r = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(109), iv(0, 50), 1, pt)
+            .unwrap();
+
+        let pref = r.berth_preference();
+        assert_eq!(
+            pref,
+            vec![(bid(1), td(5)), (bid(2), td(5)), (bid(3), td(7))]
+        );
+    }
+
+    #[test]
+    fn test_time_fraction_on_and_forbidden_berth_and_zero_window() {
+        let mut pt = BTreeMap::new();
+        pt.insert(bid(1), td(5));
+        pt.insert(bid(2), td(15));
+        let r = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(110), iv(0, 20), 1, pt)
+            .unwrap();
+
+        // 5/20 = 0.25
+        assert!((r.time_fraction_on(bid(1)).unwrap() - 0.25).abs() < 1e-12);
+        // forbidden berth -> None
+        assert!(r.time_fraction_on(bid(3)).is_none());
+
+        // zero-length window -> Some(0.0)
+        let mut pt0 = BTreeMap::new();
+        pt0.insert(bid(1), td(0));
+        let r0 =
+            Request::<FlexibleKind, i64>::new(RequestIdentifier::new(111), iv(100, 100), 1, pt0)
+                .unwrap();
+        assert_eq!(r0.time_fraction_on(bid(1)).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn test_allowed_signature_contains_all_allowed_berths() {
+        let mut pt = BTreeMap::new();
+        pt.insert(bid(2), td(5));
+        pt.insert(bid(5), td(7));
+        let r = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(112), iv(0, 50), 1, pt)
+            .unwrap();
+
+        let sig = r.allowed_signature();
+        let expected: std::collections::BTreeSet<_> = [bid(2), bid(5)].into_iter().collect();
+        assert_eq!(sig, expected);
+    }
+
+    #[test]
+    fn test_latest_start_offset_for_some_and_none() {
+        // |window| = 20, pt(1)=5, pt(2)=20
+        let mut pt = BTreeMap::new();
+        pt.insert(bid(1), td(5));
+        pt.insert(bid(2), td(20));
+        let r = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(113), iv(0, 20), 1, pt)
+            .unwrap();
+
+        assert_eq!(r.latest_start_offset_for(bid(1)), Some(td(15)));
+        assert_eq!(r.latest_start_offset_for(bid(2)), Some(td(0)));
+        assert_eq!(r.latest_start_offset_for(bid(3)), None);
+    }
+
+    #[test]
+    fn test_request_container_insert_remove_get_iter_len_contains() {
+        let mut c = RequestContainer::<FlexibleKind, i64>::new();
+        assert!(c.is_empty());
+        assert_eq!(c.len(), 0);
+
+        let mut pt1 = BTreeMap::new();
+        pt1.insert(bid(1), td(5));
+        let r1 = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(201), iv(0, 10), 1, pt1)
+            .unwrap();
+
+        let mut pt2 = BTreeMap::new();
+        pt2.insert(bid(2), td(3));
+        let r2 = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(202), iv(0, 10), 1, pt2)
+            .unwrap();
+
+        // insert
+        c.insert(r1.clone());
+        c.insert(r2.clone());
+
+        assert!(!c.is_empty());
+        assert_eq!(c.len(), 2);
+        assert!(c.contains_id(r1.id()));
+        assert!(c.contains_request(&r2));
+        assert!(c.get(r1.id()).is_some());
+
+        // iter
+        let ids: std::collections::BTreeSet<_> = c.iter().map(|r| r.id()).collect();
+        let expected: std::collections::BTreeSet<_> = [r1.id(), r2.id()].into_iter().collect();
+        assert_eq!(ids, expected);
+
+        // remove
+        let removed = c.remove(r1.id()).unwrap();
+        assert_eq!(removed.id(), r1.id());
+        assert_eq!(c.len(), 1);
+        assert!(!c.contains_id(r1.id()));
+        assert!(c.contains_id(r2.id()));
+    }
+
+    #[test]
+    fn test_any_request_and_any_request_ref_conversions_and_display() {
+        // Fixed and Flexible requests
+        let mut pt_f = BTreeMap::new();
+        pt_f.insert(bid(1), td(5));
+        let rf =
+            Request::<FixedKind, i64>::new_fixed(RequestIdentifier::new(301), iv(0, 10), 1, pt_f)
+                .unwrap();
+
+        let mut pt_x = BTreeMap::new();
+        pt_x.insert(bid(2), td(7));
+        let rx = Request::<FlexibleKind, i64>::new_flexible(
+            RequestIdentifier::new(302),
+            iv(0, 20),
+            1,
+            pt_x,
+        )
+        .unwrap();
+
+        // AnyRequest From
+        let ar_f = AnyRequest::from(rf.clone());
+        let ar_x = AnyRequest::from(rx.clone());
+        assert_eq!(format!("{ar_f}").contains("Fixed-Request"), true);
+        assert_eq!(format!("{ar_x}").contains("Flexible-Request"), true);
+
+        // AnyRequestRef From and methods
+        let arf = AnyRequestRef::from(&rf);
+        let arx = AnyRequestRef::from(&rx);
+        assert_eq!(arf.id(), rf.id());
+        assert_eq!(arx.id(), rx.id());
+        assert_eq!(arf.feasible_window(), rf.feasible_window());
+        assert_eq!(arx.feasible_window(), rx.feasible_window());
+        assert_eq!(
+            arf.processing_time_for(bid(1)),
+            rf.processing_time_for(bid(1))
+        );
+        assert_eq!(
+            arx.processing_time_for(bid(2)),
+            rx.processing_time_for(bid(2))
+        );
+
+        // Display for AnyRequestRef
+        assert!(format!("{arf}").contains("Fixed-Request"));
+        assert!(format!("{arx}").contains("Flexible-Request"));
+    }
+
+    #[test]
+    fn test_range_processing_time_some_and_singleton_zero() {
+        // Multiple entries: best=5, worst=12 -> range=7
+        let mut pt = BTreeMap::new();
+        pt.insert(bid(1), td(5));
+        pt.insert(bid(2), td(12));
+        let r = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(1201), iv(0, 100), 1, pt)
+            .unwrap();
+        assert_eq!(r.range_processing_time(), Some(td(12 - 5)));
+
+        // Singleton: best=worst=7 -> range=0
+        let mut pt1 = BTreeMap::new();
+        pt1.insert(bid(3), td(7));
+        let r1 =
+            Request::<FlexibleKind, i64>::new(RequestIdentifier::new(1202), iv(0, 100), 1, pt1)
+                .unwrap();
+        assert_eq!(r1.range_processing_time(), Some(td(0)));
+    }
+
+    #[test]
+    fn test_mad_processing_time_zero_and_nonzero() {
+        // Data: {1,2,3,4,100} => median=3, deviations={2,1,0,1,97}, median(deviations)=1
+        let mut pt = BTreeMap::new();
+        pt.insert(bid(1), td(1));
+        pt.insert(bid(2), td(2));
+        pt.insert(bid(3), td(3));
+        pt.insert(bid(4), td(4));
+        pt.insert(bid(5), td(100));
+        let r = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(1210), iv(0, 200), 1, pt)
+            .unwrap();
+        assert_eq!(r.mad_processing_time(), Some(td(1)));
+
+        // All equal -> deviations all zero -> MAD = 0
+        let mut pt_eq = BTreeMap::new();
+        pt_eq.insert(bid(1), td(5));
+        pt_eq.insert(bid(2), td(5));
+        pt_eq.insert(bid(3), td(5));
+        let r_eq =
+            Request::<FlexibleKind, i64>::new(RequestIdentifier::new(1211), iv(0, 10), 1, pt_eq)
+                .unwrap();
+        assert_eq!(r_eq.mad_processing_time(), Some(td(0)));
+    }
+
+    #[test]
+    fn test_tightness_median_and_zero_window_behavior() {
+        // |window|=20, PTs {6,10,14} -> median=10 => tightness_median=10/20=0.5
+        let mut pt = BTreeMap::new();
+        pt.insert(bid(1), td(6));
+        pt.insert(bid(2), td(10));
+        pt.insert(bid(3), td(14));
+        let r = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(1220), iv(0, 20), 1, pt)
+            .unwrap();
+        assert!((r.tightness_median() - 0.5).abs() < 1e-12);
+
+        // Zero-length window -> returns 1.0 by definition
+        let mut pt0 = BTreeMap::new();
+        pt0.insert(bid(1), td(0));
+        let r0 =
+            Request::<FlexibleKind, i64>::new(RequestIdentifier::new(1221), iv(100, 100), 1, pt0)
+                .unwrap();
+        assert_eq!(r0.tightness_median(), 1.0);
+    }
+
+    #[test]
+    fn test_weight_accessor() {
+        let mut pt = BTreeMap::new();
+        pt.insert(bid(1), td(5));
+        let w = 7;
+        let r = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(1230), iv(0, 10), w, pt)
+            .unwrap();
+        assert_eq!(r.weight(), w);
+    }
+
+    #[test]
+    fn test_request_container_with_capacity_and_basic_ops() {
+        let mut c = RequestContainer::<FlexibleKind, i64>::with_capacity(16);
+        assert!(c.is_empty());
+        assert_eq!(c.len(), 0);
+
+        let mut pt1 = BTreeMap::new();
+        pt1.insert(bid(1), td(3));
+        let r1 = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(1240), iv(0, 10), 1, pt1)
+            .unwrap();
+
+        let mut pt2 = BTreeMap::new();
+        pt2.insert(bid(2), td(4));
+        let r2 = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(1241), iv(0, 10), 1, pt2)
+            .unwrap();
+
+        c.insert(r1.clone());
+        c.insert(r2.clone());
+
+        assert_eq!(c.len(), 2);
+        assert!(c.contains_id(r1.id()));
+        assert!(c.get(r2.id()).is_some());
+
+        let removed = c.remove(r1.id()).unwrap();
+        assert_eq!(removed.id(), r1.id());
+        assert_eq!(c.len(), 1);
+    }
+
+    #[test]
+    fn test_iqr_processing_time_basic_and_even_counts() {
+        // Odd count: {1,2,3,4,100} => q1 idx=(5-1)/4=1 -> 2, q3 idx=(3*4)/4=3 -> 4 => IQR=2
+        let mut pt = BTreeMap::new();
+        pt.insert(bid(1), td(1));
+        pt.insert(bid(2), td(2));
+        pt.insert(bid(3), td(3));
+        pt.insert(bid(4), td(4));
+        pt.insert(bid(5), td(100));
+        let r = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(1301), iv(0, 200), 1, pt)
+            .unwrap();
+        assert_eq!(r.iqr_processing_time(), Some(td(2)));
+
+        // Even count: {1,2,3,4} => q1 idx=(4-1)/4=0 -> 1, q3 idx=(3*3)/4=2 -> 3 => IQR=2
+        let mut pt_even = BTreeMap::new();
+        pt_even.insert(bid(1), td(1));
+        pt_even.insert(bid(2), td(2));
+        pt_even.insert(bid(3), td(3));
+        pt_even.insert(bid(4), td(4));
+        let r_even =
+            Request::<FlexibleKind, i64>::new(RequestIdentifier::new(1302), iv(0, 100), 1, pt_even)
+                .unwrap();
+        assert_eq!(r_even.iqr_processing_time(), Some(td(2)));
+    }
+
+    #[test]
+    fn test_iqr_processing_time_all_equal_and_singleton() {
+        // All equal -> q1==q3 -> IQR=0
+        let mut pt_eq = BTreeMap::new();
+        pt_eq.insert(bid(1), td(5));
+        pt_eq.insert(bid(2), td(5));
+        pt_eq.insert(bid(3), td(5));
+        pt_eq.insert(bid(4), td(5));
+        let r_eq =
+            Request::<FlexibleKind, i64>::new(RequestIdentifier::new(1303), iv(0, 10), 1, pt_eq)
+                .unwrap();
+        assert_eq!(r_eq.iqr_processing_time(), Some(td(0)));
+
+        // Singleton -> q1=q3=that value -> IQR=0
+        let mut pt_one = BTreeMap::new();
+        pt_one.insert(bid(1), td(7));
+        let r_one =
+            Request::<FlexibleKind, i64>::new(RequestIdentifier::new(1304), iv(0, 10), 1, pt_one)
+                .unwrap();
+        assert_eq!(r_one.iqr_processing_time(), Some(td(0)));
     }
 }
