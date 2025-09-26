@@ -24,7 +24,6 @@ members = [
     "crates/berth-alloc-core",
     "crates/berth-alloc-model",
     "crates/berth-alloc-solver",
-    "crates/berth-alloc-main",
 ]
 resolver = "3"
 

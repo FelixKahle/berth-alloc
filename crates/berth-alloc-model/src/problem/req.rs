@@ -253,6 +253,122 @@ impl<K: Kind, T: Copy + Ord + CheckedSub> FromIterator<Request<K, T>> for Reques
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AnyRequest<T: Ord + Copy> {
+    Fixed(Request<FixedKind, T>),
+    Flexible(Request<FlexibleKind, T>),
+}
+
+impl<T: Copy + Ord + std::fmt::Display> std::fmt::Display for AnyRequest<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnyRequest::Fixed(r) => write!(f, "{}", r),
+            AnyRequest::Flexible(r) => write!(f, "{}", r),
+        }
+    }
+}
+
+impl<T: Copy + Ord> From<Request<FixedKind, T>> for AnyRequest<T> {
+    #[inline]
+    fn from(r: Request<FixedKind, T>) -> Self {
+        AnyRequest::Fixed(r)
+    }
+}
+
+impl<T: Copy + Ord> From<Request<FlexibleKind, T>> for AnyRequest<T> {
+    #[inline]
+    fn from(r: Request<FlexibleKind, T>) -> Self {
+        AnyRequest::Flexible(r)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AnyRequestRef<'a, T: Ord + Copy> {
+    Fixed(&'a Request<FixedKind, T>),
+    Flexible(&'a Request<FlexibleKind, T>),
+}
+
+impl<'a, T: Copy + Ord> AnyRequestRef<'a, T> {
+    #[inline]
+    pub fn id(&self) -> RequestIdentifier
+    where
+        T: CheckedSub,
+    {
+        match self {
+            AnyRequestRef::Fixed(r) => r.id(),
+            AnyRequestRef::Flexible(r) => r.id(),
+        }
+    }
+
+    #[inline]
+    pub fn feasible_window(&self) -> TimeInterval<T>
+    where
+        T: CheckedSub,
+    {
+        match self {
+            AnyRequestRef::Fixed(r) => r.feasible_window(),
+            AnyRequestRef::Flexible(r) => r.feasible_window(),
+        }
+    }
+
+    #[inline]
+    pub fn iter_allowed_berths_ids(&self) -> impl Iterator<Item = BerthIdentifier>
+    where
+        T: CheckedSub,
+    {
+        let map = match self {
+            AnyRequestRef::Fixed(r) => r.processing_times(),
+            AnyRequestRef::Flexible(r) => r.processing_times(),
+        };
+        map.keys().copied()
+    }
+
+    #[inline]
+    pub fn weight(&self) -> Cost
+    where
+        T: CheckedSub,
+    {
+        match self {
+            AnyRequestRef::Fixed(r) => r.weight(),
+            AnyRequestRef::Flexible(r) => r.weight(),
+        }
+    }
+
+    #[inline]
+    pub fn processing_time_for(&self, berth_id: BerthIdentifier) -> Option<TimeDelta<T>>
+    where
+        T: CheckedSub,
+    {
+        match self {
+            AnyRequestRef::Fixed(r) => r.processing_time_for(berth_id),
+            AnyRequestRef::Flexible(r) => r.processing_time_for(berth_id),
+        }
+    }
+}
+
+impl<'a, T: Copy + Ord + std::fmt::Display> std::fmt::Display for AnyRequestRef<'a, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnyRequestRef::Fixed(r) => write!(f, "{}", r),
+            AnyRequestRef::Flexible(r) => write!(f, "{}", r),
+        }
+    }
+}
+
+impl<'a, T: Copy + Ord> From<&'a Request<FixedKind, T>> for AnyRequestRef<'a, T> {
+    #[inline]
+    fn from(r: &'a Request<FixedKind, T>) -> Self {
+        AnyRequestRef::Fixed(r)
+    }
+}
+
+impl<'a, T: Copy + Ord> From<&'a Request<FlexibleKind, T>> for AnyRequestRef<'a, T> {
+    #[inline]
+    fn from(r: &'a Request<FlexibleKind, T>) -> Self {
+        AnyRequestRef::Flexible(r)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

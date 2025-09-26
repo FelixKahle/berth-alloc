@@ -25,6 +25,7 @@ use crate::berth::err::{
 };
 use berth_alloc_core::prelude::*;
 use berth_alloc_model::prelude::*;
+use num_traits::{CheckedAdd, CheckedSub};
 use rangemap::RangeSet;
 
 pub trait BerthRead<'b, T: Copy + Ord> {
@@ -35,6 +36,20 @@ pub trait BerthRead<'b, T: Copy + Ord> {
         &self,
         window: TimeInterval<T>,
     ) -> impl Iterator<Item = TimeInterval<T>>;
+
+    fn slack_around(&self, iv: TimeInterval<T>) -> (TimeDelta<T>, TimeDelta<T>)
+    where
+        T: CheckedSub + num_traits::Zero;
+    fn free_time_in(&self, window: TimeInterval<T>) -> TimeDelta<T>
+    where
+        T: CheckedSub + CheckedAdd + num_traits::Zero;
+    fn max_free_gap_in(&self, window: TimeInterval<T>) -> TimeDelta<T>
+    where
+        T: CheckedSub + CheckedAdd + num_traits::Zero;
+    fn free_fragments_in(&self, window: TimeInterval<T>) -> usize;
+    fn utilization_in(&self, window: TimeInterval<T>) -> f64
+    where
+        T: CheckedSub + CheckedAdd + num_traits::ToPrimitive + num_traits::Zero;
 }
 
 pub trait BerthWrite<'b, T: Copy + Ord>: BerthRead<'b, T> {
@@ -98,6 +113,82 @@ impl<'b, T: Copy + Ord> BerthRead<'b, T> for BerthOccupancy<'b, T> {
                 })
             })
     }
+
+    fn slack_around(&self, iv: TimeInterval<T>) -> (TimeDelta<T>, TimeDelta<T>)
+    where
+        T: CheckedSub + num_traits::Zero,
+    {
+        if iv.is_empty() {
+            return (TimeDelta::zero(), TimeDelta::zero());
+        }
+
+        let (s, e) = iv.into_inner();
+        let mut left = TimeDelta::zero();
+        let mut right = TimeDelta::zero();
+
+        if let Some(r) = self.free.iter().take_while(|r| r.end <= s).last()
+            && r.end == s
+        {
+            left = s - r.start;
+        }
+
+        if let Some(r) = self.free.iter().find(|r| r.start >= e)
+            && r.start == e
+        {
+            right = r.end - e;
+        }
+
+        (left, right)
+    }
+
+    fn free_time_in(&self, window: TimeInterval<T>) -> TimeDelta<T>
+    where
+        T: CheckedSub + CheckedAdd + num_traits::Zero,
+    {
+        self.iter_free_intervals_in(window)
+            .map(|seg| {
+                let (s, e) = seg.into_inner();
+                e - s
+            })
+            .sum()
+    }
+
+    fn max_free_gap_in(&self, window: TimeInterval<T>) -> TimeDelta<T>
+    where
+        T: CheckedSub + CheckedAdd + num_traits::Zero,
+    {
+        self.iter_free_intervals_in(window)
+            .map(|seg| {
+                let (s, e) = seg.into_inner();
+                e - s
+            })
+            .max()
+            .unwrap_or_else(TimeDelta::zero)
+    }
+
+    fn free_fragments_in(&self, window: TimeInterval<T>) -> usize {
+        self.iter_free_intervals_in(window).count()
+    }
+
+    fn utilization_in(&self, window: TimeInterval<T>) -> f64
+    where
+        T: CheckedSub + CheckedAdd + num_traits::ToPrimitive + num_traits::Zero,
+    {
+        if window.is_empty() {
+            return 0.0;
+        }
+        let (s, e) = window.into_inner();
+        let total = e - s;
+        let free = self.free_time_in(window);
+
+        let total_f = total.value().to_f64().unwrap_or(0.0);
+        if total_f == 0.0 {
+            return 0.0;
+        }
+        let free_f = free.value().to_f64().unwrap_or(0.0);
+        let util = 1.0 - (free_f / total_f);
+        util.clamp(0.0, 1.0)
+    }
 }
 
 impl<'b, T: Copy + Ord> BerthWrite<'b, T> for BerthOccupancy<'b, T> {
@@ -139,6 +230,7 @@ impl<'b, T: Copy + Ord> BerthWrite<'b, T> for BerthOccupancy<'b, T> {
             ));
         }
 
+        #[cfg(any(debug_assertions, feature = "validate-apply"))]
         for seg in other.free.iter() {
             let iv = TimeInterval::new(seg.start, seg.end);
             if !self.berth.covers(iv) {
@@ -173,6 +265,23 @@ impl<'b, T: Copy + Ord> BerthWrite<'b, T> for BerthOccupancy<'b, T> {
         }
 
         Ok(std::mem::replace(self, other))
+    }
+}
+
+impl<'b, T: std::fmt::Display + Copy + Ord> std::fmt::Display for BerthOccupancy<'b, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BerthOccupancy(berth={}, free=[", self.berth.id())?;
+        let mut first = true;
+        for seg in self.free.iter() {
+            if !first {
+                write!(f, ", ")?;
+            } else {
+                first = false;
+            }
+            let iv = TimeInterval::new(seg.start, seg.end);
+            write!(f, "{iv}")?;
+        }
+        write!(f, "])")
     }
 }
 
@@ -308,6 +417,47 @@ mod tests {
 
         // Should be OK: both are subsets of availability, even though c is not ⊆ a.free.
         a.apply(c).unwrap();
+    }
+
+    #[test]
+    fn test_test_display_format() {
+        let b = Berth::from_windows(bid(1), vec![iv(0, 10), iv(20, 30)]);
+        let mut occ = BerthOccupancy::new(&b);
+        occ.occupy(iv(3, 7)).unwrap(); // free => [0,3), [7,10), [20,30)
+        let s = format!("{occ}");
+        assert_eq!(
+            s,
+            "BerthOccupancy(berth=BerthId(1), free=[[TimePoint(0), TimePoint(3)), [TimePoint(7), TimePoint(10)), [TimePoint(20), TimePoint(30))])"
+        );
+    }
+
+    #[test]
+    fn test_free_time_and_fragments_and_max_gap() {
+        let b = Berth::from_windows(bid(10), vec![iv(0, 10)]);
+        let mut occ = BerthOccupancy::new(&b);
+        occ.occupy(iv(3, 7)).unwrap(); // free: [0,3) and [7,10)
+
+        assert_eq!(occ.free_time_in(iv(0, 10)).value(), 6);
+        assert_eq!(occ.max_free_gap_in(iv(0, 10)).value(), 3);
+        assert_eq!(occ.free_fragments_in(iv(0, 10)), 2);
+
+        // Sub-window
+        assert_eq!(occ.free_time_in(iv(2, 8)).value(), 2); // [2,3) and [7,8)
+        assert_eq!(occ.max_free_gap_in(iv(2, 9)).value(), 2); // [2,3) vs [7,9)
+        assert_eq!(occ.free_fragments_in(iv(2, 9)), 2);
+    }
+
+    #[test]
+    fn test_utilization_in() {
+        let b = Berth::from_windows(bid(11), vec![iv(0, 10)]);
+        let mut occ = BerthOccupancy::new(&b);
+        occ.occupy(iv(3, 7)).unwrap(); // free 6 of 10 → utilization 0.4
+
+        let u = occ.utilization_in(iv(0, 10));
+        assert!((u - 0.4).abs() < 1e-9);
+
+        // Empty window → 0
+        assert_eq!(occ.utilization_in(iv(5, 5)), 0.0);
     }
 }
 

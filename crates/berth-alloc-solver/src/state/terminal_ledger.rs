@@ -19,16 +19,27 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use std::time::Instant;
+use crate::{registry::ledger::Ledger, terminal::terminalocc::TerminalOccupancy};
 
-pub trait Clock: Send + Sync {
-    fn now(&self) -> Instant;
+#[derive(Debug, Clone)]
+pub struct TerminalLedger<'problem, T: Copy + Ord> {
+    ledger: Ledger<'problem, T>,
+    terminal: TerminalOccupancy<'problem, T>,
 }
 
-#[derive(Default, Debug, Clone, Copy)]
-pub struct SystemClock;
-impl Clock for SystemClock {
-    fn now(&self) -> Instant {
-        Instant::now()
+impl<'problem, T: Copy + Ord> TerminalLedger<'problem, T> {
+    #[inline]
+    pub fn new(ledger: Ledger<'problem, T>, terminal: TerminalOccupancy<'problem, T>) -> Self {
+        Self { ledger, terminal }
+    }
+
+    #[inline]
+    pub fn ledger(&self) -> &Ledger<'problem, T> {
+        &self.ledger
+    }
+
+    #[inline]
+    pub fn terminal(&self) -> &TerminalOccupancy<'problem, T> {
+        &self.terminal
     }
 }

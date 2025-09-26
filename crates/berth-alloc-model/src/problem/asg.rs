@@ -467,6 +467,66 @@ where
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AnyAssignment<T: Ord + Copy> {
+    Fixed(Assignment<FixedKind, T>),
+    Flexible(Assignment<FlexibleKind, T>),
+}
+
+impl<T: Copy + Ord + CheckedSub + std::fmt::Display> std::fmt::Display for AnyAssignment<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnyAssignment::Fixed(a) => write!(f, "{}", a),
+            AnyAssignment::Flexible(a) => write!(f, "{}", a),
+        }
+    }
+}
+
+impl<T: Copy + Ord> From<Assignment<FixedKind, T>> for AnyAssignment<T> {
+    fn from(a: Assignment<FixedKind, T>) -> Self {
+        AnyAssignment::Fixed(a)
+    }
+}
+
+impl<T: Copy + Ord> From<Assignment<FlexibleKind, T>> for AnyAssignment<T> {
+    fn from(a: Assignment<FlexibleKind, T>) -> Self {
+        AnyAssignment::Flexible(a)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AnyAssignmentRef<'r, 'b, T: Ord + Copy> {
+    Fixed(AssignmentRef<'r, 'b, FixedKind, T>),
+    Flexible(AssignmentRef<'r, 'b, FlexibleKind, T>),
+}
+
+impl<T: Copy + Ord + CheckedSub + std::fmt::Display> std::fmt::Display
+    for AnyAssignmentRef<'_, '_, T>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnyAssignmentRef::Fixed(a) => write!(f, "{}", a),
+            AnyAssignmentRef::Flexible(a) => write!(f, "{}", a),
+        }
+    }
+}
+
+impl<'r, 'b, T: Copy + Ord> From<AssignmentRef<'r, 'b, FixedKind, T>>
+    for AnyAssignmentRef<'r, 'b, T>
+{
+    fn from(a: AssignmentRef<'r, 'b, FixedKind, T>) -> Self {
+        AnyAssignmentRef::Fixed(a)
+    }
+}
+
+impl<'r, 'b, T: Copy + Ord> From<AssignmentRef<'r, 'b, FlexibleKind, T>>
+    for AnyAssignmentRef<'r, 'b, T>
+{
+    fn from(a: AssignmentRef<'r, 'b, FlexibleKind, T>) -> Self {
+        AnyAssignmentRef::Flexible(a)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

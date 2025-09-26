@@ -19,18 +19,18 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use std::ops::Mul;
-
 use crate::registry::err::{LedgerCommitError, LedgerUncomitError};
-use berth_alloc_core::prelude::{Cost, TimePoint};
+use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval, TimePoint};
 use berth_alloc_model::{
     common::{FixedKind, FlexibleKind},
     prelude::{
-        Assignment, AssignmentContainer, Berth, Problem, Request, RequestContainer, StateValidator,
+        Assignment, AssignmentContainer, Berth, BerthIdentifier, Problem, Request,
+        RequestContainer, StateValidator,
     },
-    problem::asg::{AssignmentRef, AssignmentView},
+    problem::asg::{AnyAssignmentRef, AssignmentRef, AssignmentView},
 };
 use num_traits::{CheckedAdd, CheckedSub};
+use std::ops::Mul;
 
 #[derive(Debug, Clone)]
 pub struct Ledger<'p, T: Copy + Ord> {
@@ -149,7 +149,7 @@ impl<'p, T: Copy + Ord> Ledger<'p, T> {
     }
 
     #[inline]
-    pub fn iter_assignments(
+    pub fn iter_flexible_assignments(
         &self,
     ) -> impl Iterator<Item = &AssignmentRef<'p, 'p, FlexibleKind, T>> {
         self.commited.iter()
@@ -176,13 +176,188 @@ impl<'p, T: Copy + Ord> Ledger<'p, T> {
         let flexible_cost: Cost = self.commited_assignments().iter().map(|a| a.cost()).sum();
         fixed_cost + flexible_cost
     }
+
+    #[inline]
+    pub fn committed_in_window(
+        &self,
+        win: TimeInterval<T>,
+    ) -> impl Iterator<Item = &AssignmentRef<'p, 'p, FlexibleKind, T>>
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        self.commited
+            .iter()
+            .filter(move |a| a.interval().intersects(&win))
+    }
+
+    #[inline]
+    pub fn committed_count_in_window(&self, win: TimeInterval<T>) -> usize
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        self.committed_in_window(win).count()
+    }
+
+    #[inline]
+    pub fn fixed_in_window(
+        &self,
+        win: TimeInterval<T>,
+    ) -> impl Iterator<Item = &Assignment<FixedKind, T>> + '_
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        self.problem
+            .fixed_assignments()
+            .iter()
+            .filter(move |a| a.interval().intersects(&win))
+    }
+
+    #[inline]
+    pub fn fixed_count_in_window(&self, win: TimeInterval<T>) -> usize
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        self.fixed_in_window(win).count()
+    }
+
+    #[inline]
+    pub fn total_count_in_window(&self, win: TimeInterval<T>) -> usize
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        self.fixed_count_in_window(win) + self.committed_count_in_window(win)
+    }
+
+    #[inline]
+    pub fn fixed_assignment_ratio_in_window(&self, win: TimeInterval<T>) -> f64
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        let fixed = self.fixed_count_in_window(win) as f64;
+        let total = self.total_count_in_window(win) as f64;
+        if total == 0.0 { 0.0 } else { fixed / total }
+    }
+
+    #[inline]
+    pub fn flexible_assignment_ratio_in_window(&self, win: TimeInterval<T>) -> f64
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        let flex = self.committed_count_in_window(win) as f64;
+        let total = self.total_count_in_window(win) as f64;
+        if total == 0.0 { 0.0 } else { flex / total }
+    }
+
+    #[inline]
+    pub fn total_in_window(
+        &self,
+        win: TimeInterval<T>,
+    ) -> impl Iterator<Item = AnyAssignmentRef<'_, '_, T>> + '_
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        let fixed_iter = self
+            .fixed_in_window(win)
+            .map(|a| AnyAssignmentRef::from(a.to_ref()));
+        let flex_iter = self
+            .committed_in_window(win)
+            .copied()
+            .map(AnyAssignmentRef::from);
+        fixed_iter.chain(flex_iter)
+    }
+
+    pub fn envelope_of_assignments_in_window(&self, win: TimeInterval<T>) -> Option<TimeInterval<T>>
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        let mut min_s: Option<TimePoint<T>> = None;
+        let mut max_e: Option<TimePoint<T>> = None;
+
+        for a in self.total_in_window(win) {
+            let (s, e) = match a {
+                AnyAssignmentRef::Fixed(fr) => (fr.start_time(), fr.end_time()),
+                AnyAssignmentRef::Flexible(fr) => (fr.start_time(), fr.end_time()),
+            };
+
+            min_s = Some(match min_s {
+                Some(cur) => cur.min(s),
+                None => s,
+            });
+            max_e = Some(match max_e {
+                Some(cur) => cur.max(e),
+                None => e,
+            });
+        }
+
+        Some(TimeInterval::new(min_s?, max_e?))
+    }
+
+    #[inline]
+    pub fn request_pressure_on_berth(&self, bid: BerthIdentifier) -> usize
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        self.problem
+            .iter_any_requests()
+            .filter(|r| r.processing_time_for(bid).is_some())
+            .count()
+    }
+
+    #[inline]
+    pub fn work_pressure_on_berth(&self, bid: BerthIdentifier) -> TimeDelta<T>
+    where
+        T: CheckedAdd + CheckedSub + num_traits::Zero,
+    {
+        self.problem
+            .iter_any_requests()
+            .filter_map(|r| r.processing_time_for(bid))
+            .sum()
+    }
+
+    #[inline]
+    pub fn flexible_pressure_on_berth(&self, bid: BerthIdentifier) -> usize
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        self.problem
+            .iter_flexible_requests()
+            .filter(|r| r.processing_time_for(bid).is_some())
+            .count()
+    }
+
+    #[inline]
+    pub fn flexible_work_pressure_on_berth(&self, bid: BerthIdentifier) -> TimeDelta<T>
+    where
+        T: CheckedAdd + CheckedSub + num_traits::Zero,
+    {
+        self.problem
+            .iter_flexible_requests()
+            .filter_map(|r| r.processing_time_for(bid))
+            .sum()
+    }
+}
+
+impl<'p, T> std::fmt::Display for Ledger<'p, T>
+where
+    T: std::fmt::Display + Copy + Ord + CheckedAdd + CheckedSub,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Ledger(problem with {} berths, {} fixed assignments, {} flexible requests; {} committed assignments)",
+            self.problem().berths().len(),
+            self.problem().fixed_assignments().len(),
+            self.problem().flexible_requests().len(),
+            self.commited.len()
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
-    use berth_alloc_model::prelude::*;
+    use berth_alloc_model::prelude::RequestIdentifier;
     use num_traits::Zero;
     use std::collections::BTreeMap;
 
@@ -255,6 +430,28 @@ mod tests {
         Problem::new(berths, fixed, flex).unwrap()
     }
 
+    fn problem_with_fixed_and_two_flex() -> Problem<i64> {
+        let mut berths = berth_alloc_model::problem::berth::BerthContainer::new();
+        let b1 = berth(1, 0, 1000);
+        berths.insert(b1.clone());
+
+        // Fixed: rf(100) on b1, pt=10, start=50 -> [50,60)
+        let rf = fixed_req(100, (0, 1000), &[(1, 10)], 1);
+        let af = Assignment::<FixedKind, i64>::new_fixed(rf, b1.clone(), tp(50))
+            .expect("fixed assignment create");
+
+        let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        fixed.insert(af);
+
+        // Flex: r1(1) pt=20, r2(2) pt=15 on b1
+        let mut flex =
+            berth_alloc_model::problem::req::RequestContainer::<FlexibleKind, i64>::new();
+        flex.insert(flex_req(1, (0, 500), &[(1, 20)], 1)); // will commit at 5 -> [5,25)
+        flex.insert(flex_req(2, (0, 500), &[(1, 15)], 1)); // will commit at 80 -> [80,95)
+
+        Problem::new(berths, fixed, flex).unwrap()
+    }
+
     #[test]
     fn new_ledger_is_empty_and_points_to_problem() {
         let prob = problem_one_berth_two_flex();
@@ -284,7 +481,7 @@ mod tests {
 
         // visible in committed
         assert!(ledger.commited_assignments().contains_id(rid(1)));
-        assert_eq!(ledger.iter_assignments().count(), 1);
+        assert_eq!(ledger.iter_flexible_assignments().count(), 1);
 
         // now uncommit
         let removed = ledger
@@ -292,7 +489,7 @@ mod tests {
             .expect("uncommit should succeed");
         assert_eq!(removed.request_id(), rid(1));
         assert!(ledger.commited_assignments().is_empty());
-        assert_eq!(ledger.iter_assignments().count(), 0);
+        assert_eq!(ledger.iter_flexible_assignments().count(), 0);
     }
 
     #[test]
@@ -409,8 +606,8 @@ mod tests {
         let b = ledger1.problem().berths().get(bid(1)).unwrap();
         ledger1.commit_assignment(req1, b, tp(0)).unwrap();
         ledger2.commit_assignment(req2, b, tp(10)).unwrap();
-        assert_eq!(ledger1.iter_assignments().count(), 1);
-        assert_eq!(ledger2.iter_assignments().count(), 1);
+        assert_eq!(ledger1.iter_flexible_assignments().count(), 1);
+        assert_eq!(ledger2.iter_flexible_assignments().count(), 1);
         ledger1.apply(ledger2);
         let assigned_ids: Vec<_> = ledger1.iter_assigned_requests().map(|r| r.id()).collect();
         assert_eq!(assigned_ids, vec![rid(2)]);
@@ -481,6 +678,114 @@ mod tests {
             Cost::zero(),
             "cost should be zero after all uncommitted"
         );
+    }
+
+    #[test]
+    fn test_committed_fixed_total_and_union_over_windows() {
+        let prob = problem_with_fixed_and_two_flex();
+        let mut ledger = Ledger::new(&prob);
+
+        let r1 = ledger.problem().flexible_requests().get(rid(1)).unwrap();
+        let r2 = ledger.problem().flexible_requests().get(rid(2)).unwrap();
+        let b1 = ledger.problem().berths().get(bid(1)).unwrap();
+
+        // Commit two flexible assignments: [5,25) and [80,95)
+        ledger.commit_assignment(r1, b1, tp(5)).unwrap();
+        ledger.commit_assignment(r2, b1, tp(80)).unwrap();
+
+        // committed_in_window([0,30)) -> r1 only
+        let ids_committed_0_30: Vec<_> = ledger
+            .committed_in_window(iv(0, 30))
+            .map(|a| a.request_id())
+            .collect();
+        assert_eq!(ids_committed_0_30, vec![rid(1)]);
+
+        // fixed_in_window([55,200)) -> fixed [50,60) intersects; [60,80) does not (touching)
+        let ids_fixed_55_200: Vec<_> = ledger
+            .fixed_in_window(iv(55, 200))
+            .map(|a| a.request_id())
+            .collect();
+        assert_eq!(ids_fixed_55_200, vec![rid(100)]);
+
+        let ids_fixed_60_80: Vec<_> = ledger
+            .fixed_in_window(iv(60, 80))
+            .map(|a| a.request_id())
+            .collect();
+        assert!(
+            ids_fixed_60_80.is_empty(),
+            "touching at endpoint is not intersecting"
+        );
+
+        // total_in_window([0,70)) -> r1 + fixed
+        use berth_alloc_model::problem::asg::AnyAssignmentRef as ARef;
+        let ids_total_0_70: std::collections::BTreeSet<_> = ledger
+            .total_in_window(iv(0, 70))
+            .map(|a| match a {
+                ARef::Fixed(fr) => fr.request_id(),
+                ARef::Flexible(fr) => fr.request_id(),
+            })
+            .collect();
+        assert!(ids_total_0_70.contains(&rid(1)));
+        assert!(ids_total_0_70.contains(&rid(100)));
+        assert_eq!(ids_total_0_70.len(), 2);
+
+        // total_in_window([70,100)) -> r2 only
+        let ids_total_70_100: Vec<_> = ledger
+            .total_in_window(iv(70, 100))
+            .map(|a| match a {
+                ARef::Fixed(fr) => fr.request_id(),
+                ARef::Flexible(fr) => fr.request_id(),
+            })
+            .collect();
+        assert_eq!(ids_total_70_100, vec![rid(2)]);
+
+        // union_of_assignments_in_window over big window -> [5,95)
+        let u_all = ledger.envelope_of_assignments_in_window(iv(0, 1000));
+        assert_eq!(u_all, Some(iv(5, 95)));
+
+        // union over [60,80) (touching only) -> None
+        let u_touch = ledger.envelope_of_assignments_in_window(iv(60, 80));
+        assert!(u_touch.is_none());
+    }
+
+    #[test]
+    fn test_request_and_work_pressure_on_berth() {
+        let prob = problem_with_fixed_and_two_flex();
+        let ledger = Ledger::new(&prob);
+
+        // berth 1 has two flexible requests that can be assigned to it (r1, r2) + one fixed (rf)
+        assert_eq!(ledger.request_pressure_on_berth(bid(1)), 3);
+
+        let total = ledger.work_pressure_on_berth(bid(1));
+        assert_eq!(total.value(), 45);
+        assert!(total > TimeDelta::zero());
+    }
+
+    #[test]
+    fn test_into_inner_returns_committed_container() {
+        let prob = problem_one_berth_two_flex();
+        let mut ledger = Ledger::new(&prob);
+
+        let r1 = ledger.problem().flexible_requests().get(rid(1)).unwrap();
+        let b1 = ledger.problem().berths().get(bid(1)).unwrap();
+        ledger.commit_assignment(r1, b1, tp(0)).unwrap();
+
+        let inner = ledger.into_inner();
+        assert_eq!(inner.len(), 1);
+        assert!(inner.contains_id(rid(1)));
+    }
+
+    #[test]
+    fn test_display_shows_counts() {
+        let prob = problem_one_berth_two_flex();
+        let ledger = Ledger::new(&prob);
+        let s = format!("{ledger}");
+        // Expect mentions of counts; exact string is known from Display impl
+        assert!(s.contains("problem with"));
+        assert!(s.contains("berths"));
+        assert!(s.contains("fixed assignments"));
+        assert!(s.contains("flexible requests"));
+        assert!(s.contains("committed assignments"));
     }
 }
 

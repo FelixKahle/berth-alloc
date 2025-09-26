@@ -210,6 +210,19 @@ where
     }
 }
 
+impl<'b, T: Copy + Ord + std::fmt::Display> std::fmt::Display for TerminalOccupancy<'b, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TerminalOccupancy(berths=[")?;
+        for (i, occ) in self.berths.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{occ}")?;
+        }
+        write!(f, "])")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn iter_free_across_selected_ids() {
+    fn test_iter_free_across_selected_ids() {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
@@ -267,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn iter_free_clamps_to_window() {
+    fn test_iter_free_clamps_to_window() {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
@@ -281,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn iter_free_empty_window_yields_none() {
+    fn test_iter_free_empty_window_yields_none() {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
@@ -294,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn occupy_then_query_then_release() {
+    fn test_occupy_then_query_then_release() {
         let base = vec![Berth::from_windows(bid(10), vec![iv(0, 10)])];
         let mut term = TerminalOccupancy::new(&base);
 
@@ -318,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn occupy_outside_availability_is_error() {
+    fn test_occupy_outside_availability_is_error() {
         let base = vec![Berth::from_windows(bid(20), vec![iv(0, 10)])];
         let mut term = TerminalOccupancy::new(&base);
 
@@ -331,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn release_outside_availability_is_error() {
+    fn test_release_outside_availability_is_error() {
         let base = vec![Berth::from_windows(bid(21), vec![iv(10, 20)])];
         let mut term = TerminalOccupancy::new(&base);
 
@@ -344,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn occupy_when_not_free_is_error() {
+    fn test_occupy_when_not_free_is_error() {
         let base = vec![Berth::from_windows(bid(30), vec![iv(0, 10)])];
         let mut term = TerminalOccupancy::new(&base);
 
@@ -355,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_berth_id_is_error_for_mutations() {
+    fn test_unknown_berth_id_is_error_for_mutations() {
         let base = mk_berths();
         let mut term = TerminalOccupancy::new(&base);
 
@@ -370,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn mutate_one_berth_does_not_affect_others() {
+    fn test_mutate_one_berth_does_not_affect_others() {
         let base = mk_berths();
         let mut term = TerminalOccupancy::new(&base);
 
@@ -400,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_length_mutations_are_noops() {
+    fn test_zero_length_mutations_are_noops() {
         let base = vec![Berth::from_windows(bid(77), vec![iv(0, 10)])];
         let mut term = TerminalOccupancy::new(&base);
 
@@ -416,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn iter_free_mixed_order_ids_yields_concatenated_per_id() {
+    fn test_iter_free_mixed_order_ids_yields_concatenated_per_id() {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
@@ -435,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn iter_free_ids_respects_order_and_window() {
+    fn test_iter_free_ids_respects_order_and_window() {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
@@ -463,5 +476,26 @@ mod tests {
             .map(|fb| fb.interval())
             .collect();
         assert_eq!(v2, vec![iv(8, 10), iv(20, 25)]);
+    }
+
+    #[test]
+    fn test_display_formats_all_berths_in_order() {
+        let base = vec![
+            Berth::from_windows(bid(1), vec![iv(0, 10), iv(20, 30)]),
+            Berth::from_windows(bid(2), vec![iv(5, 15)]),
+            Berth::from_windows(bid(3), vec![iv(-10, -5), iv(40, 50)]),
+        ];
+        let mut term = TerminalOccupancy::new(&base);
+        // Create an internal gap in berth 1 to exercise multiple free segments.
+        term.occupy(bid(1), iv(3, 7)).unwrap(); // berth 1 free: [0,3) [7,10) [20,30)
+
+        let s = format!("{term}");
+        assert_eq!(
+            s,
+            "TerminalOccupancy(berths=[\
+            BerthOccupancy(berth=BerthId(1), free=[[TimePoint(0), TimePoint(3)), [TimePoint(7), TimePoint(10)), [TimePoint(20), TimePoint(30))]), \
+            BerthOccupancy(berth=BerthId(2), free=[[TimePoint(5), TimePoint(15))]), \
+            BerthOccupancy(berth=BerthId(3), free=[[TimePoint(-10), TimePoint(-5)), [TimePoint(40), TimePoint(50))])])"
+        );
     }
 }
