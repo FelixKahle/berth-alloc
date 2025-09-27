@@ -19,9 +19,4 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod berth;
-pub mod framework;
-pub mod metaheuristic;
-pub mod registry;
-pub mod state;
-pub mod terminal;
+pub mod chainox;

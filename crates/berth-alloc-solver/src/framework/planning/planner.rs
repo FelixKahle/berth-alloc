@@ -32,7 +32,7 @@ use berth_alloc_core::prelude::Cost;
 use berth_alloc_model::{
     common::{FlexibleKind, Kind},
     prelude::Request,
-    problem::asg::AssignmentRef,
+    problem::{asg::AssignmentRef, req::RequestView},
 };
 use num_traits::{CheckedAdd, CheckedSub};
 

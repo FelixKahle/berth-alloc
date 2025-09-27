@@ -27,7 +27,10 @@ use berth_alloc_model::{
         Assignment, AssignmentContainer, Berth, BerthIdentifier, Problem, Request,
         RequestContainer, StateValidator,
     },
-    problem::asg::{AnyAssignmentRef, AssignmentRef, AssignmentView},
+    problem::{
+        asg::{AnyAssignmentRef, AssignmentRef, AssignmentView},
+        req::RequestView,
+    },
 };
 use num_traits::{CheckedAdd, CheckedSub};
 use std::ops::Mul;
@@ -68,7 +71,7 @@ impl<'p, T: Copy + Ord> Ledger<'p, T> {
     }
 
     #[inline]
-    pub fn flexible_requests(&self) -> &RequestContainer<FlexibleKind, T>
+    pub fn flexible_requests(&self) -> &RequestContainer<T, Request<FlexibleKind, T>>
     where
         T: CheckedAdd + CheckedSub,
     {
@@ -422,8 +425,10 @@ mod tests {
         let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
 
         // flexible: r1 (pt=10 on b1), r2 (pt=5 on b1)
-        let mut flex =
-            berth_alloc_model::problem::req::RequestContainer::<FlexibleKind, i64>::new();
+        let mut flex = berth_alloc_model::problem::req::RequestContainer::<
+            i64,
+            Request<FlexibleKind, i64>,
+        >::new();
         flex.insert(flex_req(1, (0, 200), &[(1, 10)], 1));
         flex.insert(flex_req(2, (0, 200), &[(1, 5)], 1));
 
@@ -444,8 +449,10 @@ mod tests {
         fixed.insert(af);
 
         // Flex: r1(1) pt=20, r2(2) pt=15 on b1
-        let mut flex =
-            berth_alloc_model::problem::req::RequestContainer::<FlexibleKind, i64>::new();
+        let mut flex = berth_alloc_model::problem::req::RequestContainer::<
+            i64,
+            Request<FlexibleKind, i64>,
+        >::new();
         flex.insert(flex_req(1, (0, 500), &[(1, 20)], 1)); // will commit at 5 -> [5,25)
         flex.insert(flex_req(2, (0, 500), &[(1, 15)], 1)); // will commit at 80 -> [80,95)
 
@@ -520,8 +527,10 @@ mod tests {
 
         let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
 
-        let mut flex =
-            berth_alloc_model::problem::req::RequestContainer::<FlexibleKind, i64>::new();
+        let mut flex = berth_alloc_model::problem::req::RequestContainer::<
+            i64,
+            Request<FlexibleKind, i64>,
+        >::new();
         flex.insert(flex_req(9, (10, 100), &[(1, 5)], 1));
 
         let prob = Problem::new(berths, fixed, flex).unwrap();
@@ -579,8 +588,10 @@ mod tests {
         fixed_cont.insert(af);
 
         // one flexible (unused in this test)
-        let mut flex =
-            berth_alloc_model::problem::req::RequestContainer::<FlexibleKind, i64>::new();
+        let mut flex = berth_alloc_model::problem::req::RequestContainer::<
+            i64,
+            Request<FlexibleKind, i64>,
+        >::new();
         flex.insert(flex_req(200, (0, 100), &[(1, 5)], 1));
 
         let prob = Problem::new(berths, fixed_cont, flex).unwrap();
@@ -621,8 +632,10 @@ mod tests {
 
         let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
 
-        let mut flex =
-            berth_alloc_model::problem::req::RequestContainer::<FlexibleKind, i64>::new();
+        let mut flex = berth_alloc_model::problem::req::RequestContainer::<
+            i64,
+            Request<FlexibleKind, i64>,
+        >::new();
         // r1: pt=10, weight=2
         flex.insert(flex_req(10, (0, 300), &[(1, 10)], 2));
         // r2: pt=15, weight=3

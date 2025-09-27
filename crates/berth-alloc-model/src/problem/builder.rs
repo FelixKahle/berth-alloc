@@ -33,7 +33,7 @@ use num_traits::{CheckedAdd, CheckedSub};
 pub struct ProblemBuilder<T: Copy + Ord> {
     berths: BerthContainer<T>,
     fixed_assignments: AssignmentContainer<FixedKind, T, Assignment<FixedKind, T>>,
-    flexible_requests: RequestContainer<FlexibleKind, T>,
+    flexible_requests: RequestContainer<T, Request<FlexibleKind, T>>,
 }
 
 impl<T: Copy + Ord> Default for ProblemBuilder<T> {

@@ -337,7 +337,7 @@ mod tests {
             AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
         prob_fixed.insert(af.clone());
 
-        let mut prob_flex = RequestContainer::<FlexibleKind, i64>::new();
+        let mut prob_flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
         prob_flex.insert(rx.clone());
 
         let prob = Problem::new(berths, prob_fixed, prob_flex).unwrap();
@@ -381,7 +381,7 @@ mod tests {
         let b1 = mk_berth(1, 0, 200);
 
         let rx = req_flex(2, (0, 50), &[(1, 5)]);
-        let mut flex_in_prob = RequestContainer::<FlexibleKind, i64>::new();
+        let mut flex_in_prob = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
         flex_in_prob.insert(rx);
 
         let mut berths = BerthContainer::new();
@@ -406,7 +406,7 @@ mod tests {
         let mut berths = BerthContainer::new();
         berths.insert(b1.clone());
 
-        let mut flex_in_prob = RequestContainer::<FlexibleKind, i64>::new();
+        let mut flex_in_prob = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
         flex_in_prob.insert(r_req.clone());
 
         let prob = Problem::new(berths, AssignmentContainer::new(), flex_in_prob).unwrap();
@@ -442,7 +442,7 @@ mod tests {
         let prob = Problem::new(
             berths,
             AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
-            RequestContainer::<FlexibleKind, i64>::new(),
+            RequestContainer::<i64, Request<FlexibleKind, i64>>::new(),
         )
         .unwrap();
 
@@ -483,7 +483,7 @@ mod tests {
         let prob = Problem::new(
             berths,
             AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
-            RequestContainer::<FlexibleKind, i64>::new(),
+            RequestContainer::<i64, Request<FlexibleKind, i64>>::new(),
         )
         .unwrap();
 
@@ -523,7 +523,7 @@ mod tests {
         let prob = Problem::new(
             berths,
             AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
-            RequestContainer::<FlexibleKind, i64>::new(),
+            RequestContainer::<i64, Request<FlexibleKind, i64>>::new(),
         )
         .unwrap();
 
@@ -555,7 +555,7 @@ mod tests {
         let prob = Problem::new(
             berths,
             AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
-            RequestContainer::<FlexibleKind, i64>::new(),
+            RequestContainer::<i64, Request<FlexibleKind, i64>>::new(),
         )
         .unwrap();
 
@@ -585,7 +585,7 @@ mod tests {
         let prob = Problem::new(
             berths,
             AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
-            RequestContainer::<FlexibleKind, i64>::new(),
+            RequestContainer::<i64, Request<FlexibleKind, i64>>::new(),
         )
         .unwrap();
 
@@ -598,8 +598,6 @@ mod tests {
         StateValidator::validate_nonoverlap(&s_fixed, &s_flex, &prob).unwrap();
     }
 
-    // ---------- Incremental check: validate_nooverlap_with ----------
-
     #[test]
     fn nooverlap_with_unknown_berth() {
         let b1 = mk_berth(1, 0, 1000);
@@ -609,7 +607,7 @@ mod tests {
         let prob = Problem::new(
             berths,
             AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
-            RequestContainer::<FlexibleKind, i64>::new(),
+            RequestContainer::<i64, Request<FlexibleKind, i64>>::new(),
         )
         .unwrap();
 
@@ -648,7 +646,7 @@ mod tests {
         let prob = Problem::new(
             berths,
             AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
-            RequestContainer::<FlexibleKind, i64>::new(),
+            RequestContainer::<i64, Request<FlexibleKind, i64>>::new(),
         )
         .unwrap();
 
@@ -687,7 +685,7 @@ mod tests {
         let prob = Problem::new(
             berths,
             AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
-            RequestContainer::<FlexibleKind, i64>::new(),
+            RequestContainer::<i64, Request<FlexibleKind, i64>>::new(),
         )
         .unwrap();
 
@@ -721,7 +719,7 @@ mod tests {
         let prob = Problem::new(
             berths,
             AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
-            RequestContainer::<FlexibleKind, i64>::new(),
+            RequestContainer::<i64, Request<FlexibleKind, i64>>::new(),
         )
         .unwrap();
 
@@ -752,7 +750,7 @@ mod tests {
         let prob = Problem::new(
             berths,
             AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
-            RequestContainer::<FlexibleKind, i64>::new(),
+            RequestContainer::<i64, Request<FlexibleKind, i64>>::new(),
         )
         .unwrap();
 
@@ -784,7 +782,7 @@ mod tests {
         let prob = Problem::new(
             berths,
             AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new(),
-            RequestContainer::<FlexibleKind, i64>::new(),
+            RequestContainer::<i64, Request<FlexibleKind, i64>>::new(),
         )
         .unwrap();
 
