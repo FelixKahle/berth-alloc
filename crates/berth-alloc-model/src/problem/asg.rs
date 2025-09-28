@@ -551,16 +551,16 @@ mod tests {
     }
 
     #[inline]
-    fn bid(n: u32) -> BerthIdentifier {
+    fn bid(n: usize) -> BerthIdentifier {
         BerthIdentifier::new(n)
     }
 
     #[inline]
-    fn rid(n: u32) -> RequestIdentifier {
+    fn rid(n: usize) -> RequestIdentifier {
         RequestIdentifier::new(n)
     }
 
-    fn mk_berth_single(id: u32, s: i64, e: i64) -> Berth<i64> {
+    fn mk_berth_single(id: usize, s: i64, e: i64) -> Berth<i64> {
         Berth::from_windows(bid(id), [iv(s, e)])
     }
 
@@ -575,7 +575,11 @@ mod tests {
         )
     }
 
-    fn mk_req_fixed_with(id: u32, win: (i64, i64), pt: &[(u32, i64)]) -> Request<FixedKind, i64> {
+    fn mk_req_fixed_with(
+        id: usize,
+        win: (i64, i64),
+        pt: &[(usize, i64)],
+    ) -> Request<FixedKind, i64> {
         let mut map = BTreeMap::new();
         for (b, d) in pt {
             map.insert(bid(*b), td(*d));
@@ -584,9 +588,9 @@ mod tests {
     }
 
     fn mk_req_flexible_with(
-        id: u32,
+        id: usize,
         win: (i64, i64),
-        pt: &[(u32, i64)],
+        pt: &[(usize, i64)],
     ) -> Request<FlexibleKind, i64> {
         let mut map = BTreeMap::new();
         for (b, d) in pt {

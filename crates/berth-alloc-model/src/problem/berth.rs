@@ -32,7 +32,7 @@ impl IdentifierMarkerName for BerthIdentifierMarker {
     const NAME: &'static str = "BerthId";
 }
 
-pub type BerthIdentifier = Identifier<u32, BerthIdentifierMarker>;
+pub type BerthIdentifier = Identifier<usize, BerthIdentifierMarker>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Berth<T: Ord + Copy> {
@@ -219,7 +219,7 @@ mod tests {
         TimeInterval::new(tp(a), tp(b))
     }
     #[inline]
-    fn bid(n: u32) -> BerthIdentifier {
+    fn bid(n: usize) -> BerthIdentifier {
         BerthIdentifier::new(n)
     }
 

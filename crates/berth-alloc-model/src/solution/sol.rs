@@ -269,19 +269,19 @@ mod tests {
         TimeDelta::new(v)
     }
     #[inline]
-    fn bid(n: u32) -> BerthIdentifier {
+    fn bid(n: usize) -> BerthIdentifier {
         BerthIdentifier::new(n)
     }
     #[inline]
-    fn rid(n: u32) -> RequestIdentifier {
+    fn rid(n: usize) -> RequestIdentifier {
         RequestIdentifier::new(n)
     }
 
-    fn mk_berth(id: u32, s: i64, e: i64) -> Berth<i64> {
+    fn mk_berth(id: usize, s: i64, e: i64) -> Berth<i64> {
         Berth::from_windows(bid(id), [iv(s, e)])
     }
 
-    fn req_fixed(id: u32, window: (i64, i64), pts: &[(u32, i64)]) -> Request<FixedKind, i64> {
+    fn req_fixed(id: usize, window: (i64, i64), pts: &[(usize, i64)]) -> Request<FixedKind, i64> {
         let mut m = BTreeMap::new();
         for (b, d) in pts {
             m.insert(bid(*b), td(*d));
@@ -289,7 +289,7 @@ mod tests {
         Request::<FixedKind, i64>::new(rid(id), iv(window.0, window.1), 1, m).unwrap()
     }
 
-    fn req_flex(id: u32, window: (i64, i64), pts: &[(u32, i64)]) -> Request<FlexibleKind, i64> {
+    fn req_flex(id: usize, window: (i64, i64), pts: &[(usize, i64)]) -> Request<FlexibleKind, i64> {
         let mut m = BTreeMap::new();
         for (b, d) in pts {
             m.insert(bid(*b), td(*d));

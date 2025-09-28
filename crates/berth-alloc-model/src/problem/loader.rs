@@ -110,14 +110,14 @@ impl ProblemLoader {
         let mut builder = ProblemBuilder::new();
 
         for j in 0..m {
-            let id = BerthIdentifier::new((j as u32) + 1);
+            let id = BerthIdentifier::new(j + 1);
             let sj = TimePoint::new(s[j]);
             let ej = TimePoint::new(e[j]);
             builder.add_berth(Berth::from_windows(id, [TimeInterval::new(sj, ej)]));
         }
 
         for i in 0..n {
-            let rid = RequestIdentifier::new((i as u32) + 1);
+            let rid = RequestIdentifier::new(i + 1);
             let a = TimePoint::new(ta[i]);
             let dmax = TimePoint::new(tmax[i]);
             let window = TimeInterval::new(a, dmax);
@@ -128,7 +128,7 @@ impl ProblemLoader {
                 if hij >= self.forbid_at_least {
                     continue;
                 }
-                pt.insert(BerthIdentifier::new((j as u32) + 1), TimeDelta::new(hij));
+                pt.insert(BerthIdentifier::new(j + 1), TimeDelta::new(hij));
             }
 
             // No weights given in the input format, so we use a uniform weight of 1.

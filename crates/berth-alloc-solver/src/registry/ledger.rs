@@ -377,22 +377,22 @@ mod tests {
         TimeInterval::new(tp(a), tp(b))
     }
     #[inline]
-    fn bid(n: u32) -> BerthIdentifier {
+    fn bid(n: usize) -> BerthIdentifier {
         BerthIdentifier::new(n)
     }
     #[inline]
-    fn rid(n: u32) -> RequestIdentifier {
+    fn rid(n: usize) -> RequestIdentifier {
         RequestIdentifier::new(n)
     }
 
-    fn berth(id: u32, s: i64, e: i64) -> Berth<i64> {
+    fn berth(id: usize, s: i64, e: i64) -> Berth<i64> {
         Berth::from_windows(bid(id), [iv(s, e)])
     }
 
     fn flex_req(
-        id: u32,
+        id: usize,
         window: (i64, i64),
-        pt: &[(u32, i64)],
+        pt: &[(usize, i64)],
         weight: i64,
     ) -> Request<FlexibleKind, i64> {
         let mut m = BTreeMap::new();
@@ -403,9 +403,9 @@ mod tests {
     }
 
     fn fixed_req(
-        id: u32,
+        id: usize,
         window: (i64, i64),
-        pt: &[(u32, i64)],
+        pt: &[(usize, i64)],
         weight: i64,
     ) -> Request<FixedKind, i64> {
         let mut m = BTreeMap::new();

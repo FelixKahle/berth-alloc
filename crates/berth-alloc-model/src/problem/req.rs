@@ -35,6 +35,15 @@ use std::{
     hash::Hasher,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RequestIdentifierMarker;
+
+impl IdentifierMarkerName for RequestIdentifierMarker {
+    const NAME: &'static str = "RequestId";
+}
+
+pub type RequestIdentifier = Identifier<usize, RequestIdentifierMarker>;
+
 pub trait RequestView<T: Ord + Copy> {
     fn id(&self) -> RequestIdentifier;
     fn feasible_window(&self) -> TimeInterval<T>;
@@ -366,15 +375,6 @@ pub trait RequestView<T: Ord + Copy> {
             .map(|pt| self.feasible_window().length() - pt)
     }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RequestIdentifierMarker;
-
-impl IdentifierMarkerName for RequestIdentifierMarker {
-    const NAME: &'static str = "RequestId";
-}
-
-pub type RequestIdentifier = Identifier<u32, RequestIdentifierMarker>;
 
 #[derive(Debug, Clone)]
 pub struct Request<K: Kind, T: Ord + Copy> {
@@ -727,7 +727,7 @@ mod tests {
         TimeDelta::new(v)
     }
     #[inline]
-    fn bid(n: u32) -> BerthIdentifier {
+    fn bid(n: usize) -> BerthIdentifier {
         BerthIdentifier::new(n)
     }
 
@@ -1032,7 +1032,7 @@ mod tests {
 
         let mut pt = BTreeMap::new();
         for (i, v) in vals.iter().enumerate() {
-            pt.insert(BerthIdentifier::new(i as u32 + 1), TimeDelta::new(*v));
+            pt.insert(BerthIdentifier::new(i + 1), TimeDelta::new(*v));
         }
         let r = Request::<FlexibleKind, i64>::new(RequestIdentifier::new(105), iv(0, 100), 1, pt)
             .unwrap();

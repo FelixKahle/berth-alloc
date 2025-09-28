@@ -180,22 +180,22 @@ mod tests {
         TimeDelta::new(v)
     }
     #[inline]
-    fn bid(n: u32) -> BerthIdentifier {
+    fn bid(n: usize) -> BerthIdentifier {
         BerthIdentifier::new(n)
     }
     #[inline]
-    fn rid(n: u32) -> RequestIdentifier {
+    fn rid(n: usize) -> RequestIdentifier {
         RequestIdentifier::new(n)
     }
 
-    fn make_berth(id: u32, s: i64, e: i64) -> Berth<i64> {
+    fn make_berth(id: usize, s: i64, e: i64) -> Berth<i64> {
         Berth::from_windows(bid(id), [iv(s, e)])
     }
 
     fn make_request_flex(
-        id: u32,
+        id: usize,
         win: (i64, i64),
-        pts: &[(u32, i64)],
+        pts: &[(usize, i64)],
     ) -> Request<FlexibleKind, i64> {
         let mut m = BTreeMap::new();
         for (b, t) in pts {

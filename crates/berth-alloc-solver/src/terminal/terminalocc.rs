@@ -244,7 +244,7 @@ mod tests {
         TimeInterval::new(tp(a), tp(b))
     }
     #[inline]
-    fn bid(n: u32) -> BerthIdentifier {
+    fn bid(n: usize) -> BerthIdentifier {
         BerthIdentifier::new(n)
     }
 
