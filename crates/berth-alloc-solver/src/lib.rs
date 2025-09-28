@@ -21,7 +21,6 @@
 
 pub mod berth;
 pub mod framework;
-pub mod metaheuristic;
 pub mod registry;
 pub mod state;
 pub mod terminal;
