@@ -37,7 +37,7 @@ pub struct FreeBerth<'b, T: Copy + Ord> {
 }
 
 impl<'b, T: Copy + Ord> FreeBerth<'b, T> {
-    fn new(interval: TimeInterval<T>, berth: &'b Berth<T>) -> Self {
+    pub(super) fn new(interval: TimeInterval<T>, berth: &'b Berth<T>) -> Self {
         Self { interval, berth }
     }
 
@@ -51,7 +51,11 @@ impl<'b, T: Copy + Ord> FreeBerth<'b, T> {
 }
 
 pub trait TerminalRead<'b, T: Copy + Ord> {
-    fn berths(&self) -> &[BerthOccupancy<'b, T>];
+    fn berths<'a>(&'a self) -> impl Iterator<Item = &'a BerthOccupancy<'b, T>> + 'a
+    where
+        'b: 'a,
+        T: 'b;
+
     fn berth(&self, id: BerthIdentifier) -> Option<&BerthOccupancy<'b, T>>;
 
     fn iter_free_intervals_for_berths_in<'a, I>(
@@ -112,11 +116,6 @@ where
     T: Copy + Ord + 'b,
 {
     #[inline]
-    fn berths(&self) -> &[BerthOccupancy<'b, T>] {
-        &self.berths
-    }
-
-    #[inline]
     fn berth(&self, id: BerthIdentifier) -> Option<&BerthOccupancy<'b, T>> {
         self.index_map.get(&id).map(|&i| &self.berths[i])
     }
@@ -143,6 +142,14 @@ where
                     .iter_free_intervals_in(window)
                     .map(move |iv| FreeBerth::new(iv, berth_ref))
             })
+    }
+
+    fn berths<'a>(&'a self) -> impl Iterator<Item = &'a BerthOccupancy<'b, T>> + 'a
+    where
+        T: 'b,
+        'b: 'a,
+    {
+        self.berths.iter()
     }
 }
 
@@ -257,7 +264,9 @@ mod tests {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
-        assert_eq!(term.berths().len(), base.len());
+        let berths: Vec<_> = term.berths().collect();
+
+        assert_eq!(berths.len(), base.len());
         for b in &base {
             let got = term.berth(b.id()).expect("berth id must exist");
             // same id exposed back out

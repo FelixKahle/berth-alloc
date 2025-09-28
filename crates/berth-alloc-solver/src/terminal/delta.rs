@@ -41,6 +41,11 @@ impl<'b, T: Copy + Ord> TerminalDelta<'b, T> {
     pub fn is_empty(&self) -> bool {
         self.updates.is_empty()
     }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &(BerthIdentifier, BerthOccupancy<'b, T>)> {
+        self.updates.iter()
+    }
 }
 
 impl<'b, T: Copy + Ord> Default for TerminalDelta<'b, T> {

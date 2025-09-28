@@ -20,5 +20,4 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 pub mod err;
-pub mod planner;
 pub mod tok;
