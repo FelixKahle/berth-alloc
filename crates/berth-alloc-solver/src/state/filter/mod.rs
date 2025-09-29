@@ -19,17 +19,17 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::state::chain::delta::ChainDelta;
+use crate::state::{chain::delta::ChainDelta, solver::solver_state::SolverState};
 
-pub trait Filter<T> {
-    fn check(&self, delta: &ChainDelta) -> bool;
+pub trait Filter<T: Copy + Ord> {
+    fn check(&self, delta: &ChainDelta, state: &SolverState<T>) -> bool;
 }
 
 pub struct FilterStack<T> {
     filters: Vec<Box<dyn Filter<T>>>,
 }
 
-impl<T> FilterStack<T> {
+impl<T: Copy + Ord> FilterStack<T> {
     pub fn new() -> Self {
         Self { filters: vec![] }
     }
@@ -45,9 +45,9 @@ impl<T> FilterStack<T> {
     }
 }
 
-impl<T> Filter<T> for FilterStack<T> {
-    fn check(&self, delta: &ChainDelta) -> bool {
-        self.filters.iter().all(|f| f.check(delta))
+impl<T: Copy + Ord> Filter<T> for FilterStack<T> {
+    fn check(&self, delta: &ChainDelta, state: &SolverState<T>) -> bool {
+        self.filters.iter().all(|f| f.check(delta, state))
     }
 }
 
@@ -65,7 +65,7 @@ impl<T: std::fmt::Display> std::fmt::Display for FilterStack<T> {
     }
 }
 
-impl<T> Default for FilterStack<T> {
+impl<T: Copy + Ord> Default for FilterStack<T> {
     fn default() -> Self {
         Self::new()
     }

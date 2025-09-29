@@ -21,6 +21,7 @@
 
 pub mod berth;
 pub mod chain;
+pub mod filter;
 pub mod index;
 pub mod solver;
 pub mod terminal;
