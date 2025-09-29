@@ -21,3 +21,4 @@
 
 pub mod delta;
 pub mod double_chain;
+pub mod virtual_chain;

@@ -23,6 +23,10 @@ use crate::state::{chain::delta::ChainDelta, solver::solver_state::SolverState};
 
 pub trait Filter<T: Copy + Ord> {
     fn check(&self, delta: &ChainDelta, state: &SolverState<T>) -> bool;
+
+    fn complexity(&self) -> usize {
+        1
+    }
 }
 
 pub struct FilterStack<T> {
@@ -30,22 +34,28 @@ pub struct FilterStack<T> {
 }
 
 impl<T: Copy + Ord> FilterStack<T> {
+    #[inline]
     pub fn new() -> Self {
         Self { filters: vec![] }
     }
 
+    #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             filters: Vec::with_capacity(capacity),
         }
     }
 
+    #[inline]
     pub fn add_filter<F: Filter<T> + 'static>(&mut self, filter: F) {
+        // Keep simplest first, most complex last
         self.filters.push(Box::new(filter));
+        self.filters.sort_by_key(|f| f.complexity());
     }
 }
 
 impl<T: Copy + Ord> Filter<T> for FilterStack<T> {
+    #[inline]
     fn check(&self, delta: &ChainDelta, state: &SolverState<T>) -> bool {
         self.filters.iter().all(|f| f.check(delta, state))
     }

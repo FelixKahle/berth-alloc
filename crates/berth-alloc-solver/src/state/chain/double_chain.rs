@@ -82,6 +82,31 @@ impl DoubleChain {
     }
 
     #[inline]
+    pub fn next_slice(&self) -> &[usize] {
+        &self.next
+    }
+
+    #[inline]
+    pub fn prev_slice(&self) -> &[usize] {
+        &self.prev
+    }
+
+    #[inline]
+    pub fn base_index(&self) -> usize {
+        self.base
+    }
+
+    #[inline]
+    pub fn start_slice(&self) -> &[usize] {
+        &self.start
+    }
+
+    #[inline]
+    pub fn end_slice(&self) -> &[usize] {
+        &self.end
+    }
+
+    #[inline]
     pub fn len(&self) -> usize {
         self.next.len()
     }

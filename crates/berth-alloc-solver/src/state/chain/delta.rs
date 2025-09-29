@@ -67,7 +67,28 @@ pub struct ChainDelta {
     updates: Vec<ArcRewrite>,
     touched: Vec<usize>,
     marks: Vec<u32>,
+    tail_vals: Vec<usize>,
+    tail_marks: Vec<u32>,
+    tail_generation: u32,
     generation: u32,
+    changed_tails: Vec<usize>,
+    changed_tail_marks: Vec<u32>,
+}
+
+impl Default for ChainDelta {
+    fn default() -> Self {
+        Self {
+            updates: Vec::new(),
+            touched: Vec::new(),
+            marks: Vec::new(),
+            generation: 1,
+            tail_vals: Vec::new(),
+            tail_marks: Vec::new(),
+            tail_generation: 1,
+            changed_tails: Vec::new(),
+            changed_tail_marks: Vec::new(),
+        }
+    }
 }
 
 impl ChainDelta {
@@ -83,13 +104,11 @@ impl ChainDelta {
             touched: Vec::with_capacity(cap * 2),
             marks: Vec::new(),
             generation: 1,
-        }
-    }
-
-    #[inline]
-    pub fn reserve_nodes(&mut self, max_index_inclusive: usize) {
-        if self.marks.len() <= max_index_inclusive {
-            self.marks.resize(max_index_inclusive + 1, 0);
+            tail_vals: Vec::with_capacity(cap),
+            tail_marks: Vec::new(),
+            tail_generation: 1,
+            changed_tails: Vec::with_capacity(cap),
+            changed_tail_marks: Vec::new(),
         }
     }
 
@@ -100,16 +119,23 @@ impl ChainDelta {
 
     #[inline]
     pub fn touch_many(&mut self, ids: &[usize]) {
-        if let Some(&mx) = ids.iter().max()
-            && mx >= self.marks.len() {
-                self.marks.resize(mx + 1, 0);
+        if let Some(&mx) = ids.iter().max() {
+            let need = mx + 1;
+            if self.marks.len() < need {
+                self.marks.resize(need, 0);
             }
+        }
         for &i in ids {
             if self.marks[i] != self.generation {
                 self.marks[i] = self.generation;
                 self.touched.push(i);
             }
         }
+    }
+
+    #[inline]
+    pub fn changed_tails(&self) -> &[usize] {
+        &self.changed_tails
     }
 
     #[inline]
@@ -133,13 +159,27 @@ impl ChainDelta {
     }
 
     #[inline]
+    pub fn next_after<'a>(&'a self, base_next: &'a [usize], i: usize) -> usize {
+        if i < self.tail_marks.len() && self.tail_marks[i] == self.tail_generation {
+            self.tail_vals[i]
+        } else {
+            base_next[i]
+        }
+    }
+
+    #[inline]
+    pub fn changed(&self, i: usize) -> bool {
+        i < self.tail_marks.len() && self.tail_marks[i] == self.tail_generation
+    }
+
+    #[inline]
     pub fn push(&mut self, tail: usize, expected_head: usize, new_head: usize) {
         self.updates
             .push(ArcRewrite::new(tail, expected_head, new_head));
-
         self.touch(tail);
         self.touch(expected_head);
         self.touch(new_head);
+        self.set_override(tail, new_head);
     }
 
     #[inline]
@@ -148,17 +188,55 @@ impl ChainDelta {
         self.touch(u.tail());
         self.touch(u.expected_head());
         self.touch(u.new_head());
+        self.set_override(u.tail(), u.new_head());
+    }
+
+    #[inline]
+    pub fn reserve_nodes(&mut self, max_index_inclusive: usize) {
+        let need = max_index_inclusive + 1;
+        if self.marks.len() < need {
+            self.marks.resize(need, 0);
+        }
+        if self.tail_marks.len() < need {
+            self.tail_marks.resize(need, 0);
+            self.tail_vals.resize(need, 0);
+        }
+        if self.changed_tail_marks.len() < need {
+            self.changed_tail_marks.resize(need, 0);
+        }
+    }
+
+    #[inline]
+    pub fn override_of(&self, tail: usize) -> Option<usize> {
+        if tail < self.tail_marks.len() && self.tail_marks[tail] == self.tail_generation {
+            Some(self.tail_vals[tail])
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn iter_changed_tails(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+        self.changed_tails.iter().copied()
     }
 
     #[inline]
     pub fn clear(&mut self) {
         self.updates.clear();
         self.touched.clear();
-        self.generation = self.generation.wrapping_add(1);
+        self.changed_tails.clear();
 
+        self.generation = self.generation.wrapping_add(1);
         if self.generation == 0 {
             self.marks.fill(0);
             self.generation = 1;
+        }
+
+        self.tail_generation = self.tail_generation.wrapping_add(1);
+        if self.tail_generation == 0 {
+            self.tail_marks.fill(0);
+            self.changed_tail_marks.fill(0);
+            self.tail_generation = 1;
         }
     }
 
@@ -172,21 +250,35 @@ impl ChainDelta {
             self.touched.push(i);
         }
     }
-}
 
-impl Default for ChainDelta {
-    fn default() -> Self {
-        Self {
-            updates: Vec::new(),
-            touched: Vec::new(),
-            marks: Vec::new(),
-            generation: 1, // <- important: start at non-zero
+    #[inline]
+    fn set_override(&mut self, tail: usize, new_head: usize) {
+        if tail >= self.tail_marks.len() {
+            let need = tail + 1;
+            self.tail_marks.resize(need, 0);
+            self.tail_vals.resize(need, 0);
+        }
+        self.tail_vals[tail] = new_head;
+        self.tail_marks[tail] = self.tail_generation;
+        self.note_changed_tail(tail);
+    }
+
+    #[inline]
+    fn note_changed_tail(&mut self, t: usize) {
+        if t >= self.changed_tail_marks.len() {
+            self.changed_tail_marks.resize(t + 1, 0);
+        }
+        if self.changed_tail_marks[t] != self.tail_generation {
+            self.changed_tail_marks[t] = self.tail_generation;
+            self.changed_tails.push(t);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
@@ -498,5 +590,170 @@ mod tests {
         cd.touch_many(&[50]);
         assert!(cd.is_touched(50));
         assert_eq!(cd.touched(), &[50]);
+    }
+
+    #[test]
+    fn arcrewrite_is_hashable_and_dedups_in_set() {
+        let a = ArcRewrite::new(1, 2, 3);
+        let b = ArcRewrite::new(1, 2, 3);
+        let c = ArcRewrite::new(1, 2, 4);
+
+        let mut set = HashSet::new();
+        assert!(set.insert(a));
+        assert!(
+            !set.insert(b),
+            "identical ArcRewrite should dedup in HashSet"
+        );
+        assert!(set.insert(c), "different new_head makes it distinct");
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn next_after_uses_base_when_unmodified_and_changed_false() {
+        let cd = ChainDelta::new();
+        let base_next = vec![10, 11, 12, 13, 14];
+
+        for i in 0..base_next.len() {
+            assert_eq!(
+                cd.next_after(&base_next, i),
+                base_next[i],
+                "without overrides, next_after should use base_next"
+            );
+            assert!(
+                !cd.changed(i),
+                "changed() should be false for all indices when no overrides exist"
+            );
+        }
+
+        // Out-of-range for changed is false
+        assert!(!cd.changed(1000));
+    }
+
+    #[test]
+    fn next_after_reflects_single_override_and_changed_true() {
+        let mut cd = ChainDelta::new();
+        let base_next = vec![0, 1, 2, 3, 4, 5, 6];
+
+        // Override tail=2 -> new_head=9 (base had 2->2)
+        cd.push(2, 99, 9);
+
+        // Unchanged tails use base
+        assert_eq!(cd.next_after(&base_next, 1), 1);
+        assert!(!cd.changed(1));
+
+        // Changed tail uses override
+        assert_eq!(cd.next_after(&base_next, 2), 9);
+        assert!(cd.changed(2));
+
+        // A different index is not changed
+        assert!(!cd.changed(5));
+        assert_eq!(cd.next_after(&base_next, 5), 5);
+    }
+
+    #[test]
+    fn multiple_overrides_last_wins_for_same_tail() {
+        let mut cd = ChainDelta::new();
+        let base_next = vec![0, 1, 2, 3, 4, 5];
+
+        cd.push(3, 100, 7);
+        assert_eq!(cd.next_after(&base_next, 3), 7);
+        assert!(cd.changed(3));
+
+        // New override for the same tail should take effect
+        cd.push(3, 101, 8);
+        assert_eq!(
+            cd.next_after(&base_next, 3),
+            8,
+            "latest override for a tail must win"
+        );
+        assert!(cd.changed(3));
+
+        // Non-overridden tails unchanged
+        assert_eq!(cd.next_after(&base_next, 4), 4);
+        assert!(!cd.changed(4));
+    }
+
+    #[test]
+    fn push_update_sets_override_and_changed() {
+        let mut cd = ChainDelta::new();
+        let base_next = vec![0, 1, 2, 3, 4];
+
+        let u = ArcRewrite::new(1, 2, 42);
+        cd.push_update(u);
+
+        assert!(cd.changed(1));
+        assert_eq!(cd.next_after(&base_next, 1), 42);
+
+        // Others use base
+        assert!(!cd.changed(0));
+        assert_eq!(cd.next_after(&base_next, 0), 0);
+    }
+
+    #[test]
+    fn clear_resets_overrides_and_changed() {
+        let mut cd = ChainDelta::new();
+        let base_next = vec![0, 1, 2, 3, 4];
+
+        cd.push(2, 9, 99);
+        assert!(cd.changed(2));
+        assert_eq!(cd.next_after(&base_next, 2), 99);
+
+        cd.clear();
+
+        // After clear, no overrides should be active
+        assert!(!cd.changed(2));
+        assert_eq!(cd.next_after(&base_next, 2), 2);
+
+        // Touched and updates are cleared too (covered elsewhere but kept here for coherence)
+        assert!(cd.touched().is_empty());
+        assert!(cd.updates().is_empty());
+    }
+
+    #[test]
+    fn reserve_nodes_resizes_tail_buffers_and_leaves_state_unmodified() {
+        let mut cd = ChainDelta::new();
+        let base_next = (0..=20).collect::<Vec<usize>>();
+
+        // Reserve should allow safe queries for indices without implying a change
+        cd.reserve_nodes(20);
+
+        // No changes yet
+        for i in 0..=20 {
+            assert_eq!(cd.next_after(&base_next, i), base_next[i]);
+            assert!(!cd.changed(i));
+        }
+
+        // Now perform an override at a high index and ensure it applies
+        cd.push(20, 0, 777);
+        assert!(cd.changed(20));
+        assert_eq!(cd.next_after(&base_next, 20), 777);
+
+        // Neighbor indices remain unchanged
+        assert!(!cd.changed(19));
+        assert_eq!(cd.next_after(&base_next, 19), 19);
+    }
+
+    #[test]
+    fn changed_tails_lists_unique_tails_last_wins() {
+        let mut cd = ChainDelta::new();
+        cd.push(3, 0, 10);
+        cd.push(5, 0, 11);
+        cd.push(3, 10, 12); // same tail again
+
+        let mut v = cd.changed_tails().to_vec();
+        v.sort_unstable();
+        assert_eq!(v, vec![3, 5]); // dedup per generation
+
+        assert_eq!(cd.override_of(3), Some(12)); // last wins
+        assert_eq!(cd.override_of(5), Some(11));
+    }
+
+    #[test]
+    fn changed_tails_clears_on_clear() {
+        let mut cd = ChainDelta::new();
+        cd.push(1, 0, 2);
+        assert_eq!(cd.changed_tails(), &[1]);
+        cd.clear();
+        assert!(cd.changed_tails().is_empty());
     }
 }
