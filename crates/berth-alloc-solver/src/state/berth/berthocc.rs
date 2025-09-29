@@ -19,14 +19,15 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::berth::err::{
-    BerthApplyError, BerthUpdateError, FreeOutsideAvailabilityError, MismatchedBerthIdsError,
-    NotFreeError, OutsideAvailabilityError,
-};
 use berth_alloc_core::prelude::*;
 use berth_alloc_model::prelude::*;
 use num_traits::{CheckedAdd, CheckedSub};
 use rangemap::RangeSet;
+
+use crate::state::berth::err::{
+    BerthApplyError, BerthUpdateError, FreeOutsideAvailabilityError, MismatchedBerthIdsError,
+    NotFreeError, OutsideAvailabilityError,
+};
 
 pub trait BerthRead<'b, T: Copy + Ord> {
     fn is_free(&self, interval: TimeInterval<T>) -> bool;
@@ -234,6 +235,8 @@ impl<'b, T: Copy + Ord> BerthWrite<'b, T> for BerthOccupancy<'b, T> {
         for seg in other.free.iter() {
             let iv = TimeInterval::new(seg.start, seg.end);
             if !self.berth.covers(iv) {
+                use crate::state::berth::err::FreeOutsideAvailabilityError;
+
                 return Err(BerthApplyError::FreeOutsideAvailability(
                     FreeOutsideAvailabilityError::new(self.berth.id(), iv),
                 ));

@@ -19,16 +19,17 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::{
+use berth_alloc_core::prelude::TimeInterval;
+use berth_alloc_model::prelude::*;
+use std::collections::HashMap;
+
+use crate::state::{
     berth::berthocc::{BerthOccupancy, BerthRead, BerthWrite},
     terminal::{
         delta::TerminalDelta,
         err::{BerthIdentifierNotFoundError, TerminalApplyError, TerminalUpdateError},
     },
 };
-use berth_alloc_core::prelude::TimeInterval;
-use berth_alloc_model::prelude::*;
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FreeBerth<'b, T: Copy + Ord> {

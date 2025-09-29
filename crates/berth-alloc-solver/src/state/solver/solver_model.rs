@@ -27,13 +27,10 @@ use berth_alloc_model::{
 use num_traits::{CheckedAdd, CheckedSub};
 use std::collections::BTreeMap;
 
-use crate::state::err::{MissingRequestError, SolverModelBuildError};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BerthIndex(pub usize);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RequestIndex(pub usize);
+use crate::state::{
+    index::{BerthIndex, RequestIndex},
+    solver::err::{MissingRequestError, SolverModelBuildError},
+};
 
 #[derive(Debug, Clone)]
 pub struct IdMapper {

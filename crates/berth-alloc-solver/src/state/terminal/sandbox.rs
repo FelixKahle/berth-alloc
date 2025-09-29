@@ -19,14 +19,12 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::{
-    berth::berthocc::{BerthOccupancy, BerthRead, BerthWrite},
-    terminal::{
-        delta::TerminalDelta,
-        err::{BerthIdentifierNotFoundError, TerminalUpdateError},
-        terminalocc::{TerminalOccupancy, TerminalRead, TerminalWrite},
-    },
+use crate::state::berth::berthocc::{BerthOccupancy, BerthRead, BerthWrite};
+use crate::state::terminal::delta::TerminalDelta;
+use crate::state::terminal::err::{
+    BerthIdentifierNotFoundError, TerminalApplyError, TerminalUpdateError,
 };
+use crate::state::terminal::terminalocc::{TerminalOccupancy, TerminalRead, TerminalWrite};
 use berth_alloc_core::prelude::TimeInterval;
 use berth_alloc_model::prelude::BerthIdentifier;
 use std::collections::BTreeMap;
@@ -152,10 +150,7 @@ where
     }
 
     #[inline]
-    fn apply_delta(
-        &mut self,
-        delta: TerminalDelta<'p, T>,
-    ) -> Result<(), crate::terminal::err::TerminalApplyError<T>> {
+    fn apply_delta(&mut self, delta: TerminalDelta<'p, T>) -> Result<(), TerminalApplyError<T>> {
         for (id, new_occ) in delta.into_iter() {
             self.touched.insert(id, new_occ);
         }
@@ -165,6 +160,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::state::terminal::terminalocc::TerminalOccupancy;
+
     use super::*;
     use berth_alloc_core::prelude::{TimeInterval, TimePoint};
     use berth_alloc_model::prelude::{Berth, BerthIdentifier};
