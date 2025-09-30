@@ -20,5 +20,6 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 pub mod delta;
+pub mod delta_builder;
 pub mod double_chain;
-pub mod virtual_chain;
+pub mod virtual_double_chain;

@@ -73,6 +73,9 @@ pub struct ChainDelta {
     generation: u32,
     changed_tails: Vec<usize>,
     changed_tail_marks: Vec<u32>,
+    affected_berths: Vec<usize>,
+    berth_marks: Vec<u32>,
+    berth_generation: u32,
 }
 
 impl Default for ChainDelta {
@@ -87,6 +90,9 @@ impl Default for ChainDelta {
             tail_generation: 1,
             changed_tails: Vec::new(),
             changed_tail_marks: Vec::new(),
+            affected_berths: Vec::new(),
+            berth_marks: Vec::new(),
+            berth_generation: 1,
         }
     }
 }
@@ -109,6 +115,9 @@ impl ChainDelta {
             tail_generation: 1,
             changed_tails: Vec::with_capacity(cap),
             changed_tail_marks: Vec::new(),
+            affected_berths: Vec::with_capacity(cap),
+            berth_marks: Vec::new(),
+            berth_generation: 1,
         }
     }
 
@@ -207,6 +216,14 @@ impl ChainDelta {
     }
 
     #[inline]
+    pub fn reserve_berths(&mut self, max_berth_index_inclusive: usize) {
+        let need = max_berth_index_inclusive + 1;
+        if self.berth_marks.len() < need {
+            self.berth_marks.resize(need, 0);
+        }
+    }
+
+    #[inline]
     pub fn override_of(&self, tail: usize) -> Option<usize> {
         if tail < self.tail_marks.len() && self.tail_marks[tail] == self.tail_generation {
             Some(self.tail_vals[tail])
@@ -225,6 +242,7 @@ impl ChainDelta {
         self.updates.clear();
         self.touched.clear();
         self.changed_tails.clear();
+        self.affected_berths.clear();
 
         self.generation = self.generation.wrapping_add(1);
         if self.generation == 0 {
@@ -237,6 +255,50 @@ impl ChainDelta {
             self.tail_marks.fill(0);
             self.changed_tail_marks.fill(0);
             self.tail_generation = 1;
+        }
+
+        self.berth_generation = self.berth_generation.wrapping_add(1);
+        if self.berth_generation == 0 {
+            self.berth_marks.fill(0);
+            self.berth_generation = 1;
+        }
+    }
+
+    #[inline]
+    pub fn affected_berths(&self) -> &[usize] {
+        &self.affected_berths
+    }
+
+    /// Iterator over affected berths (exact-size).
+    #[inline]
+    pub fn iter_affected_berths(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+        self.affected_berths.iter().copied()
+    }
+
+    /// Mark a single berth index as affected (dedup within the current generation).
+    #[inline]
+    pub fn mark_berth(&mut self, berth_index: usize) {
+        if berth_index >= self.berth_marks.len() {
+            self.berth_marks.resize(berth_index + 1, 0);
+        }
+        if self.berth_marks[berth_index] != self.berth_generation {
+            self.berth_marks[berth_index] = self.berth_generation;
+            self.affected_berths.push(berth_index);
+        }
+    }
+
+    /// Mark many berth indices as affected (dedup; preserves first-seen order).
+    #[inline]
+    pub fn mark_many_berths(&mut self, berths: &[usize]) {
+        if let Some(&mx) = berths.iter().max()
+            && mx >= self.berth_marks.len() {
+                self.berth_marks.resize(mx + 1, 0);
+            }
+        for &b in berths {
+            if self.berth_marks[b] != self.berth_generation {
+                self.berth_marks[b] = self.berth_generation;
+                self.affected_berths.push(b);
+            }
         }
     }
 
@@ -755,5 +817,23 @@ mod tests {
         assert_eq!(cd.changed_tails(), &[1]);
         cd.clear();
         assert!(cd.changed_tails().is_empty());
+    }
+
+    #[test]
+    fn affected_berths_mark_and_dedup_and_clear() {
+        let mut d = ChainDelta::new();
+        assert!(d.affected_berths().is_empty());
+
+        d.mark_berth(2);
+        d.mark_berth(2); // dedup
+        d.mark_many_berths(&[1, 3, 1, 4]);
+
+        assert_eq!(d.affected_berths(), &[2, 1, 3, 4]);
+
+        // Next generation after clear allows re-marking
+        d.clear();
+        assert!(d.affected_berths().is_empty());
+        d.mark_many_berths(&[4, 2]);
+        assert_eq!(d.affected_berths(), &[4, 2]);
     }
 }

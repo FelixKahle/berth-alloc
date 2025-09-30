@@ -19,6 +19,31 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod feasible_berth_filter;
-pub mod filter_trait;
-pub mod stack;
+use crate::state::{chain::delta::ChainDelta, solver::solver_state::SolverState};
+
+pub trait Filter<T: Copy + Ord> {
+    fn check(&self, delta: &ChainDelta, state: &SolverState<T>) -> bool;
+
+    fn complexity(&self) -> usize {
+        1
+    }
+
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+}
+
+impl<T: Copy + Ord> std::fmt::Debug for dyn Filter<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Filter")
+            .field("name", &self.name())
+            .field("complexity", &self.complexity())
+            .finish()
+    }
+}
+
+impl<T: Copy + Ord> std::fmt::Display for dyn Filter<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (complexity: {})", self.name(), self.complexity())
+    }
+}
