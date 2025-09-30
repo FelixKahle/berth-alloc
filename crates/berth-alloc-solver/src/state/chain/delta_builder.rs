@@ -31,8 +31,6 @@ pub struct DeltaBuilder<'a> {
 }
 
 impl<'a> DeltaBuilder<'a> {
-    // ---------- ctor / finish ----------
-
     #[inline]
     pub fn new(chain: &'a DoubleChain) -> Self {
         let mut d = ChainDelta::new();
@@ -51,8 +49,6 @@ impl<'a> DeltaBuilder<'a> {
     pub fn into_delta(self) -> ChainDelta {
         self.delta
     }
-
-    // ---------- tiny helpers (all O(1)) ----------
 
     #[inline]
     fn is_tail_idx(&self, x: usize) -> bool {
@@ -84,27 +80,21 @@ impl<'a> DeltaBuilder<'a> {
         }
     }
 
-    /// Record one arc rewrite and mirror `prev` maintenance locally (O(1)).
     #[inline]
     fn rewrite_arc(&mut self, tail: usize, new_head: usize) {
         let expected = self.next_after(tail);
-
-        // record in delta
         self.delta.push(tail, expected, new_head);
 
-        // mirror prev[] updates like DoubleChain::apply_arcrewrite
         self.prev_view[new_head] = tail;
         if self.prev_view[expected] == tail {
             self.prev_view[expected] = expected;
         }
 
-        // mark berths if a sentinel is involved
         self.mark_if_sentinel(tail);
         self.mark_if_sentinel(expected);
         self.mark_if_sentinel(new_head);
     }
 
-    /// Detach contiguous segment [a..=b] from current place (O(1) rewrites).
     #[inline]
     fn detach_segment(&mut self, a: usize, b: usize) {
         let pa = self.pred_in_view(a);
@@ -114,10 +104,6 @@ impl<'a> DeltaBuilder<'a> {
         }
     }
 
-    // ---------- LOW-LEVEL link APIs (require payload skipped) ----------
-
-    /// Link node `i` (must be skipped in current view) immediately after `anchor`.
-    /// 2 rewrites: (i -> next(anchor)), (anchor -> i).
     #[inline]
     pub fn link_after_skipped(&mut self, i: usize, anchor: usize) -> &mut Self {
         debug_assert!(i < self.chain.len() && anchor < self.chain.len());
@@ -130,18 +116,12 @@ impl<'a> DeltaBuilder<'a> {
         self
     }
 
-    /// Link node `i` (must be skipped) immediately before `before`.
     #[inline]
     pub fn link_before_skipped(&mut self, i: usize, before: usize) -> &mut Self {
         let a = self.pred_in_view(before);
         self.link_after_skipped(i, a)
     }
 
-    // ---------- HIGH-LEVEL insert/move (work for attached OR skipped) ----------
-
-    /// Insert node `i` after `anchor`. If `i` is attached, performs the
-    /// minimal 3-rewrite move (bypass i; stitch i after anchor) without
-    /// creating any temporary self-loops.
     #[inline]
     pub fn insert_after_any(&mut self, i: usize, anchor: usize) -> &mut Self {
         debug_assert!(i < self.chain.len() && anchor < self.chain.len());
@@ -150,23 +130,18 @@ impl<'a> DeltaBuilder<'a> {
         if i == anchor {
             return self;
         }
-        // exact no-op: already directly after anchor
+
         if self.pred_in_view(i) == anchor {
             return self;
         }
 
         let an = self.next_after(anchor);
         if self.is_skipped(i) {
-            // 2-rewrite fast path
             self.rewrite_arc(i, an);
             self.rewrite_arc(anchor, i);
             return self;
         }
 
-        // 3-rewrite path (no self-loop):
-        // (pa -> ni)  bypass i from old place
-        // (i -> an)   point i to the next of anchor
-        // (anchor -> i)
         let pa = self.pred_in_view(i);
         let ni = self.next_after(i);
         self.rewrite_arc(pa, ni);
@@ -175,41 +150,33 @@ impl<'a> DeltaBuilder<'a> {
         self
     }
 
-    /// Insert node `i` before `before` (works for attached or skipped).
     #[inline]
     pub fn insert_before_any(&mut self, i: usize, before: usize) -> &mut Self {
         let a = self.pred_in_view(before);
         self.insert_after_any(i, a)
     }
 
-    // ---------- API mirroring DoubleChain (strict + move variants) ----------
-
-    /// Strict variant mirroring DoubleChain::insert_after — requires `i` skipped.
     #[inline]
     pub fn insert_after(&mut self, i: usize, anchor: usize) -> &mut Self {
         self.link_after_skipped(i, anchor)
     }
 
-    /// Strict variant mirroring DoubleChain::insert_before — requires `i` skipped.
     #[inline]
     pub fn insert_before(&mut self, i: usize, before: usize) -> &mut Self {
         self.link_before_skipped(i, before)
     }
 
-    /// Mirror DoubleChain::move_after(i, x) using the minimal-path insert.
     #[inline]
     pub fn move_after(&mut self, i: usize, x: usize) -> &mut Self {
         self.insert_after_any(i, x)
     }
 
-    /// Mirror DoubleChain::move_before(i, y).
     #[inline]
     pub fn move_before(&mut self, i: usize, y: usize) -> &mut Self {
         let x = self.pred_in_view(y);
         self.insert_after_any(i, x)
     }
 
-    /// Move node `i` after `anchor` even across berths.
     #[inline]
     pub fn move_node_after_node(&mut self, i: usize, anchor: usize) -> &mut Self {
         if i != anchor {
@@ -218,41 +185,33 @@ impl<'a> DeltaBuilder<'a> {
         self
     }
 
-    /// Move node `i` before node `y`.
     #[inline]
     pub fn move_node_before_node(&mut self, i: usize, y: usize) -> &mut Self {
         self.insert_before_any(i, y)
     }
 
-    /// Push to front of berth.
     #[inline]
     pub fn push_front_to_berth(&mut self, i: usize, berth: usize) -> &mut Self {
         let head = self.chain.start_of(berth);
         self.insert_after_any(i, head)
     }
 
-    /// Push to back of berth.
     #[inline]
     pub fn push_back_to_berth(&mut self, i: usize, berth: usize) -> &mut Self {
         let tail = self.chain.end_of(berth);
         self.insert_before_any(i, tail)
     }
 
-    /// Move node to berth back (detaches if needed, then link).
     #[inline]
     pub fn move_node_to_berth_back(&mut self, i: usize, target_berth: usize) -> &mut Self {
         self.push_back_to_berth(i, target_berth)
     }
 
-    /// Move node to berth front (detaches if needed, then link).
     #[inline]
     pub fn move_node_to_berth_front(&mut self, i: usize, target_berth: usize) -> &mut Self {
         self.push_front_to_berth(i, target_berth)
     }
 
-    // ---------- Segment ops (standard 3-rewrite pattern) ----------
-
-    /// Splice contiguous segment [a..=b] after x (O(1) rewrites).
     #[inline]
     pub fn splice_after(&mut self, a: usize, b: usize, x: usize) -> &mut Self {
         debug_assert!(a < self.chain.len() && b < self.chain.len() && x < self.chain.len());
@@ -262,7 +221,6 @@ impl<'a> DeltaBuilder<'a> {
         );
 
         if self.is_tail_idx(x) {
-            // Tail anchor means "before tail" — emulate DoubleChain tail path.
             let y = x;
             let prev_y = self.pred_in_view(y);
             if prev_y == b || prev_y == self.pred_in_view(a) || x == a {
@@ -289,7 +247,6 @@ impl<'a> DeltaBuilder<'a> {
         self
     }
 
-    /// Move contiguous segment [a..=b] after x (O(1) rewrites).
     #[inline]
     pub fn move_segment_after(&mut self, a: usize, b: usize, x: usize) -> &mut Self {
         debug_assert!(a < self.chain.len() && b < self.chain.len() && x < self.chain.len());
@@ -298,31 +255,63 @@ impl<'a> DeltaBuilder<'a> {
             "cannot move sentinel payload"
         );
 
-        if x == b || self.pred_in_view(a) == x {
+        let pa = self.pred_in_view(a);
+        if x == b || x == pa {
             return self;
         }
-        if self.is_tail_idx(x) {
-            return self.move_before(a, x);
+
+        #[cfg(debug_assertions)]
+        {
+            let mut cur = a;
+            let mut hops = 0usize;
+            while cur != b && hops <= self.chain.len() {
+                cur = self.next_after(cur);
+                hops += 1;
+            }
+            debug_assert!(cur == b, "[a..=b] must be contiguous");
+
+            let mut cur2 = a;
+            let mut inside = false;
+            while cur2 != b {
+                cur2 = self.next_after(cur2);
+                if cur2 != b && cur2 == x {
+                    inside = true;
+                    break;
+                }
+            }
+            if inside {
+                return self;
+            }
         }
 
-        let pa = self.pred_in_view(a);
+        if self.is_tail_idx(x) {
+            let y = self.pred_in_view(x);
+            if y == b || y == pa {
+                return self;
+            }
+            self.detach_segment(a, b);
+            let ny = self.next_after(y);
+            self.rewrite_arc(y, a);
+            self.rewrite_arc(b, ny);
+            return self;
+        }
+
         let nb = self.next_after(b);
         let nx = self.next_after(x);
 
         self.rewrite_arc(pa, nb);
+
         self.rewrite_arc(x, a);
         self.rewrite_arc(b, nx);
         self
     }
 
-    /// Move contiguous segment [a..=b] before node `y`.
     #[inline]
     pub fn move_segment_before_node(&mut self, a: usize, b: usize, y: usize) -> &mut Self {
         let x = self.pred_in_view(y);
         self.move_segment_after(a, b, x)
     }
 
-    /// Move segment [a..=b] to berth back.
     #[inline]
     pub fn move_segment_to_berth_back(
         &mut self,
@@ -335,7 +324,6 @@ impl<'a> DeltaBuilder<'a> {
         self.move_segment_after(a, b, x)
     }
 
-    /// Move segment [a..=b] to berth front.
     #[inline]
     pub fn move_segment_to_berth_front(
         &mut self,
@@ -346,8 +334,6 @@ impl<'a> DeltaBuilder<'a> {
         let head = self.chain.start_of(target_berth);
         self.move_segment_after(a, b, head)
     }
-
-    // ---------- Misc ----------
 
     #[inline]
     pub fn mark_berth(&mut self, berth: usize) -> &mut Self {
@@ -360,8 +346,6 @@ impl<'a> DeltaBuilder<'a> {
 mod tests {
     use super::*;
     use crate::state::chain::double_chain::DoubleChain;
-
-    // ---------- Helpers ----------
 
     fn collect_berth(chain: &DoubleChain, berth: usize) -> Vec<usize> {
         chain.iter_berth(berth).collect()
@@ -927,7 +911,31 @@ mod tests {
         let base2 = base.clone();
         let mut b2 = DeltaBuilder::new(&base2);
         b2.splice_after(1, 1, tail); // this path can short-circuit depending on structure
+
         let d2 = b2.into_delta();
         let _ = (d1, d2); // ensure no panics in debug path
+    }
+
+    #[test]
+    fn move_segment_after_tail_moves_whole_segment_builder() {
+        // Build berth [0,1,2]
+        let mut truth = make_chain(5, 1);
+        fill_berth(&mut truth, 0, &[0, 1, 2]);
+        let mut target = truth.clone();
+        let tail = truth.end_of(0);
+
+        // Move [0,1] after tail => [2,0,1]
+        let rewrites = apply_and_compare(
+            &mut truth,
+            &mut target,
+            |_base, b| {
+                b.move_segment_after(0, 1, tail);
+            },
+            |c| {
+                c.move_segment_after(0, 1, tail);
+            },
+        );
+        assert_eq!(rewrites, 3);
+        assert_berth_eq(&truth, 0, &[2, 0, 1]);
     }
 }

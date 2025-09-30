@@ -164,7 +164,7 @@ impl DoubleChain {
     #[inline(always)]
     pub fn skip(&mut self, i: usize) {
         debug_assert!(i < self.len());
-        if self.is_sentinel(i) || self.next[i] == i {
+        if self.is_sentinel(i) || (self.next[i] == i && self.prev[i] == i) {
             return;
         }
 
@@ -172,8 +172,13 @@ impl DoubleChain {
         let n = self.next[i];
         debug_assert!(p < self.len() && n < self.len());
 
-        self.next[p] = n;
-        self.prev[n] = p;
+        if p != i && self.next[p] == i {
+            self.next[p] = n;
+        }
+        if n != i && self.prev[n] == i {
+            self.prev[n] = p;
+        }
+
         self.next[i] = i;
         self.prev[i] = i;
     }
@@ -296,24 +301,68 @@ impl DoubleChain {
         debug_assert!(a < self.len() && b < self.len() && x < self.len());
         debug_assert!(!self.is_sentinel(a) && !self.is_sentinel(b));
 
-        if x == b || self.prev[a] == x {
+        let pa = self.prev[a];
+
+        if x == b || x == pa {
             return;
         }
+
+        #[cfg(debug_assertions)]
+        {
+            let mut cur = a;
+            let mut hops = 0usize;
+            while cur != b && hops <= self.len() {
+                cur = self.next[cur];
+                hops += 1;
+            }
+            debug_assert!(cur == b, "[a..=b] must be contiguous");
+
+            let mut inside = false;
+            cur = a;
+            while cur != b {
+                cur = self.next[cur];
+                if cur != b && cur == x {
+                    inside = true;
+                    break;
+                }
+            }
+            if inside {
+                return;
+            }
+        }
+
         if self.is_tail_idx(x) {
-            self.move_before(a, x);
-        } else {
-            let pa = self.prev[a];
+            let y = self.prev[x];
+            if y == b || y == pa {
+                return;
+            }
             let nb = self.next[b];
-            let nx = self.next[x];
+            let ny = self.next[y];
+
+            debug_assert!(nb < self.len() && ny < self.len());
 
             self.next[pa] = nb;
             self.prev[nb] = pa;
 
-            self.next[x] = a;
-            self.prev[a] = x;
-            self.next[b] = nx;
-            self.prev[nx] = b;
+            self.next[y] = a;
+            self.prev[a] = y;
+            self.next[b] = ny;
+            self.prev[ny] = b;
+            return;
         }
+
+        let nb = self.next[b];
+        let nx = self.next[x];
+
+        debug_assert!(nb < self.len() && nx < self.len());
+
+        self.next[pa] = nb;
+        self.prev[nb] = pa;
+
+        self.next[x] = a;
+        self.prev[a] = x;
+        self.next[b] = nx;
+        self.prev[nx] = b;
     }
 
     #[inline]
@@ -958,5 +1007,42 @@ mod tests {
 
         // Should panic due to debug-only duplicate-tail guard
         c.apply_delta(&d);
+    }
+
+    #[test]
+    fn test_move_segment_after_tail_moves_whole_segment() {
+        let mut c = DoubleChain::new(5, 1);
+        let s = c.start_of(0);
+        c.insert_after(0, s);
+        c.insert_after(1, 0);
+        c.insert_after(2, 1);
+        assert_berth_eq(&c, 0, &[0, 1, 2]);
+
+        let t = c.end_of(0);
+        // Move [0,1] after tail => becomes [2,0,1]
+        c.move_segment_after(0, 1, t);
+        assert_berth_eq(&c, 0, &[2, 0, 1]);
+    }
+
+    #[test]
+    fn test_skip_on_half_detached_is_safe() {
+        // s -> 0 -> 1 -> e
+        let mut c = DoubleChain::new(3, 1);
+        let s = c.start_of(0);
+        let e = c.end_of(0);
+        c.insert_after(0, s);
+        c.insert_after(1, 0);
+
+        // Rewrite 0's next from 1 to e:
+        // Now node 1 has prev[1]==1 (self), next[1]==e (half-detached)
+        c.apply_arcrewrite(ArcRewrite::new(0, 1, e));
+        assert_eq!(c.pred(e), 0);
+        assert_eq!(c.pred(1), 1);
+        assert_eq!(c.succ(1), e);
+
+        // Old skip() would corrupt e.prev; the fixed version should not.
+        c.skip(1);
+        assert_eq!(c.pred(e), 0);
+        assert!(c.is_skipped(1));
     }
 }
