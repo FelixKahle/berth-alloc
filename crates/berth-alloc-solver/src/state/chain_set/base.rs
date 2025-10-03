@@ -71,7 +71,7 @@ impl ChainSet {
     }
 
     #[inline]
-    fn num_total_nodes(&self) -> usize {
+    pub fn num_total_nodes(&self) -> usize {
         self.next.len()
     }
 
@@ -87,23 +87,60 @@ impl ChainSet {
 
     #[inline]
     pub fn set_next(&mut self, tail: usize, new_head: usize) {
-        debug_assert!(tail < self.next.len());
-        debug_assert!(new_head < self.next.len());
-        debug_assert!(
+        let num_total_nodes = self.num_total_nodes();
+
+        debug_assert!(tail < num_total_nodes, "tail out of bounds");
+        debug_assert!(new_head < num_total_nodes, "new_head out of bounds");
+
+        assert!(
             !(self.is_head_node(tail) && new_head == tail),
-            "set_next would create start->start self-loop"
+            "set_next would create start->start self-loop (tail = {})",
+            tail
         );
-        debug_assert!(
+        assert!(
             !self.is_head_node(new_head),
-            "new_head must not be a head sentinel"
+            "new_head must not be a head sentinel (new_head = {})",
+            new_head
+        );
+        assert!(
+            !self.is_tail_node(tail),
+            "tail must not be a tail sentinel (tail = {})",
+            tail
         );
 
         let old_head = self.next[tail];
-        if old_head != new_head && self.prev[old_head] == tail {
+
+        if old_head == new_head {
+            return;
+        }
+
+        if self.prev[old_head] == tail {
             self.prev[old_head] = old_head;
         }
+
         self.next[tail] = new_head;
         self.prev[new_head] = tail;
+
+        assert!(
+            self.next[tail] == new_head,
+            "post: next[tail] != new_head (tail={}, next[tail]={}, new_head={})",
+            tail,
+            self.next[tail],
+            new_head
+        );
+        assert!(
+            self.prev[new_head] == tail,
+            "post: prev[new_head] != tail (new_head={}, prev[new_head]={}, tail={})",
+            new_head,
+            self.prev[new_head],
+            tail
+        );
+
+        assert!(
+            !self.is_head_node(self.next[tail]),
+            "no edges may point to a head sentinel (tail={})",
+            tail
+        );
     }
 
     #[inline]
@@ -223,6 +260,7 @@ pub struct ChainIter<'slice> {
     next: &'slice [usize],
     current: usize,
     end: usize,
+    steps_left: usize,
 }
 
 impl<'slice> ChainIter<'slice> {
@@ -232,16 +270,19 @@ impl<'slice> ChainIter<'slice> {
             next,
             current: start,
             end,
+            steps_left: next.len(),
         }
     }
 }
 
 impl<'slice> Iterator for ChainIter<'slice> {
     type Item = usize;
+
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current == self.end {
+        if self.current == self.end || self.steps_left == 0 {
             return None;
         }
+        self.steps_left -= 1;
         let out = self.current;
         self.current = self.next[self.current];
         Some(out)

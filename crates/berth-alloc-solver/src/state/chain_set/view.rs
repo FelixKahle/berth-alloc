@@ -99,7 +99,7 @@ impl<'chain, C: ChainSetView> std::fmt::Display for ChainRef<'chain, C> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChainRef, ChainSetView};
+    use super::*;
     use std::collections::HashSet;
 
     #[derive(Default)]

@@ -52,18 +52,47 @@ impl<'a> ChainSetDeltaBuilder<'a> {
     }
 
     #[inline]
-    fn ov(&self) -> ChainSetOverlay<'a, '_> {
+    fn overlay(&self) -> ChainSetOverlay<'a, '_> {
         ChainSetOverlay::new(self.base, &self.delta)
     }
 
     #[inline]
     fn set_next(&mut self, tail: usize, succ: usize) {
+        let num_total_nodes = self.base.num_total_nodes();
+
+        debug_assert!(tail < num_total_nodes, "tail oob");
+        debug_assert!(succ < num_total_nodes, "succ oob");
+
+        assert!(
+            !self.base.is_head_node(succ),
+            "builder must never set a head sentinel as successor (succ={})",
+            succ
+        );
+
+        assert!(
+            !self.base.is_tail_node(tail),
+            "builder must never modify a tail sentinel (tail={})",
+            tail
+        );
+
+        if tail == succ {
+            assert!(
+                !self.base.is_sentinel_node(tail),
+                "cannot isolate a sentinel (tail==succ=={})",
+                tail
+            );
+        }
+        if let Some(cur) = self.overlay().next_node(tail)
+            && cur == succ {
+                return;
+            }
+
         self.delta.push_rewire(ChainNextRewire::new(tail, succ));
     }
 
     #[inline]
     fn succ(&self, node: usize) -> usize {
-        self.ov()
+        self.overlay()
             .next_node(node)
             .expect("node out of bounds (succ)")
     }
@@ -71,7 +100,7 @@ impl<'a> ChainSetDeltaBuilder<'a> {
     #[allow(dead_code)]
     #[inline]
     fn pred(&self, node: usize) -> usize {
-        self.ov()
+        self.overlay()
             .prev_node(node)
             .expect("node out of bounds (pred)")
     }
@@ -86,12 +115,14 @@ impl<'a> ChainSetDeltaBuilder<'a> {
         if self.is_sentinel(node) {
             return;
         }
-        let (p, s) = {
-            let ov = self.ov();
-            let p = ov.prev_node(node).expect("detach: node pred oob");
-            let s = ov.next_node(node).expect("detach: node succ oob");
-            (p, s)
-        };
+        let ov = self.overlay();
+        let (p, s) = (
+            ov.prev_node(node).expect("detach: pred oob"),
+            ov.next_node(node).expect("detach: succ oob"),
+        );
+        if p == node && s == node {
+            return;
+        }
         self.set_next(p, s);
         self.set_next(node, node);
     }
@@ -111,7 +142,7 @@ impl<'a> ChainSetDeltaBuilder<'a> {
     #[inline]
     pub fn remove_after(&mut self, prev: usize) -> Option<usize> {
         let x = {
-            let ov = self.ov();
+            let ov = self.overlay();
             match ov.next_node(prev) {
                 Some(n) if !self.is_sentinel(n) => n,
                 _ => return None,
@@ -131,7 +162,7 @@ impl<'a> ChainSetDeltaBuilder<'a> {
         }
 
         let dst_insert_prev = {
-            let ov = self.ov();
+            let ov = self.overlay();
             if self.base.is_head_node(dst_prev) {
                 let end = dst_prev + 1; // paired tail sentinel
                 ov.prev_node(end).expect("move_after: end oob")
@@ -141,7 +172,7 @@ impl<'a> ChainSetDeltaBuilder<'a> {
         };
 
         let (x, succ_x, old_dst) = {
-            let ov = self.ov();
+            let ov = self.overlay();
             let x = match ov.next_node(src_prev) {
                 Some(n) if !self.is_sentinel(n) => n,
                 _ => return self,
@@ -162,7 +193,7 @@ impl<'a> ChainSetDeltaBuilder<'a> {
     #[inline]
     pub fn move_block_after(&mut self, dst_prev: usize, src_prev: usize, last: usize) -> &mut Self {
         let (first, after_last, old_dst) = {
-            let ov = self.ov();
+            let ov = self.overlay();
             let first = ov
                 .next_node(src_prev)
                 .expect("move_block_after: src_prev oob");
@@ -189,7 +220,7 @@ impl<'a> ChainSetDeltaBuilder<'a> {
     #[inline]
     pub fn swap_adjacent_after(&mut self, prev: usize) -> &mut Self {
         let (a, b, tail) = {
-            let ov = self.ov();
+            let ov = self.overlay();
             let a = match ov.next_node(prev) {
                 Some(n) if !self.is_sentinel(n) => n,
                 _ => return self,
@@ -215,7 +246,7 @@ impl<'a> ChainSetDeltaBuilder<'a> {
         }
 
         let (a, b) = {
-            let ov = self.ov();
+            let ov = self.overlay();
             let a = ov.next_node(p).expect("swap_after: p oob");
             let b = ov.next_node(q).expect("swap_after: q oob");
             if self.is_sentinel(a) || self.is_sentinel(b) || a == b {
@@ -232,7 +263,7 @@ impl<'a> ChainSetDeltaBuilder<'a> {
         }
 
         let (a_next, b_next) = {
-            let ov = self.ov();
+            let ov = self.overlay();
             (
                 ov.next_node(a).expect("a_next oob"),
                 ov.next_node(b).expect("b_next oob"),
@@ -255,7 +286,7 @@ impl<'a> ChainSetDeltaBuilder<'a> {
         }
 
         let (a, b, a_next, b_next) = {
-            let ov = self.ov();
+            let ov = self.overlay();
             let a = ov.next_node(p).expect("p oob");
             let b = ov.next_node(q).expect("q oob");
             let a_next = ov.next_node(a).expect("a_next oob");

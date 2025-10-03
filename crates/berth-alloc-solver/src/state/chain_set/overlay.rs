@@ -130,27 +130,13 @@ impl<'base, 'delta> ChainSetView for ChainSetOverlay<'base, 'delta> {
         let e = self.end_of_chain(chain);
 
         let mut cur = self.next_of(s);
-
-        #[cfg(debug_assertions)]
-        let mut steps = 0usize;
-        #[cfg(debug_assertions)]
-        let cap = self.total_nodes();
+        let mut steps_left: usize = self.total_nodes();
 
         std::iter::from_fn(move || {
-            if cur == e {
+            if cur == e || steps_left == 0 {
                 return None;
             }
-
-            #[cfg(debug_assertions)]
-            {
-                steps += 1;
-                debug_assert!(
-                    steps <= cap,
-                    "cycle detected during overlay iteration (exceeded {})",
-                    cap
-                );
-            }
-
+            steps_left -= 1;
             let out = cur;
             cur = self.next_of(cur);
             Some(out)
