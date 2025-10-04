@@ -1,22 +1,57 @@
-# Chain-set: high-level overview
+Chain-set: fast, safe sequences for search 🚀
 
-This module provides a compact state representation for multiple disjoint chains—ordered sequences of integer node IDs—with two goals in mind: fast local edits and safe, consistent reads during search. It is the low-level “sequence backbone” used by the solver to build and modify ordered plans, such as the sequence of vessels handled at a berth, while supporting speculative evaluation of moves before they are committed.
+Chain-set is a compact data structure for managing multiple disjoint chains—ordered sequences of integer node IDs. It’s the solver’s low-level “sequence backbone,” built for two things:
+	•	Fast local edits (insert, remove, reorder) in O(1) time per edge change.
+	•	Safe, consistent reads while you explore moves during search.
 
-Each chain is bounded by two special sentinels that mark the start and end. An empty chain is simply “start followed by end.” Regular nodes that are not placed on any chain are self-looped, which makes it trivial to check if a node is still unused. This design allows the solver to insert, remove, and reorder nodes by rewiring local pointers, without scanning or reallocating larger structures.
+It keeps the stable state separate from tentative edits, so you can try complex neighborhoods cheaply, score them, and then commit only the winners.
 
-A typical search step wants to try out a small change (for example, re-inserting a vessel earlier or later in a sequence), evaluate its impact on cost and feasibility, and then either commit or discard it. To make this cheap and safe, the module separates stable state from tentative edits. The stable state holds the canonical next/previous links for all chains. Tentative edits live in a lightweight overlay that records only what changed and presents a merged, read-only view to the rest of the solver. As a result, you can evaluate complex neighborhoods without touching the base state and apply accepted changes in one shot.
+⸻
 
-Because the representation is array-based and avoids pointer chasing through heap objects, iteration is cache-friendly and predictable. Local rewiring updates both directions consistently and isolates displaced nodes, so invariants are maintained even under heavy neighborhood exploration. Iteration over a chain never yields sentinels, and internal guards prevent accidental infinite walks when evaluating temporary configurations.
+Why this exists 💡
 
-This module is intentionally minimal and generic. It does not impose domain semantics like time, capacity, or spatial feasibility; those are layered on top by the solver’s cost and constraint checks. The chain-set is about sequence structure only: fast, robust, and easy to reason about for heuristic and metaheuristic search.
+Heuristic and metaheuristic search spend most of their time nudging sequences: “what if we move this vessel earlier?”, “what if we splice this block over there?”. Chain-set lets you do that with tiny, local rewires—no scans, no allocations—while a read-only overlay provides a merged view for evaluation.
 
-In practice, you will:
-- Keep a stable sequence state for the current solution, and stage candidate changes in a temporary overlay to score them before deciding to commit.
-- Use the chain boundaries (start/end sentinels) as natural anchors for building empty chains, inserting nodes, and forming or breaking subsequences.
+⸻
 
-Glossary:
-- Chain: an ordered sequence of node IDs representing, for example, the service order at a resource.
-- Node: an integer index; unused nodes are self-looped.
-- Sentinels: synthetic start/end markers for each chain that define empty chains and safe boundaries.
+Core ideas (at a glance)
+	•	Sentinel-bounded chains: each chain has a start and end sentinel.
+	•	Empty chain = start → end.
+	•	Iteration never yields sentinels.
+	•	Unused nodes self-loop: next[n] = prev[n] = n.
+Quick check for “not placed yet.”
+	•	Local rewiring updates both directions and isolates displaced nodes.
+	•	Overlay for tentative edits: record only changed edges; everyone else reads a merged view.
+Score first, apply once if accepted.
 
-This structure underpins the solver’s ability to iterate quickly on sequence-based decisions, enabling large numbers of candidate evaluations per second while keeping the state consistent and the implementation easy to compose with higher-level logic.
+⸻
+
+Typical workflow 🛠️
+	1.	Keep the current solution in the base chain-set.
+	2.	Build a delta/overlay with a few set_next rewires (or use the builder helpers).
+	3.	Evaluate costs/feasibility against the overlay’s read-only view.
+	4.	If it helps, apply the delta to the base in one shot; otherwise discard.
+
+⸻
+
+What stays safe ✅
+	•	No edge ever points to a head sentinel.
+	•	You never modify a tail sentinel as a tail.
+	•	The exact edge you touch is kept locally consistent (next[tail] == head, prev[head] == tail).
+	•	Iterators guard against accidental infinite walks (bounded steps).
+
+Global shape (unique membership, full head→…→tail connectivity) may be temporarily broken while you’re composing moves—that’s intentional for speed. Use the overlay to evaluate, then finalize to restore global structure.
+
+⸻
+
+Performance notes ⚡
+	•	Array-based (cache-friendly) next/prev links; no pointer chasing through heap objects.
+	•	Edits are O(1) per rewire; applying a delta is linear in the number of touched edges.
+	•	Plays nicely with higher-level cost/constraint layers (time, capacity, spatial rules), which remain orthogonal to sequence structure.
+
+⸻
+
+Glossary 📚
+	•	Chain: ordered sequence of node IDs (e.g., service order at a berth).
+	•	Node: integer index; unused nodes are self-looped.
+	•	Sentinels: per-chain start/end markers that define boundaries and empty chains.
