@@ -88,7 +88,7 @@ impl ChainSet {
 
     /// See rustdoc in your previous snippet — semantics unchanged; now uses `NodeIndex`.
     #[inline]
-    pub fn set_next(&mut self, tail: NodeIndex, new_head: NodeIndex) {
+    pub(super) fn set_next(&mut self, tail: NodeIndex, new_head: NodeIndex) {
         let tail_index = tail.get();
         let new_head_index = new_head.get();
 
@@ -149,7 +149,7 @@ impl ChainSet {
     }
 
     #[inline]
-    pub fn apply_rewire(&mut self, rewire: ChainNextRewire) {
+    pub(super) fn apply_rewire(&mut self, rewire: ChainNextRewire) {
         self.set_next(rewire.tail(), rewire.successor());
     }
 

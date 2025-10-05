@@ -19,10 +19,38 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod berth;
-pub mod chain_set;
-pub mod err;
-pub mod index;
-pub mod index_manager;
-pub mod model;
-pub mod search_state;
+#![allow(dead_code)]
+
+use crate::state::{chain_set::base::ChainSet, model::SolverModel};
+use num_traits::{CheckedAdd, CheckedSub};
+
+#[derive(Debug, Clone)]
+pub struct SolverSearchState<'model, 'problem, T: Copy + Ord> {
+    model: &'model SolverModel<'problem, T>,
+    chain_set: ChainSet,
+}
+
+impl<'problem, 'model, T: Copy + Ord + CheckedAdd + CheckedSub>
+    SolverSearchState<'model, 'problem, T>
+{
+    #[inline]
+    pub fn new(model: &'model SolverModel<'problem, T>) -> Self {
+        let num_chains = model.berths_len();
+        let num_nodes = model.flexible_requests_len();
+
+        Self {
+            model,
+            chain_set: ChainSet::new(num_chains, num_nodes),
+        }
+    }
+
+    #[inline]
+    pub fn model(&self) -> &'model SolverModel<'problem, T> {
+        self.model
+    }
+
+    #[inline]
+    pub fn chain_set(&self) -> &ChainSet {
+        &self.chain_set
+    }
+}

@@ -19,11 +19,10 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ChainIndex(pub usize);
+pub struct BerthIndex(pub usize);
 
-impl ChainIndex {
+impl BerthIndex {
     #[inline]
     pub fn new(index: usize) -> Self {
         Self(index)
@@ -35,31 +34,23 @@ impl ChainIndex {
     }
 }
 
-impl std::fmt::Display for ChainIndex {
+impl std::fmt::Display for BerthIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ChainIndex({})", self.0)
+        write!(f, "BerthIndex({})", self.0)
     }
 }
 
-impl From<usize> for ChainIndex {
+impl From<usize> for BerthIndex {
     #[inline]
     fn from(value: usize) -> Self {
         Self::new(value)
     }
 }
 
-impl From<ChainIndex> for usize {
-    #[inline]
-    fn from(val: ChainIndex) -> Self {
-        val.get()
-    }
-}
-
-#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodeIndex(pub usize);
+pub struct RequestIndex(pub usize);
 
-impl NodeIndex {
+impl RequestIndex {
     #[inline]
     pub fn new(index: usize) -> Self {
         Self(index)
@@ -71,22 +62,15 @@ impl NodeIndex {
     }
 }
 
-impl std::fmt::Display for NodeIndex {
+impl std::fmt::Display for RequestIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "NodeIndex({})", self.0)
+        write!(f, "RequestIndex({})", self.0)
     }
 }
 
-impl From<usize> for NodeIndex {
+impl From<usize> for RequestIndex {
     #[inline]
     fn from(value: usize) -> Self {
         Self::new(value)
-    }
-}
-
-impl From<NodeIndex> for usize {
-    #[inline]
-    fn from(val: NodeIndex) -> Self {
-        val.get()
     }
 }

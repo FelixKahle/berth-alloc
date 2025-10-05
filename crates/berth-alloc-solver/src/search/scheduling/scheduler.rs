@@ -19,10 +19,25 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod berth;
-pub mod chain_set;
-pub mod err;
-pub mod index;
-pub mod index_manager;
-pub mod model;
-pub mod search_state;
+use crate::{
+    search::scheduling::{err::SchedulingError, schedule::Schedule},
+    state::{chain_set::view::ChainSetView, search_state::SolverSearchState},
+};
+
+pub trait Scheduler<T: Copy + Ord> {
+    fn name(&self) -> &str;
+
+    fn schedule<C: ChainSetView>(
+        &self,
+        solver_state: &SolverSearchState<T>,
+        chains: &C,
+    ) -> Result<Schedule<T>, SchedulingError>;
+
+    fn valid_schedule<C: ChainSetView>(
+        &self,
+        solver_state: &SolverSearchState<T>,
+        chains: &C,
+    ) -> bool {
+        self.schedule(solver_state, chains).is_ok()
+    }
+}

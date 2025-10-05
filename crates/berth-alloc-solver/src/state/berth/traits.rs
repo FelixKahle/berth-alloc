@@ -20,9 +20,9 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::state::berth::err::BerthUpdateError;
-use berth_alloc_core::prelude::TimeInterval;
+use berth_alloc_core::prelude::{TimeDelta, TimeInterval};
 use berth_alloc_model::prelude::Berth;
-use num_traits::Zero;
+use num_traits::{CheckedSub, Zero};
 
 pub trait BerthRead<'b, T: Copy + Ord> {
     fn is_free(&self, interval: TimeInterval<T>) -> bool;
@@ -47,6 +47,19 @@ pub trait BerthRead<'b, T: Copy + Ord> {
         T: Zero + 'b,
     {
         self.iter_free_intervals_in(window).next()
+    }
+
+    #[inline]
+    fn iter_earliest_fit_intervals_in(
+        &self,
+        window: TimeInterval<T>,
+        min_duration: TimeDelta<T>,
+    ) -> impl Iterator<Item = TimeInterval<T>>
+    where
+        T: Zero + CheckedSub + 'b,
+    {
+        self.iter_free_intervals_in(window)
+            .filter(move |interval| interval.length() >= min_duration)
     }
 }
 

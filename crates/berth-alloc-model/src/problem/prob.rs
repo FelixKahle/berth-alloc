@@ -88,8 +88,18 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub> Problem<T> {
     }
 
     #[inline]
+    pub fn fixed_assignments_count(&self) -> usize {
+        self.fixed_assignments.len()
+    }
+
+    #[inline]
     pub fn flexible_requests(&self) -> &RequestContainer<T, Request<FlexibleKind, T>> {
         &self.flexible_requests
+    }
+
+    #[inline]
+    pub fn flexible_requests_count(&self) -> usize {
+        self.flexible_requests.len()
     }
 
     #[inline]
