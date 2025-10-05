@@ -19,25 +19,27 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+use crate::state::chain_set::index::{ChainIndex, NodeIndex};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChainNextRewire {
-    tail: usize,
-    successor: usize,
+    tail: NodeIndex,
+    successor: NodeIndex,
 }
 
 impl ChainNextRewire {
     #[inline]
-    pub fn new(tail: usize, successor: usize) -> Self {
+    pub fn new(tail: NodeIndex, successor: NodeIndex) -> Self {
         Self { tail, successor }
     }
 
     #[inline]
-    pub fn tail(&self) -> usize {
+    pub fn tail(&self) -> NodeIndex {
         self.tail
     }
 
     #[inline]
-    pub fn successor(&self) -> usize {
+    pub fn successor(&self) -> NodeIndex {
         self.successor
     }
 }
@@ -47,7 +49,8 @@ impl std::fmt::Display for ChainNextRewire {
         write!(
             f,
             "ChainNextRewire(tail: {}, successor: {})",
-            self.tail, self.successor
+            self.tail.get(),
+            self.successor.get()
         )
     }
 }
@@ -55,12 +58,12 @@ impl std::fmt::Display for ChainNextRewire {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainSetDelta {
     rewires: Vec<ChainNextRewire>,
-    touched_nodes: Vec<usize>,
+    touched_nodes: Vec<NodeIndex>,
+    tail_next_overrides: Vec<NodeIndex>,
+    head_prev_overrides: Vec<NodeIndex>,
+    changed_tails: Vec<NodeIndex>,
+    affected_chains: Vec<ChainIndex>,
     touched_marks: Vec<u32>,
-    tail_next_overrides: Vec<usize>,
-    head_prev_overrides: Vec<usize>,
-    changed_tails: Vec<usize>,
-    affected_chains: Vec<usize>,
     tail_next_marks: Vec<u32>,
     head_prev_marks: Vec<u32>,
     changed_tail_marks: Vec<u32>,
@@ -140,44 +143,49 @@ impl ChainSetDelta {
     }
 
     #[inline]
-    pub fn touched_nodes(&self) -> &[usize] {
+    pub fn touched_nodes(&self) -> &[NodeIndex] {
         &self.touched_nodes
     }
 
     #[inline]
-    pub fn changed_tails(&self) -> &[usize] {
+    pub fn changed_tails(&self) -> &[NodeIndex] {
         &self.changed_tails
     }
 
     #[inline]
-    pub fn affected_chains(&self) -> &[usize] {
+    pub fn affected_chains(&self) -> &[ChainIndex] {
         &self.affected_chains
     }
 
     #[inline]
-    pub fn touch_node(&mut self, node: usize) {
+    pub fn touch_node(&mut self, node: NodeIndex) {
+        let node = node.get();
+
         if node >= self.touched_marks.len() {
             self.touched_marks.resize(node + 1, 0);
         }
         if self.touched_marks[node] != self.touched_epoch {
             self.touched_marks[node] = self.touched_epoch;
-            self.touched_nodes.push(node);
+            self.touched_nodes.push(node.into());
         }
     }
 
     #[inline]
-    pub fn is_node_touched(&self, node: usize) -> bool {
+    pub fn is_node_touched(&self, node: NodeIndex) -> bool {
+        let node = node.get();
         node < self.touched_marks.len() && self.touched_marks[node] == self.touched_epoch
     }
 
     #[inline]
-    pub fn mark_chain(&mut self, chain: usize) {
+    pub fn mark_chain(&mut self, chain: ChainIndex) {
+        let chain = chain.get();
+
         if chain >= self.chain_marks.len() {
             self.chain_marks.resize(chain + 1, 0);
         }
         if self.chain_marks[chain] != self.chain_epoch {
             self.chain_marks[chain] = self.chain_epoch;
-            self.affected_chains.push(chain);
+            self.affected_chains.push(chain.into());
         }
     }
 
@@ -210,17 +218,23 @@ impl ChainSetDelta {
     }
 
     #[inline]
-    pub fn is_tail_overridden(&self, tail: usize) -> bool {
+    pub fn is_tail_overridden(&self, tail: NodeIndex) -> bool {
+        let tail = tail.get();
+
         tail < self.changed_tail_marks.len() && self.changed_tail_marks[tail] == self.override_epoch
     }
 
     #[inline]
-    pub fn is_head_overridden(&self, head: usize) -> bool {
+    pub fn is_head_overridden(&self, head: NodeIndex) -> bool {
+        let head = head.get();
+
         head < self.head_prev_marks.len() && self.head_prev_marks[head] == self.override_epoch
     }
 
     #[inline]
-    pub fn next_override_for_tail(&self, tail: usize) -> Option<usize> {
+    pub fn next_override_for_tail(&self, tail: NodeIndex) -> Option<NodeIndex> {
+        let tail = tail.get();
+
         if tail < self.tail_next_marks.len() && self.tail_next_marks[tail] == self.override_epoch {
             Some(self.tail_next_overrides[tail])
         } else {
@@ -229,8 +243,9 @@ impl ChainSetDelta {
     }
 
     #[inline]
-    pub fn prev_override_for_head(&self, head: usize) -> Option<usize> {
+    pub fn prev_override_for_head(&self, head: NodeIndex) -> Option<NodeIndex> {
         if self.is_head_overridden(head) {
+            let head = head.get();
             Some(self.head_prev_overrides[head])
         } else {
             None
@@ -238,11 +253,13 @@ impl ChainSetDelta {
     }
 
     #[inline(always)]
-    fn ensure_tail_slot(&mut self, tail: usize) {
+    fn ensure_tail_slot(&mut self, tail: NodeIndex) {
+        let tail = tail.get();
+
         if tail >= self.tail_next_marks.len() {
             let need = tail + 1;
             self.tail_next_marks.resize(need, 0);
-            self.tail_next_overrides.resize(need, 0);
+            self.tail_next_overrides.resize(need, NodeIndex(0));
         }
         if tail >= self.changed_tail_marks.len() {
             self.changed_tail_marks.resize(tail + 1, 0);
@@ -250,40 +267,52 @@ impl ChainSetDelta {
     }
 
     #[inline(always)]
-    fn ensure_head_slot(&mut self, head: usize) {
+    fn ensure_head_slot(&mut self, head: NodeIndex) {
+        let head = head.get();
+
         if head >= self.head_prev_marks.len() {
             let need = head + 1;
             self.head_prev_marks.resize(need, 0);
-            self.head_prev_overrides.resize(need, 0);
+            self.head_prev_overrides.resize(need, NodeIndex(0));
         }
     }
 
     #[inline]
-    pub fn set_next(&mut self, tail: usize, successor: usize) {
+    pub fn set_next(&mut self, tail: NodeIndex, successor: NodeIndex) {
         let prior_successor = self.next_override_for_tail(tail);
-        self.ensure_tail_slot(tail);
-        self.tail_next_overrides[tail] = successor;
-        self.tail_next_marks[tail] = self.override_epoch;
 
-        if self.changed_tail_marks[tail] != self.override_epoch {
-            self.changed_tail_marks[tail] = self.override_epoch;
+        self.ensure_tail_slot(tail);
+        self.ensure_head_slot(successor);
+
+        let tail_index = tail.get();
+        let successor_index = successor.get();
+        let epoch = self.override_epoch;
+
+        self.tail_next_overrides[tail_index] = successor;
+        self.tail_next_marks[tail_index] = epoch;
+
+        if self.changed_tail_marks[tail_index] != epoch {
+            self.changed_tail_marks[tail_index] = epoch;
             self.changed_tails.push(tail);
         }
 
-        self.ensure_head_slot(successor);
-        self.head_prev_overrides[successor] = tail;
-        self.head_prev_marks[successor] = self.override_epoch;
+        self.head_prev_overrides[successor_index] = tail;
+        self.head_prev_marks[successor_index] = epoch;
 
-        if let Some(old_succ) = prior_successor
-            && old_succ != successor
+        if let Some(os) = prior_successor
+            && os != successor
         {
-            self.ensure_head_slot(old_succ);
-            self.head_prev_overrides[old_succ] = old_succ;
-            self.head_prev_marks[old_succ] = self.override_epoch;
+            self.ensure_head_slot(os);
+            self.ensure_tail_slot(os);
 
-            self.ensure_tail_slot(old_succ);
-            self.tail_next_overrides[old_succ] = old_succ;
-            self.tail_next_marks[old_succ] = self.override_epoch;
+            let os_idx = os.get();
+
+            // Self-links denote detachment
+            self.head_prev_overrides[os_idx] = os;
+            self.head_prev_marks[os_idx] = epoch;
+
+            self.tail_next_overrides[os_idx] = os;
+            self.tail_next_marks[os_idx] = epoch;
         }
     }
 
@@ -307,6 +336,8 @@ impl std::fmt::Display for ChainSetDelta {
 
 #[cfg(test)]
 mod tests {
+    use crate::state::chain_set::index::{ChainIndex, NodeIndex};
+
     use super::{ChainNextRewire, ChainSetDelta};
 
     #[test]
@@ -322,14 +353,14 @@ mod tests {
         assert!(d.affected_chains().is_empty());
 
         // No overrides
-        assert!(!d.is_tail_overridden(0));
-        assert!(!d.is_head_overridden(0));
-        assert_eq!(d.next_override_for_tail(0), None);
-        assert_eq!(d.prev_override_for_head(0), None);
+        assert!(!d.is_tail_overridden(NodeIndex(0)));
+        assert!(!d.is_head_overridden(NodeIndex(0)));
+        assert_eq!(d.next_override_for_tail(NodeIndex(0)), None);
+        assert_eq!(d.prev_override_for_head(NodeIndex(0)), None);
 
         // No touches
-        assert!(!d.is_node_touched(0));
-        assert!(!d.is_node_touched(10));
+        assert!(!d.is_node_touched(NodeIndex(0)));
+        assert!(!d.is_node_touched(NodeIndex(10)));
     }
 
     #[test]
@@ -342,10 +373,10 @@ mod tests {
         assert!(d.rewires().is_empty());
 
         // No marks/overrides pre-set
-        assert_eq!(d.next_override_for_tail(0), None);
-        assert_eq!(d.prev_override_for_head(0), None);
-        assert!(!d.is_tail_overridden(0));
-        assert!(!d.is_head_overridden(0));
+        assert_eq!(d.next_override_for_tail(NodeIndex(0)), None);
+        assert_eq!(d.prev_override_for_head(NodeIndex(0)), None);
+        assert!(!d.is_tail_overridden(NodeIndex(0)));
+        assert!(!d.is_head_overridden(NodeIndex(0)));
     }
 
     #[test]
@@ -353,20 +384,20 @@ mod tests {
         let mut d = ChainSetDelta::new();
 
         // Set next[2] = 5
-        d.set_next(2, 5);
+        d.set_next(NodeIndex(2), NodeIndex(5));
 
         // Forward/backward overlay queries
-        assert!(d.is_tail_overridden(2));
-        assert!(d.is_head_overridden(5));
-        assert_eq!(d.next_override_for_tail(2), Some(5));
-        assert_eq!(d.prev_override_for_head(5), Some(2));
+        assert!(d.is_tail_overridden(NodeIndex(2)));
+        assert!(d.is_head_overridden(NodeIndex(5)));
+        assert_eq!(d.next_override_for_tail(NodeIndex(2)), Some(NodeIndex(5)));
+        assert_eq!(d.prev_override_for_head(NodeIndex(5)), Some(NodeIndex(2)));
 
         // Non-touched unless we explicitly touch or push_rewire
-        assert!(!d.is_node_touched(2));
-        assert!(!d.is_node_touched(5));
+        assert!(!d.is_node_touched(NodeIndex(2)));
+        assert!(!d.is_node_touched(NodeIndex(5)));
 
         // changed_tails records 2 exactly once
-        assert_eq!(d.changed_tails(), &[2]);
+        assert_eq!(d.changed_tails(), &[NodeIndex(2)]);
     }
 
     #[test]
@@ -374,62 +405,65 @@ mod tests {
         let mut d = ChainSetDelta::new();
 
         // First: 7 -> 3
-        d.set_next(7, 3);
-        assert_eq!(d.next_override_for_tail(7), Some(3));
-        assert_eq!(d.prev_override_for_head(3), Some(7));
-        assert!(d.is_head_overridden(3));
-        assert!(d.is_tail_overridden(7));
+        d.set_next(NodeIndex(7), NodeIndex(3));
+        assert_eq!(d.next_override_for_tail(NodeIndex(7)), Some(NodeIndex(3)));
+        assert_eq!(d.prev_override_for_head(NodeIndex(3)), Some(NodeIndex(7)));
+        assert!(d.is_head_overridden(NodeIndex(3)));
+        assert!(d.is_tail_overridden(NodeIndex(7)));
 
         // Replace: 7 -> 9 (same epoch)
-        d.set_next(7, 9);
+        d.set_next(NodeIndex(7), NodeIndex(9));
 
         // New mapping
-        assert_eq!(d.next_override_for_tail(7), Some(9));
-        assert_eq!(d.prev_override_for_head(9), Some(7));
-        assert!(d.is_head_overridden(9));
+        assert_eq!(d.next_override_for_tail(NodeIndex(7)), Some(NodeIndex(9)));
+        assert_eq!(d.prev_override_for_head(NodeIndex(9)), Some(NodeIndex(7)));
+        assert!(d.is_head_overridden(NodeIndex(9)));
 
         // Old successor 3 must be detached in overlay (self loops)
-        assert!(d.is_head_overridden(3));
-        assert_eq!(d.prev_override_for_head(3), Some(3));
-        assert_eq!(d.next_override_for_tail(3), Some(3));
+        assert!(d.is_head_overridden(NodeIndex(3)));
+        assert_eq!(d.prev_override_for_head(NodeIndex(3)), Some(NodeIndex(3)));
+        assert_eq!(d.next_override_for_tail(NodeIndex(3)), Some(NodeIndex(3)));
 
         // changed_tails still has 7 exactly once
-        assert_eq!(d.changed_tails(), &[7]);
+        assert_eq!(d.changed_tails(), &[NodeIndex(7)]);
     }
 
     #[test]
     fn test_set_next_idempotent_no_duplicate_changed_tails() {
         let mut d = ChainSetDelta::new();
 
-        d.set_next(4, 4); // self-loop allowed
-        d.set_next(4, 4);
-        d.set_next(4, 4);
+        d.set_next(NodeIndex(4), NodeIndex(4)); // self-loop allowed
+        d.set_next(NodeIndex(4), NodeIndex(4));
+        d.set_next(NodeIndex(4), NodeIndex(4));
 
-        assert!(d.is_tail_overridden(4));
-        assert!(d.is_head_overridden(4));
-        assert_eq!(d.changed_tails(), &[4]);
+        assert!(d.is_tail_overridden(NodeIndex(4)));
+        assert!(d.is_head_overridden(NodeIndex(4)));
+        assert_eq!(d.changed_tails(), &[NodeIndex(4)]);
     }
 
     #[test]
     fn test_push_rewire_records_and_touches_nodes() {
         let mut d = ChainSetDelta::new();
 
-        d.push_rewire(ChainNextRewire::new(1, 2));
+        d.push_rewire(ChainNextRewire::new(NodeIndex(1), NodeIndex(2)));
 
         // Rewires recorded
         assert_eq!(d.len(), 1);
-        assert_eq!(d.rewires(), &[ChainNextRewire::new(1, 2)]);
+        assert_eq!(
+            d.rewires(),
+            &[ChainNextRewire::new(NodeIndex(1), NodeIndex(2))]
+        );
 
         // Touches applied for both tail and successor
-        assert!(d.is_node_touched(1));
-        assert!(d.is_node_touched(2));
+        assert!(d.is_node_touched(NodeIndex(1)));
+        assert!(d.is_node_touched(NodeIndex(2)));
 
         // Overlay set as well
-        assert_eq!(d.next_override_for_tail(1), Some(2));
-        assert_eq!(d.prev_override_for_head(2), Some(1));
+        assert_eq!(d.next_override_for_tail(NodeIndex(1)), Some(NodeIndex(2)));
+        assert_eq!(d.prev_override_for_head(NodeIndex(2)), Some(NodeIndex(1)));
 
         // changed_tails includes 1
-        assert_eq!(d.changed_tails(), &[1]);
+        assert_eq!(d.changed_tails(), &[NodeIndex(1)]);
     }
 
     #[test]
@@ -437,29 +471,29 @@ mod tests {
         let mut d = ChainSetDelta::new();
 
         // Touch same node many times in same epoch
-        d.touch_node(10);
-        d.touch_node(10);
-        d.touch_node(10);
+        d.touch_node(NodeIndex(10));
+        d.touch_node(NodeIndex(10));
+        d.touch_node(NodeIndex(10));
 
-        assert!(d.is_node_touched(10));
-        assert_eq!(d.touched_nodes(), &[10]);
+        assert!(d.is_node_touched(NodeIndex(10)));
+        assert_eq!(d.touched_nodes(), &[NodeIndex(10)]);
 
         // Touch another node
-        d.touch_node(3);
-        assert!(d.is_node_touched(3));
-        assert_eq!(d.touched_nodes(), &[10, 3]);
+        d.touch_node(NodeIndex(3));
+        assert!(d.is_node_touched(NodeIndex(3)));
+        assert_eq!(d.touched_nodes(), &[NodeIndex(10), NodeIndex(3)]);
 
         // Clear -> epoch advances, dedup resets
         d.clear();
 
         // No nodes are considered touched in the new epoch
-        assert!(!d.is_node_touched(10));
-        assert!(!d.is_node_touched(3));
+        assert!(!d.is_node_touched(NodeIndex(10)));
+        assert!(!d.is_node_touched(NodeIndex(3)));
         assert!(d.touched_nodes().is_empty());
 
         // Touch again -> collected anew
-        d.touch_node(10);
-        assert_eq!(d.touched_nodes(), &[10]);
+        d.touch_node(NodeIndex(10));
+        assert_eq!(d.touched_nodes(), &[NodeIndex(10)]);
     }
 
     #[test]
@@ -467,34 +501,34 @@ mod tests {
         let mut d = ChainSetDelta::new();
 
         // Mark same chain multiple times in same epoch
-        d.mark_chain(2);
-        d.mark_chain(2);
-        assert_eq!(d.affected_chains(), &[2]);
+        d.mark_chain(ChainIndex(2));
+        d.mark_chain(ChainIndex(2));
+        assert_eq!(d.affected_chains(), &[ChainIndex(2)]);
 
         // Mark another chain
-        d.mark_chain(0);
-        assert_eq!(d.affected_chains(), &[2, 0]);
+        d.mark_chain(ChainIndex(0));
+        assert_eq!(d.affected_chains(), &[ChainIndex(2), ChainIndex(0)]);
 
         // Clear -> epoch bumps, dedup resets
         d.clear();
         assert!(d.affected_chains().is_empty());
 
         // Mark again in new epoch; should reappear
-        d.mark_chain(2);
-        assert_eq!(d.affected_chains(), &[2]);
+        d.mark_chain(ChainIndex(2));
+        assert_eq!(d.affected_chains(), &[ChainIndex(2)]);
     }
 
     #[test]
     fn test_clear_resets_overlay_visibility_and_lists() {
         let mut d = ChainSetDelta::new();
 
-        d.set_next(5, 6);
-        d.touch_node(1);
-        d.mark_chain(3);
+        d.set_next(NodeIndex(5), NodeIndex(6));
+        d.touch_node(NodeIndex(1));
+        d.mark_chain(ChainIndex(3));
 
         // Sanity before clear
-        assert!(d.is_tail_overridden(5));
-        assert!(d.is_head_overridden(6));
+        assert!(d.is_tail_overridden(NodeIndex(5)));
+        assert!(d.is_head_overridden(NodeIndex(6)));
         assert!(!d.changed_tails().is_empty());
         assert!(!d.touched_nodes().is_empty());
         assert!(!d.affected_chains().is_empty());
@@ -502,15 +536,15 @@ mod tests {
         d.clear();
 
         // After clear, nothing should be visible in current epoch
-        assert!(!d.is_tail_overridden(5));
-        assert!(!d.is_head_overridden(6));
+        assert!(!d.is_tail_overridden(NodeIndex(5)));
+        assert!(!d.is_head_overridden(NodeIndex(6)));
         assert_eq!(d.changed_tails(), &[]);
         assert_eq!(d.touched_nodes(), &[]);
         assert_eq!(d.affected_chains(), &[]);
 
         // Override queries should return None in new epoch
-        assert_eq!(d.next_override_for_tail(5), None);
-        assert_eq!(d.prev_override_for_head(6), None);
+        assert_eq!(d.next_override_for_tail(NodeIndex(5)), None);
+        assert_eq!(d.prev_override_for_head(NodeIndex(6)), None);
     }
 
     #[test]
@@ -518,31 +552,31 @@ mod tests {
         let mut d = ChainSetDelta::new();
 
         // Two different tails pointing to the same head
-        d.set_next(1, 9);
-        assert_eq!(d.prev_override_for_head(9), Some(1));
-        assert!(d.is_head_overridden(9));
-        assert!(d.is_tail_overridden(1));
+        d.set_next(NodeIndex(1), NodeIndex(9));
+        assert_eq!(d.prev_override_for_head(NodeIndex(9)), Some(NodeIndex(1)));
+        assert!(d.is_head_overridden(NodeIndex(9)));
+        assert!(d.is_tail_overridden(NodeIndex(1)));
 
-        d.set_next(2, 9);
+        d.set_next(NodeIndex(2), NodeIndex(9));
         // Head 9 now points back to tail 2 (last-writer-wins behavior)
-        assert_eq!(d.prev_override_for_head(9), Some(2));
-        assert!(d.is_tail_overridden(2));
+        assert_eq!(d.prev_override_for_head(NodeIndex(9)), Some(NodeIndex(2)));
+        assert!(d.is_tail_overridden(NodeIndex(2)));
 
         // changed_tails contains both 1 and 2 (order preserved by first-seen)
         let tails = d.changed_tails().to_vec();
-        assert!(tails.contains(&1));
-        assert!(tails.contains(&2));
+        assert!(tails.contains(&NodeIndex(1)));
+        assert!(tails.contains(&NodeIndex(2)));
         // 1 must come before 2 as 1 was first seen
-        let pos1 = tails.iter().position(|&x| x == 1).unwrap();
-        let pos2 = tails.iter().position(|&x| x == 2).unwrap();
+        let pos1 = tails.iter().position(|&x| x == NodeIndex(1)).unwrap();
+        let pos2 = tails.iter().position(|&x| x == NodeIndex(2)).unwrap();
         assert!(pos1 < pos2);
     }
 
     #[test]
     fn test_display_lists_rewires_one_per_line() {
         let mut d = ChainSetDelta::new();
-        d.push_rewire(ChainNextRewire::new(0, 2));
-        d.push_rewire(ChainNextRewire::new(3, 4));
+        d.push_rewire(ChainNextRewire::new(NodeIndex(0), NodeIndex(2)));
+        d.push_rewire(ChainNextRewire::new(NodeIndex(3), NodeIndex(4)));
 
         let s = format!("{}", d);
         let lines: Vec<_> = s.lines().collect();

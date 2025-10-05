@@ -22,6 +22,7 @@
 pub mod base;
 pub mod delta;
 pub mod delta_builder;
+pub mod index;
 pub mod overlay;
 pub mod view;
 
