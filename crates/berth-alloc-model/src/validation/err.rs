@@ -19,9 +19,12 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::problem::{
-    err::{AssignmentOverlapError, BerthNotFoundError},
-    req::RequestIdentifier,
+use crate::{
+    prelude::IncompatibleBerthError,
+    problem::{
+        err::{AssignmentOverlapError, BerthNotFoundError},
+        req::RequestIdentifier,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -221,6 +224,7 @@ impl std::error::Error for RequestIdNotUniqueError {}
 pub enum CrossValidationError {
     UnknownBerth(BerthNotFoundError),
     Overlap(AssignmentOverlapError),
+    IncompatibleBerth(IncompatibleBerthError),
 }
 
 impl std::fmt::Display for CrossValidationError {
@@ -228,6 +232,7 @@ impl std::fmt::Display for CrossValidationError {
         match self {
             CrossValidationError::UnknownBerth(e) => write!(f, "{e}"),
             CrossValidationError::Overlap(e) => write!(f, "{e}"),
+            CrossValidationError::IncompatibleBerth(e) => write!(f, "{e}"),
         }
     }
 }
@@ -243,5 +248,11 @@ impl From<BerthNotFoundError> for CrossValidationError {
 impl From<AssignmentOverlapError> for CrossValidationError {
     fn from(e: AssignmentOverlapError) -> Self {
         Self::Overlap(e)
+    }
+}
+
+impl From<IncompatibleBerthError> for CrossValidationError {
+    fn from(e: IncompatibleBerthError) -> Self {
+        Self::IncompatibleBerth(e)
     }
 }

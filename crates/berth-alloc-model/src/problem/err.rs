@@ -122,12 +122,12 @@ impl From<NoFeasibleAssignmentError> for RequestError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct IncomatibleBerthError {
+pub struct IncompatibleBerthError {
     request: RequestIdentifier,
     berth: BerthIdentifier,
 }
 
-impl IncomatibleBerthError {
+impl IncompatibleBerthError {
     pub fn new(request: RequestIdentifier, berth: BerthIdentifier) -> Self {
         Self { request, berth }
     }
@@ -141,7 +141,7 @@ impl IncomatibleBerthError {
     }
 }
 
-impl std::fmt::Display for IncomatibleBerthError {
+impl std::fmt::Display for IncompatibleBerthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -151,7 +151,7 @@ impl std::fmt::Display for IncomatibleBerthError {
     }
 }
 
-impl std::error::Error for IncomatibleBerthError {}
+impl std::error::Error for IncompatibleBerthError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BerthNotFoundError {
@@ -329,7 +329,7 @@ impl<T: std::fmt::Debug + std::fmt::Display> std::error::Error
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AssignmentError<T> {
-    Incompatible(IncomatibleBerthError),
+    Incompatible(IncompatibleBerthError),
     AssignmentStartsBeforeFeasibleWindow(AssignmenStartsBeforeFeasibleWindowError<T>),
     AssignmentEndsAfterFeasibleWindow(AssignmentEndsAfterFeasibleWindowError<T>),
 }
@@ -349,8 +349,8 @@ where
 
 impl<T: std::fmt::Debug + std::fmt::Display> std::error::Error for AssignmentError<T> {}
 
-impl<T> From<IncomatibleBerthError> for AssignmentError<T> {
-    fn from(err: IncomatibleBerthError) -> Self {
+impl<T> From<IncompatibleBerthError> for AssignmentError<T> {
+    fn from(err: IncompatibleBerthError) -> Self {
         AssignmentError::Incompatible(err)
     }
 }

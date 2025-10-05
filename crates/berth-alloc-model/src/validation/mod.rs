@@ -23,6 +23,7 @@ pub mod err;
 
 use crate::{
     common::{FixedKind, FlexibleKind, Kind},
+    prelude::IncompatibleBerthError,
     problem::{
         asg::{AssignmentContainer, AssignmentView},
         err::AssignmentOverlapError,
@@ -465,6 +466,83 @@ impl StateValidator {
             return Err(AssignmentOverlapError::new(conflicting_rid, v.request_id()).into());
         }
 
+        Ok(())
+    }
+
+    #[inline]
+    pub fn validate_berth_compatibility<T, AVF, AVX>(
+        fixed: &AssignmentContainer<FixedKind, T, AVF>,
+        flexible: &AssignmentContainer<FlexibleKind, T, AVX>,
+        problem: &Problem<T>,
+    ) -> Result<(), CrossValidationError>
+    where
+        T: Copy + Ord + CheckedAdd + CheckedSub,
+        AVF: AssignmentView<FixedKind, T>,
+        AVX: AssignmentView<FlexibleKind, T>,
+    {
+        for a in flexible.iter() {
+            let rid = a.request_id();
+            let bid = a.berth_id();
+
+            let Some(req) = problem.flexible_requests().get(rid) else {
+                continue;
+            };
+
+            if req.processing_time_for(bid).is_none() {
+                return Err(CrossValidationError::IncompatibleBerth(
+                    IncompatibleBerthError::new(rid, bid),
+                ));
+            }
+        }
+
+        // No-op for fixed unless you want symmetry
+        for a in fixed.iter() {
+            let _ = (a.request_id(), a.berth_id());
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    pub fn validate_berth_compatibility_with<T, K, V, AVF, AVX>(
+        fixed: &AssignmentContainer<FixedKind, T, AVF>,
+        flexible: &AssignmentContainer<FlexibleKind, T, AVX>,
+        problem: &Problem<T>,
+        asg: &V,
+    ) -> Result<(), CrossValidationError>
+    where
+        T: Copy + Ord + CheckedAdd + CheckedSub,
+        K: Kind,
+        V: AssignmentView<K, T>,
+        AVF: AssignmentView<FixedKind, T>,
+        AVX: AssignmentView<FlexibleKind, T>,
+    {
+        for a in flexible.iter() {
+            let rid = a.request_id();
+            let bid = a.berth_id();
+
+            let Some(req) = problem.flexible_requests().get(rid) else {
+                continue;
+            };
+
+            if req.processing_time_for(bid).is_none() {
+                return Err(CrossValidationError::IncompatibleBerth(
+                    IncompatibleBerthError::new(rid, bid),
+                ));
+            }
+        }
+        for a in fixed.iter() {
+            let _ = (a.request_id(), a.berth_id());
+        }
+
+        let rid_new = asg.request_id();
+        let bid_new = asg.berth_id();
+        if let Some(req) = problem.flexible_requests().get(rid_new)
+            && req.processing_time_for(bid_new).is_none() {
+                return Err(CrossValidationError::IncompatibleBerth(
+                    IncompatibleBerthError::new(rid_new, bid_new),
+                ));
+            }
         Ok(())
     }
 }

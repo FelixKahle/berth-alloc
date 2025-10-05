@@ -25,7 +25,7 @@ use crate::{
         berth::{Berth, BerthIdentifier},
         err::{
             AssignmenStartsBeforeFeasibleWindowError, AssignmentEndsAfterFeasibleWindowError,
-            AssignmentError, IncomatibleBerthError,
+            AssignmentError, IncompatibleBerthError,
         },
         req::{Request, RequestIdentifier, RequestView},
     },
@@ -143,7 +143,7 @@ impl<K: Kind, T: Ord + CheckedSub + Copy + CheckedAdd> Assignment<K, T> {
         start_time: TimePoint<T>,
     ) -> Result<Self, AssignmentError<T>> {
         let Some(processing_time) = request.processing_time_for(berth.id()) else {
-            return Err(AssignmentError::Incompatible(IncomatibleBerthError::new(
+            return Err(AssignmentError::Incompatible(IncompatibleBerthError::new(
                 request.id(),
                 berth.id(),
             )));
@@ -258,7 +258,7 @@ impl<'r, 'b, K: Kind, T: Ord + Copy + CheckedSub + CheckedAdd> AssignmentRef<'r,
         start_time: TimePoint<T>,
     ) -> Result<Self, AssignmentError<T>> {
         let Some(processing_time) = request.processing_time_for(berth.id()) else {
-            return Err(AssignmentError::Incompatible(IncomatibleBerthError::new(
+            return Err(AssignmentError::Incompatible(IncompatibleBerthError::new(
                 request.id(),
                 berth.id(),
             )));
