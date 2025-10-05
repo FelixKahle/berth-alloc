@@ -218,13 +218,13 @@ impl From<BerthNotFoundError> for ProblemError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AssignmenStartsBeforeFeasibleWindowError<T> {
+pub struct AssignmentStartsBeforeFeasibleWindowError<T> {
     id: RequestIdentifier,
     start_time: TimePoint<T>,
     assigned_time: TimePoint<T>,
 }
 
-impl<T> AssignmenStartsBeforeFeasibleWindowError<T> {
+impl<T> AssignmentStartsBeforeFeasibleWindowError<T> {
     pub fn new(
         id: RequestIdentifier,
         start_time: TimePoint<T>,
@@ -256,7 +256,7 @@ impl<T> AssignmenStartsBeforeFeasibleWindowError<T> {
     }
 }
 
-impl<T> std::fmt::Display for AssignmenStartsBeforeFeasibleWindowError<T>
+impl<T> std::fmt::Display for AssignmentStartsBeforeFeasibleWindowError<T>
 where
     T: std::fmt::Display,
 {
@@ -270,7 +270,7 @@ where
 }
 
 impl<T: std::fmt::Debug + std::fmt::Display> std::error::Error
-    for AssignmenStartsBeforeFeasibleWindowError<T>
+    for AssignmentStartsBeforeFeasibleWindowError<T>
 {
 }
 
@@ -330,7 +330,7 @@ impl<T: std::fmt::Debug + std::fmt::Display> std::error::Error
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AssignmentError<T> {
     Incompatible(IncompatibleBerthError),
-    AssignmentStartsBeforeFeasibleWindow(AssignmenStartsBeforeFeasibleWindowError<T>),
+    AssignmentStartsBeforeFeasibleWindow(AssignmentStartsBeforeFeasibleWindowError<T>),
     AssignmentEndsAfterFeasibleWindow(AssignmentEndsAfterFeasibleWindowError<T>),
 }
 
@@ -355,8 +355,8 @@ impl<T> From<IncompatibleBerthError> for AssignmentError<T> {
     }
 }
 
-impl<T> From<AssignmenStartsBeforeFeasibleWindowError<T>> for AssignmentError<T> {
-    fn from(err: AssignmenStartsBeforeFeasibleWindowError<T>) -> Self {
+impl<T> From<AssignmentStartsBeforeFeasibleWindowError<T>> for AssignmentError<T> {
+    fn from(err: AssignmentStartsBeforeFeasibleWindowError<T>) -> Self {
         AssignmentError::AssignmentStartsBeforeFeasibleWindow(err)
     }
 }

@@ -30,7 +30,7 @@ pub mod prelude {
         asg::{Assignment, AssignmentContainer},
         berth::{Berth, BerthContainer, BerthIdentifier},
         err::{
-            AssignmenStartsBeforeFeasibleWindowError, AssignmentEndsAfterFeasibleWindowError,
+            AssignmentEndsAfterFeasibleWindowError, AssignmentStartsBeforeFeasibleWindowError,
             IncompatibleBerthError,
         },
         prob::Problem,

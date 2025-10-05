@@ -108,6 +108,11 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub> Solution<T> {
         StateValidator::validate_all_flexible_assignments_present(&flexible_assignments, problem)?;
         StateValidator::validate_no_extra_fixed_requests(&fixed_assignments, problem)?;
         StateValidator::validate_no_extra_flexible_requests(&flexible_assignments, problem)?;
+        StateValidator::validate_berth_compatibility(
+            &fixed_assignments,
+            &flexible_assignments,
+            problem,
+        )?;
 
         Ok(Self {
             fixed_assignments,

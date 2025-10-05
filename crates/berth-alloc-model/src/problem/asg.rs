@@ -24,7 +24,7 @@ use crate::{
     problem::{
         berth::{Berth, BerthIdentifier},
         err::{
-            AssignmenStartsBeforeFeasibleWindowError, AssignmentEndsAfterFeasibleWindowError,
+            AssignmentStartsBeforeFeasibleWindowError, AssignmentEndsAfterFeasibleWindowError,
             AssignmentError, IncompatibleBerthError,
         },
         req::{Request, RequestIdentifier, RequestView},
@@ -152,7 +152,7 @@ impl<K: Kind, T: Ord + CheckedSub + Copy + CheckedAdd> Assignment<K, T> {
         let window = request.feasible_window();
         if start_time < window.start() {
             return Err(AssignmentError::AssignmentStartsBeforeFeasibleWindow(
-                AssignmenStartsBeforeFeasibleWindowError::new(
+                AssignmentStartsBeforeFeasibleWindowError::new(
                     request.id(),
                     window.start(),
                     start_time,
@@ -267,7 +267,7 @@ impl<'r, 'b, K: Kind, T: Ord + Copy + CheckedSub + CheckedAdd> AssignmentRef<'r,
         let window = request.feasible_window();
         if start_time < window.start() {
             return Err(AssignmentError::AssignmentStartsBeforeFeasibleWindow(
-                AssignmenStartsBeforeFeasibleWindowError::new(
+                AssignmentStartsBeforeFeasibleWindowError::new(
                     request.id(),
                     window.start(),
                     start_time,
