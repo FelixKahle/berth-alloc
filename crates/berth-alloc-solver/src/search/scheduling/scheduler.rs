@@ -33,11 +33,9 @@ pub trait Scheduler<T: Copy + Ord> {
         chains: &C,
     ) -> Result<Schedule<T>, SchedulingError>;
 
-    fn valid_schedule<C: ChainSetView>(
+    fn check_schedule<C: ChainSetView>(
         &self,
         solver_state: &SolverSearchState<T>,
         chains: &C,
-    ) -> bool {
-        self.schedule(solver_state, chains).is_ok()
-    }
+    ) -> Result<(), SchedulingError>;
 }

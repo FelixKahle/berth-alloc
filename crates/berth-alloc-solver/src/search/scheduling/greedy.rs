@@ -59,13 +59,44 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub + Zero + std::fmt::Debug> Scheduler
     ) -> Result<Schedule<T>, SchedulingError> {
         let model: &SolverModel<T> = solver_state.model();
         let mut final_schedule = Schedule::new(model.berths_len());
-        let mut modified_berth_occupancies: HashMap<BerthIndex, BerthOccupancy<'_, T>> =
+
+        self.process_schedule(solver_state, chains, |scheduled_item| {
+            final_schedule.add_schedule(scheduled_item);
+        })?;
+
+        Ok(final_schedule)
+    }
+
+    fn check_schedule<C: ChainSetView>(
+        &self,
+        solver_state: &SolverSearchState<T>,
+        chains: &C,
+    ) -> Result<(), SchedulingError> {
+        self.process_schedule(solver_state, chains, |_| {})
+    }
+}
+
+impl GreedyEarliest {
+    #[inline]
+    fn process_schedule<T, C, F>(
+        &self,
+        solver_state: &SolverSearchState<T>,
+        chains: &C,
+        mut on_scheduled_item: F,
+    ) -> Result<(), SchedulingError>
+    where
+        T: Copy + Ord + CheckedAdd + CheckedSub + Zero + std::fmt::Debug,
+        C: ChainSetView,
+        F: FnMut(RequestSchedule<T>),
+    {
+        let model: &SolverModel<T> = solver_state.model();
+        let mut modified_berths: HashMap<BerthIndex, BerthOccupancy<'_, T>> =
             HashMap::with_capacity(model.berths_len());
 
         for chain_idx_val in 0..chains.num_chains() {
             let chain_index = ChainIndex(chain_idx_val);
             let berth_index = BerthIndex(chain_index.get());
-            let mut previous_request_end_time: Option<TimePoint<T>> = None;
+            let mut prev_end_time: Option<TimePoint<T>> = None;
 
             for request_node in chains.iter_chain(chain_index) {
                 let request_index = RequestIndex(request_node.get());
@@ -79,7 +110,7 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub + Zero + std::fmt::Debug> Scheduler
                     ));
                 };
 
-                let earliest_arrival = match previous_request_end_time {
+                let earliest_arrival = match prev_end_time {
                     None => feasible_window.start(),
                     Some(prev_end) => {
                         if prev_end > feasible_window.end() {
@@ -91,15 +122,14 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub + Zero + std::fmt::Debug> Scheduler
                     }
                 };
 
-                let berth_occupancy = modified_berth_occupancies
-                    .entry(berth_index)
-                    .or_insert_with(|| {
-                        model.baseline_occupancy_for_berth(berth_index).expect(
-                            "berth_index is in range; baseline_occupancy_for_berth must succeed",
-                        ).clone()
-                    });
+                let berth_occupancy = modified_berths.entry(berth_index).or_insert_with(|| {
+                    model
+                        .baseline_occupancy_for_berth(berth_index)
+                        .unwrap()
+                        .clone()
+                });
 
-                let Some(first_available_slot) = berth_occupancy
+                let Some(slot) = berth_occupancy
                     .iter_earliest_fit_intervals_in(feasible_window, processing_time)
                     .next()
                 else {
@@ -108,39 +138,32 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub + Zero + std::fmt::Debug> Scheduler
                     ));
                 };
 
-                let actual_start_time =
-                    std::cmp::max(earliest_arrival, first_available_slot.start());
-
-                let Some(actual_end_time) = actual_start_time.checked_add(processing_time) else {
+                let start_time = std::cmp::max(earliest_arrival, slot.start());
+                let Some(end_time) = start_time.checked_add(processing_time) else {
                     return Err(SchedulingError::FeasiblyWindowViolation(
                         FeasiblyWindowViolationError::new(request_index),
                     ));
                 };
 
-                if actual_end_time > first_available_slot.end()
-                    || actual_end_time > feasible_window.end()
-                {
+                if end_time > slot.end() || end_time > feasible_window.end() {
                     return Err(SchedulingError::FeasiblyWindowViolation(
                         FeasiblyWindowViolationError::new(request_index),
                     ));
                 }
 
-                let service_interval = TimeInterval::new(actual_start_time, actual_end_time);
-                berth_occupancy
-                    .occupy(service_interval)
-                    .expect("we selected from free space; occupy must succeed");
+                let service_interval = TimeInterval::new(start_time, end_time);
+                berth_occupancy.occupy(service_interval).unwrap();
 
-                final_schedule.add_schedule(RequestSchedule::new(
+                on_scheduled_item(RequestSchedule::new(
                     request_index,
                     berth_index,
                     service_interval,
                 ));
 
-                previous_request_end_time = Some(actual_end_time);
+                prev_end_time = Some(end_time);
             }
         }
-
-        Ok(final_schedule)
+        Ok(())
     }
 }
 
@@ -405,5 +428,58 @@ mod tests {
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].interval(), &iv(0, 7));
         assert_eq!(s[1].interval(), &iv(7, 14));
+    }
+
+    #[test]
+    fn test_check_schedule_on_valid_sequence() {
+        // This test uses a known valid setup to ensure check_schedule returns Ok.
+        let b0 = berth(1, 0, 100);
+        let f0 = req_flex(10, (0, 100), &[(1, 5)]);
+        let f1 = req_flex(11, (0, 100), &[(1, 5)]);
+
+        let mut pb = ProblemBuilder::new();
+        pb.add_berth(b0);
+        pb.add_flexible(f0);
+        pb.add_flexible(f1);
+        let p = pb.build().unwrap();
+
+        let model = SolverModel::try_from(&p).unwrap();
+        let state = make_state(&model);
+
+        let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());
+        link_sequence(&mut cs, ChainIndex(0), &[0, 1]);
+
+        // check_schedule should succeed without error.
+        let check_result = GreedyEarliest.check_schedule(&state, &cs);
+        assert!(check_result.is_ok());
+    }
+
+    #[test]
+    fn test_check_schedule_on_invalid_sequence() {
+        // This test uses the known invalid setup from `test_greedy_precedence_past_window_fails`
+        // to ensure check_schedule correctly returns an error.
+        let b0 = berth(1, 0, 100);
+        let f0 = req_flex(10, (0, 100), &[(1, 8)]);
+        let f1 = req_flex(11, (0, 10), &[(1, 5)]); // Window is too tight
+
+        let mut pb = ProblemBuilder::new();
+        pb.add_berth(b0);
+        pb.add_flexible(f0);
+        pb.add_flexible(f1);
+        let p = pb.build().unwrap();
+        let model = SolverModel::try_from(&p).unwrap();
+        let state = make_state(&model);
+
+        let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());
+        link_sequence(&mut cs, ChainIndex(0), &[0, 1]);
+
+        // check_schedule should fail with the correct error.
+        let err = GreedyEarliest.check_schedule(&state, &cs).unwrap_err();
+        match err {
+            SchedulingError::FeasiblyWindowViolation(e) => {
+                assert_eq!(e.request(), ri(1)); // second request violates its window
+            }
+            other => panic!("expected FeasiblyWindowViolation, got {other:?}"),
+        }
     }
 }
