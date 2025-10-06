@@ -361,7 +361,7 @@ mod tests {
         let removed = b.remove_after(NodeIndex(3)); // removes 5, parks as 5->5
         assert_eq!(removed, Some(NodeIndex(5)));
 
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
 
         assert_eq!(
             collect(&base, ChainIndex(0)),
@@ -389,7 +389,7 @@ mod tests {
         let mut b = ChainSetDeltaBuilder::new(&base);
         b.move_after(s1, s0); // move node after s0 (1) to after s1
 
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
 
         assert_eq!(
             collect(&base, ChainIndex(0)),
@@ -422,7 +422,7 @@ mod tests {
         let mut b = ChainSetDeltaBuilder::new(&base);
         b.move_block_after(NodeIndex(5), NodeIndex(1), NodeIndex(3));
 
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![
@@ -455,7 +455,7 @@ mod tests {
         // Adjacent swap 1 and 3
         let mut b1 = ChainSetDeltaBuilder::new(&base);
         b1.swap_adjacent_after(s);
-        base.apply_delta(&b1.build());
+        base.apply_delta(b1.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![
@@ -470,7 +470,7 @@ mod tests {
         // Non-adjacent swap successors of (s) and (1): currently succ(s)=3, succ(1)=5
         let mut b2 = ChainSetDeltaBuilder::new(&base);
         b2.swap_after(s, NodeIndex(1));
-        base.apply_delta(&b2.build());
+        base.apply_delta(b2.build());
         // Expected: s->5->1->3->7->9
         assert_eq!(
             collect(&base, ChainIndex(0)),
@@ -496,7 +496,7 @@ mod tests {
 
         let mut b = ChainSetDeltaBuilder::new(&base);
         assert!(b.insert_after(NodeIndex(1), NodeIndex(3)));
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
 
         assert_eq!(
             collect(&base, ChainIndex(0)),
@@ -515,7 +515,7 @@ mod tests {
 
         let mut b = ChainSetDeltaBuilder::new(&base);
         assert!(b.insert_after(NodeIndex(3), NodeIndex(2)));
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
 
         assert_eq!(collect(&base, ChainIndex(0)), vec![NodeIndex(1)]);
         assert_eq!(
@@ -526,7 +526,7 @@ mod tests {
         // Now insert 1 right after chain head of c1 (i.e., before 3)
         let mut b2 = ChainSetDeltaBuilder::new(&base);
         assert!(b2.insert_after(s1, NodeIndex(1)));
-        base.apply_delta(&b2.build());
+        base.apply_delta(b2.build());
         assert_eq!(
             collect(&base, ChainIndex(1)),
             vec![NodeIndex(1), NodeIndex(3), NodeIndex(2)]
@@ -542,7 +542,7 @@ mod tests {
         let mut b = ChainSetDeltaBuilder::new(&base);
         // inserting the tail sentinel is not allowed
         assert!(!b.insert_after(NodeIndex(1), e));
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(1), NodeIndex(2)]
@@ -558,7 +558,7 @@ mod tests {
         let mut b = ChainSetDeltaBuilder::new(&base);
         let removed = b.remove_after(s);
         assert_eq!(removed, Some(NodeIndex(1)));
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
 
         assert_eq!(collect(&base, ChainIndex(0)), vec![NodeIndex(2)]);
         // 1 must be isolated
@@ -574,7 +574,7 @@ mod tests {
         let mut b = ChainSetDeltaBuilder::new(&base);
         let removed = b.remove_after(NodeIndex(2));
         assert_eq!(removed, None);
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(1), NodeIndex(2)]
@@ -592,7 +592,7 @@ mod tests {
         // src_prev=3 is followed by end => noop
         let mut b = ChainSetDeltaBuilder::new(&base);
         b.move_after(NodeIndex(1), NodeIndex(3));
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(1), NodeIndex(2), NodeIndex(3)]
@@ -612,7 +612,7 @@ mod tests {
 
         let mut b = ChainSetDeltaBuilder::new(&base);
         b.move_after(s, s); // equal => noop by contract
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(1), NodeIndex(2), NodeIndex(3)]
@@ -621,7 +621,7 @@ mod tests {
         // Now move node after s (1) to after current last (3)
         let mut b4 = ChainSetDeltaBuilder::new(&base);
         b4.move_after(NodeIndex(3), s);
-        base.apply_delta(&b4.build());
+        base.apply_delta(b4.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(2), NodeIndex(3), NodeIndex(1)]
@@ -642,7 +642,7 @@ mod tests {
 
         let mut b = ChainSetDeltaBuilder::new(&base);
         b.move_after(s1, s0); // move node 1 after head of empty chain => becomes first
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(2), NodeIndex(3)]
@@ -662,7 +662,7 @@ mod tests {
 
         let mut b = ChainSetDeltaBuilder::new(&base);
         b.move_block_after(NodeIndex(4), NodeIndex(1), NodeIndex(2)); // block [2]
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(1), NodeIndex(3), NodeIndex(4), NodeIndex(2)]
@@ -687,7 +687,7 @@ mod tests {
 
         let mut b = ChainSetDeltaBuilder::new(&base);
         b.move_block_after(NodeIndex(5), NodeIndex(1), NodeIndex(4));
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![
@@ -711,7 +711,7 @@ mod tests {
         );
         let mut b = ChainSetDeltaBuilder::new(&base);
         b.move_block_after(NodeIndex(1), NodeIndex(3), NodeIndex(3)); // first = succ(3) = tail => noop
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(1), NodeIndex(2), NodeIndex(3)]
@@ -729,7 +729,7 @@ mod tests {
         );
         let mut b = ChainSetDeltaBuilder::new(&base);
         b.swap_adjacent_after(NodeIndex(2));
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(1), NodeIndex(2), NodeIndex(3)]
@@ -739,7 +739,7 @@ mod tests {
         let s = base.start_of_chain(ChainIndex(0));
         let mut b2 = ChainSetDeltaBuilder::new(&base);
         b2.swap_adjacent_after(s);
-        base.apply_delta(&b2.build());
+        base.apply_delta(b2.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(2), NodeIndex(1), NodeIndex(3)]
@@ -753,14 +753,14 @@ mod tests {
         let s = base.start_of_chain(ChainIndex(0));
         let mut b = ChainSetDeltaBuilder::new(&base);
         b.swap_adjacent_after(s);
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
         assert_eq!(collect(&base, ChainIndex(0)), Vec::<NodeIndex>::new());
 
         // Single node
         link_sequence(&mut base, ChainIndex(0), &[NodeIndex(1)]);
         let mut b2 = ChainSetDeltaBuilder::new(&base);
         b2.swap_adjacent_after(s);
-        base.apply_delta(&b2.build());
+        base.apply_delta(b2.build());
         assert_eq!(collect(&base, ChainIndex(0)), vec![NodeIndex(1)]);
     }
 
@@ -777,7 +777,7 @@ mod tests {
         // p==q
         let mut b1 = ChainSetDeltaBuilder::new(&base);
         b1.swap_after(NodeIndex(1), NodeIndex(1));
-        base.apply_delta(&b1.build());
+        base.apply_delta(b1.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(1), NodeIndex(2), NodeIndex(3)]
@@ -786,7 +786,7 @@ mod tests {
         // identical successors
         let mut b2 = ChainSetDeltaBuilder::new(&base);
         b2.swap_after(s, s);
-        base.apply_delta(&b2.build());
+        base.apply_delta(b2.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(1), NodeIndex(2), NodeIndex(3)]
@@ -795,7 +795,7 @@ mod tests {
         // a sentinel successor path (choose q=3 so succ(3)=tail)
         let mut b3 = ChainSetDeltaBuilder::new(&base);
         b3.swap_after(s, NodeIndex(3));
-        base.apply_delta(&b3.build());
+        base.apply_delta(b3.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(1), NodeIndex(2), NodeIndex(3)]
@@ -815,7 +815,7 @@ mod tests {
 
         let mut b1 = ChainSetDeltaBuilder::new(&base);
         b1.swap_after(s, NodeIndex(1)); // q==a (1->2)
-        base.apply_delta(&b1.build());
+        base.apply_delta(b1.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(2), NodeIndex(1), NodeIndex(3), NodeIndex(4)]
@@ -831,7 +831,7 @@ mod tests {
         );
         let mut b2 = ChainSetDeltaBuilder::new(&base2);
         b2.swap_after(NodeIndex(6), NodeIndex(5)); // p==b (6), q->b(6)->a(7)
-        base2.apply_delta(&b2.build());
+        base2.apply_delta(b2.build());
         assert_eq!(
             collect(&base2, ChainIndex(0)),
             vec![NodeIndex(5), NodeIndex(7), NodeIndex(6)]
@@ -851,7 +851,7 @@ mod tests {
 
         let mut b = ChainSetDeltaBuilder::new(&base);
         b.swap_after(s, NodeIndex(3));
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
         // Expected: s->5->3->1->7
         assert_eq!(
             collect(&base, ChainIndex(0)),
@@ -872,7 +872,7 @@ mod tests {
         let s = base.start_of_chain(ChainIndex(0));
         let mut b = ChainSetDeltaBuilder::new(&base);
         b.two_opt_star_intra(s, NodeIndex(1), NodeIndex(3));
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(1), NodeIndex(4), NodeIndex(3), NodeIndex(2)]
@@ -892,7 +892,7 @@ mod tests {
 
         let mut b = ChainSetDeltaBuilder::new(&base);
         b.splice_run_after(NodeIndex(1), NodeIndex(1), NodeIndex(4));
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(1), NodeIndex(2), NodeIndex(3), NodeIndex(4)]
@@ -911,7 +911,7 @@ mod tests {
 
         let mut b = ChainSetDeltaBuilder::new(&base);
         b.detach(NodeIndex(2));
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(1), NodeIndex(3)]
@@ -931,7 +931,7 @@ mod tests {
         );
         let mut b1 = ChainSetDeltaBuilder::new(&base);
         b1.detach(NodeIndex(1));
-        base.apply_delta(&b1.build());
+        base.apply_delta(b1.build());
         assert_eq!(
             collect(&base, ChainIndex(0)),
             vec![NodeIndex(2), NodeIndex(3)]
@@ -940,7 +940,7 @@ mod tests {
         // Detach tail actual node
         let mut b2 = ChainSetDeltaBuilder::new(&base);
         b2.detach(NodeIndex(3));
-        base.apply_delta(&b2.build());
+        base.apply_delta(b2.build());
         assert_eq!(collect(&base, ChainIndex(0)), vec![NodeIndex(2)]);
         assert_eq!(base.next_node(NodeIndex(3)), Some(NodeIndex(3)));
         assert_eq!(base.prev_node(NodeIndex(3)), Some(NodeIndex(3)));
@@ -956,7 +956,7 @@ mod tests {
         let snapshot = collect(&base, ChainIndex(0));
         let mut b = ChainSetDeltaBuilder::new(&base);
         b.detach(s).detach(e);
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
 
         assert_eq!(collect(&base, ChainIndex(0)), snapshot);
     }
@@ -981,7 +981,7 @@ mod tests {
             .move_after(NodeIndex(4), NodeIndex(1))
             .insert_after(NodeIndex(1), NodeIndex(2));
 
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
 
         assert_eq!(
             collect(&base, ChainIndex(0)),
@@ -1002,7 +1002,7 @@ mod tests {
 
         let mut b = ChainSetDeltaBuilder::new(&base);
         b.splice_run_after(NodeIndex(5), NodeIndex(1), NodeIndex(3));
-        base.apply_delta(&b.build());
+        base.apply_delta(b.build());
 
         assert_eq!(
             collect(&base, ChainIndex(0)),

@@ -154,7 +154,7 @@ impl ChainSet {
     }
 
     #[inline]
-    pub fn apply_delta(&mut self, delta: &ChainSetDelta) {
+    pub fn apply_delta(&mut self, delta: ChainSetDelta) {
         for &r in delta.rewires() {
             self.apply_rewire(r);
         }
@@ -257,7 +257,7 @@ impl ChainSetView for ChainSet {
     }
 
     #[inline]
-    fn iter_chain(&self, chain: ChainIndex) -> impl Iterator<Item = NodeIndex> + '_ {
+    fn iter_chain(&self, chain: ChainIndex) -> Self::NodeIter<'_> {
         debug_assert!(chain.get() < self.num_chains());
 
         let num_total_nodes = self.num_total_nodes();
@@ -269,6 +269,8 @@ impl ChainSetView for ChainSet {
 
         ChainIter::new(&self.next, self.next[start.get()], end)
     }
+
+    type NodeIter<'a> = ChainIter<'a>;
 }
 
 #[derive(Debug, Clone)]
@@ -666,7 +668,7 @@ mod tests {
         delta.push_rewire(ChainNextRewire::new(NodeIndex(3), NodeIndex(5)));
         delta.push_rewire(ChainNextRewire::new(NodeIndex(5), e));
 
-        cs.apply_delta(&delta);
+        cs.apply_delta(delta);
 
         assert_eq!(
             collect_chain(&cs, ChainIndex(0)),
@@ -713,7 +715,7 @@ mod tests {
         delta.push_rewire(ChainNextRewire::new(s1, NodeIndex(0)));
         delta.push_rewire(ChainNextRewire::new(NodeIndex(0), e1));
 
-        cs.apply_delta(&delta);
+        cs.apply_delta(delta);
 
         assert_eq!(
             collect_chain(&cs, ChainIndex(0)),
@@ -733,7 +735,7 @@ mod tests {
         let before: Vec<NodeIndex> = collect_chain(&cs, ChainIndex(0));
         let delta = ChainSetDelta::new();
 
-        cs.apply_delta(&delta);
+        cs.apply_delta(delta);
 
         let after: Vec<NodeIndex> = collect_chain(&cs, ChainIndex(0));
         assert_eq!(before, after);

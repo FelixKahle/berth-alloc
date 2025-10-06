@@ -131,23 +131,43 @@ impl<'base, 'delta> ChainSetView for ChainSetOverlay<'base, 'delta> {
     }
 
     #[inline]
-    fn iter_chain(&self, chain: ChainIndex) -> impl Iterator<Item = NodeIndex> + '_ {
+    fn iter_chain(&self, chain: ChainIndex) -> Self::NodeIter<'_> {
         debug_assert!(chain.get() < self.num_chains());
-        let s = self.start_of_chain(chain);
-        let e = self.end_of_chain(chain);
 
-        let mut cur = self.next_of(s);
-        let mut steps_left: usize = self.total_nodes();
+        let start = self.start_of_chain(chain);
+        let end = self.end_of_chain(chain);
+        ChainSetOverlayIter {
+            overlay: self,
+            current: self.next_of(start),
+            end,
+            steps_left: self.total_nodes(),
+        }
+    }
 
-        std::iter::from_fn(move || {
-            if cur == e || steps_left == 0 {
-                return None;
-            }
-            steps_left -= 1;
-            let out = cur;
-            cur = self.next_of(cur);
-            Some(out)
-        })
+    type NodeIter<'a>
+        = ChainSetOverlayIter<'a>
+    where
+        Self: 'a;
+}
+
+pub struct ChainSetOverlayIter<'a> {
+    overlay: &'a ChainSetOverlay<'a, 'a>,
+    current: NodeIndex,
+    end: NodeIndex,
+    steps_left: usize,
+}
+
+impl<'a> Iterator for ChainSetOverlayIter<'a> {
+    type Item = NodeIndex;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current == self.end || self.steps_left == 0 {
+            return None;
+        }
+        self.steps_left -= 1;
+        let out = self.current;
+        self.current = self.overlay.next_of(self.current);
+        Some(out)
     }
 }
 
@@ -217,7 +237,7 @@ mod apply_tests {
         delta.push_rewire(ChainNextRewire::new(NodeIndex(3), NodeIndex(5)));
         delta.push_rewire(ChainNextRewire::new(NodeIndex(5), e));
 
-        cs.apply_delta(&delta);
+        cs.apply_delta(delta);
 
         assert_eq!(
             collect_chain(&cs, ChainIndex(0)),
@@ -257,7 +277,7 @@ mod apply_tests {
         delta.push_rewire(ChainNextRewire::new(s1, NodeIndex(0)));
         delta.push_rewire(ChainNextRewire::new(NodeIndex(0), e1));
 
-        cs.apply_delta(&delta);
+        cs.apply_delta(delta);
 
         assert_eq!(
             collect_chain(&cs, ChainIndex(0)),
@@ -276,7 +296,7 @@ mod apply_tests {
         let before: Vec<NodeIndex> = collect_chain(&cs, ChainIndex(0));
         let delta = ChainSetDelta::new();
 
-        cs.apply_delta(&delta);
+        cs.apply_delta(delta);
 
         let after: Vec<NodeIndex> = collect_chain(&cs, ChainIndex(0));
         assert_eq!(before, after);

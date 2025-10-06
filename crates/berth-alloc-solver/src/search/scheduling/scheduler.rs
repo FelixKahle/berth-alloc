@@ -21,51 +21,52 @@
 
 use crate::{
     search::scheduling::{err::SchedulingError, schedule::Schedule},
-    state::{
-        chain_set::view::ChainSetView, cost_policy::CostPolicy, search_state::SolverSearchState,
-    },
+    state::{chain_set::view::ChainSetView, model::SolverModel},
 };
 use berth_alloc_model::{common::FlexibleKind, prelude::SolutionRef, problem::asg::AssignmentRef};
 use num_traits::{CheckedAdd, CheckedSub, Zero};
 
 pub trait Scheduler<T: Copy + Ord + CheckedAdd + CheckedSub + Zero> {
+    type ScheduleIter<'run, C>: Iterator<Item = Result<Schedule<T>, SchedulingError>> + 'run
+    where
+        C: ChainSetView + 'run,
+        Self: 'run,
+        T: 'run;
+
     #[inline]
     fn name(&self) -> &str {
         std::any::type_name::<Self>()
     }
 
-    fn process_schedule<C, F, P>(
-        &self,
-        solver_state: &SolverSearchState<T, P>,
-        chains: &C,
-        on_scheduled_item: F,
-    ) -> Result<(), SchedulingError>
+    fn schedules<'run, C>(
+        &'run self,
+        solver_model: &'run SolverModel<'run, T>,
+        chains: &'run C,
+    ) -> Self::ScheduleIter<'run, C>
     where
-        C: ChainSetView,
-        F: FnMut(&Schedule<T>),
-        P: CostPolicy<T>;
+        C: ChainSetView + 'run;
 
     #[inline]
-    fn check_schedule<C: ChainSetView, P: CostPolicy<T>>(
+    fn check_schedule<C: ChainSetView>(
         &self,
-        solver_state: &SolverSearchState<T, P>,
+        solver_model: &SolverModel<T>,
         chains: &C,
     ) -> Result<(), SchedulingError> {
-        self.process_schedule(solver_state, chains, |_| {})
+        self.schedules(solver_model, chains)
+            .try_for_each(|r| r.map(|_| ()))
     }
 
     #[inline]
-    fn solution<'problem, C: ChainSetView, P: CostPolicy<T>>(
+    fn solution<'problem, C: ChainSetView>(
         &self,
-        solver_state: &'problem SolverSearchState<T, P>,
+        solver_model: &SolverModel<'problem, T>,
         chains: &C,
-    ) -> Result<berth_alloc_model::prelude::SolutionRef<'problem, T>, SchedulingError>
+    ) -> Result<SolutionRef<'problem, T>, SchedulingError>
     where
-        T: std::fmt::Debug + std::fmt::Display,
+        T: std::fmt::Debug,
     {
-        let model = solver_state.model();
-        let problem = model.problem();
-        let index_manager = model.index_manager();
+        let problem = solver_model.problem();
+        let index_manager = solver_model.index_manager();
 
         let fixed_refs = problem
             .fixed_assignments()
@@ -79,31 +80,18 @@ pub trait Scheduler<T: Copy + Ord + CheckedAdd + CheckedSub + Zero> {
             AssignmentRef<'problem, 'problem, FlexibleKind, T>,
         >::new();
 
-        self.process_schedule(solver_state, chains, |schedule| {
-            let req = schedule.request_index();
-            let berth = schedule.berth_index();
-            let iv = schedule.assigned_time_interval();
-            let req_id = index_manager
-                .request_id(req)
-                .expect("request_id map is total after preprocessing");
-
-            let berth_id = index_manager
-                .berth_id(berth)
-                .expect("berth_id map is total after preprocessing");
-            let req_ref = problem
-                .flexible_requests()
-                .get(req_id)
-                .expect("flexible request must exist");
-
-            let berth_ref = problem.berths().get(berth_id).expect("berth must exist");
-
-            let start = iv.start();
-
+        for sched in self.schedules(solver_model, chains) {
+            let s = sched?;
+            let req_id = index_manager.request_id(s.request_index()).expect("total");
+            let berth_id = index_manager.berth_id(s.berth_index()).expect("total");
+            let req_ref = problem.flexible_requests().get(req_id).expect("exists");
+            let berth_ref = problem.berths().get(berth_id).expect("exists");
+            let start = s.assigned_time_interval().start();
             let aref = AssignmentRef::<FlexibleKind, T>::new_flexible(req_ref, berth_ref, start)
-                .expect("greedy placement must construct a feasible AssignmentRef");
-
+                .expect("greedy placement must be feasible");
             flex_refs.insert(aref);
-        })?;
+        }
+
         Ok(SolutionRef::new(fixed_refs, flex_refs))
     }
 }

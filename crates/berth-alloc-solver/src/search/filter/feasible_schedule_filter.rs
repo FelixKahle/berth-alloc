@@ -23,7 +23,6 @@ use crate::{
     search::{filter::traits::FeasibilityFilter, scheduling::scheduler::Scheduler},
     state::{
         chain_set::{delta::ChainSetDelta, overlay::ChainSetOverlay},
-        cost_policy::CostPolicy,
         search_state::SolverSearchState,
     },
 };
@@ -35,21 +34,19 @@ pub struct FeasibleScheduleFilter<T: Copy + Ord + CheckedAdd + CheckedSub + Zero
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<'model, 'problem, T, P, S> FeasibilityFilter<'model, 'problem, T, P>
-    for FeasibleScheduleFilter<T, S>
+impl<'model, 'problem, T, S> FeasibilityFilter<'model, 'problem, T> for FeasibleScheduleFilter<T, S>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Zero,
-    P: CostPolicy<T>,
     S: Scheduler<T>,
 {
     fn is_feasible(
         &self,
         delta: &ChainSetDelta,
-        search_state: &SolverSearchState<'model, 'problem, T, P>,
+        search_state: &SolverSearchState<'model, 'problem, T>,
     ) -> bool {
         let overlay = ChainSetOverlay::new(search_state.chain_set(), delta);
         self.scheduler
-            .check_schedule(search_state, &overlay)
+            .check_schedule(search_state.model(), &overlay)
             .is_ok()
     }
 
@@ -71,7 +68,6 @@ mod tests {
                 index::{ChainIndex, NodeIndex},
                 view::ChainSetView,
             },
-            cost_policy::WeightedFlowTime,
             model::SolverModel,
             search_state::SolverSearchState,
         },
@@ -136,11 +132,8 @@ mod tests {
     }
 
     #[inline]
-    fn make_search_state<'p>(
-        model: &'p SolverModel<'p, i64>,
-    ) -> SolverSearchState<'p, 'p, i64, WeightedFlowTime<'p, 'p, i64>> {
-        let policy = WeightedFlowTime::new(model);
-        SolverSearchState::new(model, policy)
+    fn make_search_state<'p>(model: &'p SolverModel<'p, i64>) -> SolverSearchState<'p, 'p, i64> {
+        SolverSearchState::new(model)
     }
 
     // Build a ChainSetDelta that links node indices in order on the given chain.

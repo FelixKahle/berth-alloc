@@ -19,20 +19,20 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::{search::filter::traits::FeasibilityFilter, state::cost_policy::CostPolicy};
+use crate::search::filter::traits::FeasibilityFilter;
 
 #[derive(Debug)]
-pub struct FilterStack<'model, 'problem, T: Copy + Ord, P: CostPolicy<T>> {
-    filters: Vec<Box<dyn FeasibilityFilter<'model, 'problem, T, P>>>,
+pub struct FilterStack<'model, 'problem, T: Copy + Ord> {
+    filters: Vec<Box<dyn FeasibilityFilter<'model, 'problem, T>>>,
 }
 
-impl<'model, 'problem, T: Copy + Ord, P: CostPolicy<T>> Default for FilterStack<'model, 'problem, T, P> {
+impl<'model, 'problem, T: Copy + Ord> Default for FilterStack<'model, 'problem, T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'model, 'problem, T: Copy + Ord, P: CostPolicy<T>> FilterStack<'model, 'problem, T, P> {
+impl<'model, 'problem, T: Copy + Ord> FilterStack<'model, 'problem, T> {
     #[inline]
     pub fn new() -> Self {
         Self { filters: vec![] }
@@ -46,7 +46,7 @@ impl<'model, 'problem, T: Copy + Ord, P: CostPolicy<T>> FilterStack<'model, 'pro
     }
 
     #[inline]
-    pub fn with_filters(filters: Vec<Box<dyn FeasibilityFilter<'model, 'problem, T, P>>>) -> Self {
+    pub fn with_filters(filters: Vec<Box<dyn FeasibilityFilter<'model, 'problem, T>>>) -> Self {
         let mut stack = Self { filters };
         stack
             .filters
@@ -67,7 +67,7 @@ impl<'model, 'problem, T: Copy + Ord, P: CostPolicy<T>> FilterStack<'model, 'pro
     #[inline]
     pub fn add_filter<F>(&mut self, filter: F)
     where
-        F: FeasibilityFilter<'model, 'problem, T, P> + 'static,
+        F: FeasibilityFilter<'model, 'problem, T> + 'static,
     {
         self.filters.push(Box::new(filter));
         self.filters
@@ -75,13 +75,13 @@ impl<'model, 'problem, T: Copy + Ord, P: CostPolicy<T>> FilterStack<'model, 'pro
     }
 }
 
-impl<'model, 'problem, T: Copy + Ord, P: CostPolicy<T>> FeasibilityFilter<'model, 'problem, T, P>
-    for FilterStack<'model, 'problem, T, P>
+impl<'model, 'problem, T: Copy + Ord> FeasibilityFilter<'model, 'problem, T>
+    for FilterStack<'model, 'problem, T>
 {
     fn is_feasible(
         &self,
         delta: &crate::state::chain_set::prelude::ChainSetDelta,
-        search_state: &crate::state::search_state::SolverSearchState<'model, 'problem, T, P>,
+        search_state: &crate::state::search_state::SolverSearchState<'model, 'problem, T>,
     ) -> bool {
         // Because the filters are sorted by complexity, we can short-circuit early
         // if any filter is not feasible and rule out deltas early without

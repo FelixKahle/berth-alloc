@@ -22,6 +22,10 @@
 use crate::state::chain_set::index::{ChainIndex, NodeIndex};
 
 pub trait ChainSetView {
+    type NodeIter<'a>: Iterator<Item = NodeIndex> + 'a
+    where
+        Self: 'a;
+
     fn num_nodes(&self) -> usize;
     fn num_chains(&self) -> usize;
 
@@ -45,7 +49,7 @@ pub trait ChainSetView {
 
     fn is_chain_empty(&self, chain: ChainIndex) -> bool;
 
-    fn iter_chain(&self, chain: ChainIndex) -> impl Iterator<Item = NodeIndex> + '_;
+    fn iter_chain(&self, chain: ChainIndex) -> Self::NodeIter<'_>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -199,10 +203,15 @@ mod tests {
             self.chains[chain].is_empty()
         }
 
-        fn iter_chain(&self, chain: ChainIndex) -> impl Iterator<Item = NodeIndex> + '_ {
+        fn iter_chain(&self, chain: ChainIndex) -> Self::NodeIter<'_> {
             let chain = chain.get();
             self.chains[chain].iter().copied()
         }
+
+        type NodeIter<'a>
+            = std::iter::Copied<std::slice::Iter<'a, NodeIndex>>
+        where
+            Self: 'a;
     }
 
     #[test]

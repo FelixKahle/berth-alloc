@@ -28,7 +28,6 @@ use crate::{
             overlay::ChainSetOverlay,
             view::ChainSetView,
         },
-        cost_policy::CostPolicy,
         index::{BerthIndex, RequestIndex},
         search_state::SolverSearchState,
     },
@@ -45,10 +44,9 @@ impl FeasibleBerthFilter {
     }
 }
 
-impl<'model, 'problem, T, P> FeasibilityFilter<'model, 'problem, T, P> for FeasibleBerthFilter
+impl<'model, 'problem, T> FeasibilityFilter<'model, 'problem, T> for FeasibleBerthFilter
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
-    P: CostPolicy<T>,
 {
     #[inline]
     fn complexity(&self) -> usize {
@@ -59,7 +57,7 @@ where
     fn is_feasible(
         &self,
         delta: &ChainSetDelta,
-        search_state: &SolverSearchState<'model, 'problem, T, P>,
+        search_state: &SolverSearchState<'model, 'problem, T>,
     ) -> bool
     where
         T: Copy + Ord + CheckedAdd + CheckedSub,
