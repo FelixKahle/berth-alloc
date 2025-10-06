@@ -19,27 +19,27 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-#![allow(dead_code)]
-
-use crate::state::{chain_set::base::ChainSet, model::SolverModel};
+use crate::state::{chain_set::base::ChainSet, cost_policy::CostPolicy, model::SolverModel};
 use num_traits::{CheckedAdd, CheckedSub};
 
 #[derive(Debug, Clone)]
-pub struct SolverSearchState<'model, 'problem, T: Copy + Ord> {
+pub struct SolverSearchState<'model, 'problem, T: Copy + Ord, C: CostPolicy<T>> {
     model: &'model SolverModel<'problem, T>,
+    cost_policy: C,
     chain_set: ChainSet,
 }
 
-impl<'problem, 'model, T: Copy + Ord + CheckedAdd + CheckedSub>
-    SolverSearchState<'model, 'problem, T>
+impl<'problem, 'model, T: Copy + Ord + CheckedAdd + CheckedSub, C: CostPolicy<T>>
+    SolverSearchState<'model, 'problem, T, C>
 {
     #[inline]
-    pub fn new(model: &'model SolverModel<'problem, T>) -> Self {
+    pub fn new(model: &'model SolverModel<'problem, T>, cost_policy: C) -> Self {
         let num_chains = model.berths_len();
         let num_nodes = model.flexible_requests_len();
 
         Self {
             model,
+            cost_policy,
             chain_set: ChainSet::new(num_chains, num_nodes),
         }
     }
@@ -52,5 +52,10 @@ impl<'problem, 'model, T: Copy + Ord + CheckedAdd + CheckedSub>
     #[inline]
     pub fn chain_set(&self) -> &ChainSet {
         &self.chain_set
+    }
+
+    #[inline]
+    pub fn cost_policy(&self) -> &C {
+        &self.cost_policy
     }
 }

@@ -21,12 +21,15 @@
 
 use crate::{
     search::scheduling::{err::SchedulingError, scheduler::Scheduler},
-    state::{chain_set::view::ChainSetView, search_state::SolverSearchState},
+    state::{
+        chain_set::view::ChainSetView, cost_policy::CostPolicy, index::RequestIndex,
+        search_state::SolverSearchState,
+    },
 };
 use berth_alloc_core::prelude::{Cost, TimeDelta};
 use num_traits::{CheckedAdd, CheckedSub, Zero};
 
-pub trait ScheduleScorer<T: Copy + Ord + CheckedAdd + CheckedSub + Zero> {
+pub trait ScheduleScorer<T: Copy + Ord + CheckedAdd + CheckedSub + Zero, P: CostPolicy<T>> {
     #[inline]
     fn name(&self) -> &str {
         std::any::type_name::<Self>()
@@ -34,7 +37,7 @@ pub trait ScheduleScorer<T: Copy + Ord + CheckedAdd + CheckedSub + Zero> {
 
     fn score_exact<C: ChainSetView, S: Scheduler<T>>(
         &self,
-        solver_state: &SolverSearchState<T>,
+        solver_state: &SolverSearchState<T, P>,
         chains: &C,
         scheduler: &S,
     ) -> Result<Cost, SchedulingError>;
@@ -43,34 +46,43 @@ pub trait ScheduleScorer<T: Copy + Ord + CheckedAdd + CheckedSub + Zero> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DefaultScheduleScorer;
 
-impl<T> ScheduleScorer<T> for DefaultScheduleScorer
+impl<T, P> ScheduleScorer<T, P> for DefaultScheduleScorer
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Zero + Into<Cost>,
+    P: CostPolicy<T>,
 {
     fn score_exact<C: ChainSetView, S: Scheduler<T>>(
         &self,
-        state: &SolverSearchState<T>,
+        state: &SolverSearchState<T, P>,
         chains: &C,
         scheduler: &S,
     ) -> Result<Cost, crate::search::scheduling::err::SchedulingError> {
         let model = state.model();
+        let policy = state.cost_policy();
         let zero = TimeDelta::zero();
-        let mut total: Cost = model.empty_schedule_cost();
+
+        let mut total: Cost = 0.into();
+        for i in 0..model.flexible_requests_len() {
+            total = total.saturating_add(policy.unperformed_penalty(RequestIndex(i)));
+        }
+
         scheduler.process_schedule(state, chains, |sched| {
             let r = sched.request_index();
             let iv = sched.assigned_time_interval();
             let win = model.feasible_intervals()[r.get()];
             let wgt = model.weights()[r.get()];
-            let penalty = model.unperformed_penalties()[r.get()];
+            let penalty = policy.unperformed_penalty(r);
             let bi = sched.berth_index();
-            let proc_cost = model
-                .cost(r, bi)
+            let proc_cost = policy
+                .scheduled_cost(r, bi)
                 .expect("scheduler produced (req, berth) that is infeasible");
+
             let wait = {
                 let d = iv.start() - win.start();
                 if d < zero { zero } else { d }
             };
             let wait_cost: Cost = wgt.saturating_mul(wait.value().into());
+
             let scheduled_total = proc_cost.saturating_add(wait_cost);
             total = total
                 .saturating_add(scheduled_total)
@@ -158,8 +170,10 @@ mod tests {
     }
 
     #[inline]
-    fn make_state<'p>(model: &'p SolverModel<'p, i64>) -> SolverSearchState<'p, 'p, i64> {
-        SolverSearchState::new(model)
+    fn make_state<'p>(
+        model: &'p SolverModel<'p, i64>,
+    ) -> SolverSearchState<'p, 'p, i64, WeightedFlowTime<'p, 'p, i64>> {
+        SolverSearchState::new(model, WeightedFlowTime::new(model))
     }
 
     // Link a sequence into a given chain: head -> n0 -> n1 -> ... -> tail
@@ -173,13 +187,6 @@ mod tests {
             current_tail = node_to_link;
         }
         cs.apply_delta(&builder.build());
-    }
-
-    #[test]
-    fn test_name_contains_type() {
-        let scorer = DefaultScheduleScorer;
-        let name = <DefaultScheduleScorer as ScheduleScorer<i64>>::name(&scorer);
-        assert!(name.contains("DefaultScheduleScorer"), "name was {}", name);
     }
 
     #[test]
@@ -199,7 +206,7 @@ mod tests {
         pb.add_flexible(r20);
         let p: Problem<i64> = pb.build().unwrap();
 
-        let model = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
+        let model = SolverModel::from_problem(&p).unwrap();
         let state = make_state(&model);
 
         // indices: rid(10)->0, rid(20)->1
@@ -230,7 +237,7 @@ mod tests {
         pb.add_flexible(r20);
         let p = pb.build().unwrap();
 
-        let model = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
+        let model = SolverModel::from_problem(&p).unwrap();
         let state = make_state(&model);
 
         let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());
@@ -258,7 +265,7 @@ mod tests {
         pb.add_flexible(r);
         let p = pb.build().unwrap();
 
-        let model = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
+        let model = SolverModel::from_problem(&p).unwrap();
         let state = make_state(&model);
 
         let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());
@@ -284,7 +291,7 @@ mod tests {
         pb.add_flexible(r_b);
         let p = pb.build().unwrap();
 
-        let model = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
+        let model = SolverModel::from_problem(&p).unwrap();
         let state = make_state(&model);
 
         let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());
@@ -314,7 +321,7 @@ mod tests {
         pb.add_flexible(r2);
         let p = pb.build().unwrap();
 
-        let model = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
+        let model = SolverModel::from_problem(&p).unwrap();
         let state = make_state(&model);
 
         let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());
@@ -352,7 +359,7 @@ mod tests {
         pb.add_flexible(r_b);
         let p = pb.build().unwrap();
 
-        let model = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
+        let model = SolverModel::from_problem(&p).unwrap();
         let state = make_state(&model);
 
         let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());

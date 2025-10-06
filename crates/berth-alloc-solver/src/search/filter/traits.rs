@@ -19,11 +19,14 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::state::{chain_set::delta::ChainSetDelta, search_state::SolverSearchState};
+use crate::state::{
+    chain_set::delta::ChainSetDelta, cost_policy::CostPolicy, search_state::SolverSearchState,
+};
 
-pub trait FeasibilityFilter<'model, 'problem, T>
+pub trait FeasibilityFilter<'model, 'problem, T, P>
 where
     T: Copy + Ord,
+    P: CostPolicy<T>,
 {
     #[inline]
     fn name(&self) -> &str {
@@ -38,42 +41,51 @@ where
     fn is_feasible(
         &self,
         delta: &ChainSetDelta,
-        search_state: &SolverSearchState<'model, 'problem, T>,
+        search_state: &SolverSearchState<'model, 'problem, T, P>,
     ) -> bool;
 }
 
-impl<'model, 'problem, T> PartialEq for dyn FeasibilityFilter<'model, 'problem, T>
+impl<'model, 'problem, T, P> PartialEq for dyn FeasibilityFilter<'model, 'problem, T, P>
 where
     T: Copy + Ord,
+    P: CostPolicy<T>,
 {
     fn eq(&self, other: &Self) -> bool {
         self.complexity() == other.complexity()
     }
 }
 
-impl<'model, 'problem, T> Eq for dyn FeasibilityFilter<'model, 'problem, T> where T: Copy + Ord {}
-
-impl<'model, 'problem, T> PartialOrd for dyn FeasibilityFilter<'model, 'problem, T>
+impl<'model, 'problem, T, P> Eq for dyn FeasibilityFilter<'model, 'problem, T, P>
 where
     T: Copy + Ord,
+    P: CostPolicy<T>,
+{
+}
+
+impl<'model, 'problem, T, P> PartialOrd for dyn FeasibilityFilter<'model, 'problem, T, P>
+where
+    T: Copy + Ord,
+    P: CostPolicy<T>,
 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<'model, 'problem, T> Ord for dyn FeasibilityFilter<'model, 'problem, T>
+impl<'model, 'problem, T, P> Ord for dyn FeasibilityFilter<'model, 'problem, T, P>
 where
     T: Copy + Ord,
+    P: CostPolicy<T>,
 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.complexity().cmp(&other.complexity())
     }
 }
 
-impl<'model, 'problem, T> std::fmt::Debug for dyn FeasibilityFilter<'model, 'problem, T>
+impl<'model, 'problem, T, P> std::fmt::Debug for dyn FeasibilityFilter<'model, 'problem, T, P>
 where
     T: Copy + Ord,
+    P: CostPolicy<T>,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Filter")
@@ -83,9 +95,10 @@ where
     }
 }
 
-impl<'model, 'problem, T> std::fmt::Display for dyn FeasibilityFilter<'model, 'problem, T>
+impl<'model, 'problem, T, P> std::fmt::Display for dyn FeasibilityFilter<'model, 'problem, T, P>
 where
     T: Copy + Ord,
+    P: CostPolicy<T>,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} (complexity: {})", self.name(), self.complexity())

@@ -19,41 +19,57 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use berth_alloc_core::prelude::Cost;
-use berth_alloc_model::{prelude::Berth, problem::req::RequestView};
-use num_traits::CheckedSub;
+use crate::state::{
+    index::{BerthIndex, RequestIndex},
+    model::SolverModel,
+};
+use berth_alloc_core::prelude::{Cost, TimeDelta};
+use num_traits::{CheckedAdd, CheckedSub};
 
-pub trait CostPolicy {
-    fn unperformed_penalty<T: Copy + Ord + CheckedSub + Into<Cost>, V: RequestView<T>>(
-        &self,
-        req: &V,
-    ) -> Cost;
-    fn scheduled_cost<T: Copy + Ord + CheckedSub + Into<Cost>, V: RequestView<T>>(
-        &self,
-        req: &V,
-        berth: &Berth<T>,
-    ) -> Option<Cost>;
+pub trait CostPolicy<T: Copy + Ord> {
+    fn unperformed_penalty(&self, request_index: RequestIndex) -> Cost;
+    fn scheduled_cost(&self, request_index: RequestIndex, berth_index: BerthIndex) -> Option<Cost>;
+    fn wait_cost(&self, req: RequestIndex, wait: TimeDelta<T>) -> Cost;
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct WeightedFlowTime;
+#[derive(Debug, Clone, Copy)]
+pub struct WeightedFlowTime<'model, 'problem, T: Copy + Ord> {
+    model: &'model SolverModel<'problem, T>,
+}
 
-impl CostPolicy for WeightedFlowTime {
-    fn unperformed_penalty<'p, T: Copy + Ord + CheckedSub + Into<Cost>, V: RequestView<T>>(
-        &self,
-        req: &V,
-    ) -> Cost {
-        let weight = req.weight();
-        weight.saturating_mul(req.feasible_window().length().value().into())
+impl<'problem, 'model, T: Copy + Ord> WeightedFlowTime<'model, 'problem, T> {
+    #[inline]
+    pub fn new(model: &'model SolverModel<'problem, T>) -> Self {
+        Self { model }
+    }
+}
+
+impl<'problem, 'model, T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost>> CostPolicy<T>
+    for WeightedFlowTime<'model, 'problem, T>
+{
+    #[inline]
+    fn unperformed_penalty(&self, request_index: RequestIndex) -> Cost {
+        let w: Cost = self.model.weights()[request_index.get()];
+        let len: Cost = self.model.feasible_intervals()[request_index.get()]
+            .length()
+            .value()
+            .into();
+        w.saturating_mul(len)
     }
 
-    fn scheduled_cost<T: Copy + Ord + CheckedSub + Into<Cost>, V: RequestView<T>>(
-        &self,
-        req: &V,
-        berth: &Berth<T>,
-    ) -> Option<Cost> {
-        let weight = req.weight();
-        let processing_time_on = req.processing_time_for(berth.id())?;
-        Some(weight.saturating_mul(processing_time_on.value().into()))
+    #[inline]
+    fn scheduled_cost(&self, request_index: RequestIndex, berth_index: BerthIndex) -> Option<Cost> {
+        let Some(Some(dt)) = self.model.processing_time(request_index, berth_index) else {
+            return None;
+        };
+        let w: Cost = self.model.weights()[request_index.get()];
+        let dur: Cost = dt.value().into();
+        Some(w.saturating_mul(dur))
+    }
+
+    fn wait_cost(&self, r: RequestIndex, wait: TimeDelta<T>) -> Cost {
+        let w = self.model.weights()[r.get()];
+        let wcost: Cost = wait.value().into();
+        w.saturating_mul(wcost)
     }
 }

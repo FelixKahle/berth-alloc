@@ -21,7 +21,9 @@
 
 use crate::{
     search::scheduling::{err::SchedulingError, schedule::Schedule},
-    state::{chain_set::view::ChainSetView, search_state::SolverSearchState},
+    state::{
+        chain_set::view::ChainSetView, cost_policy::CostPolicy, search_state::SolverSearchState,
+    },
 };
 use berth_alloc_model::{common::FlexibleKind, prelude::SolutionRef, problem::asg::AssignmentRef};
 use num_traits::{CheckedAdd, CheckedSub, Zero};
@@ -32,29 +34,30 @@ pub trait Scheduler<T: Copy + Ord + CheckedAdd + CheckedSub + Zero> {
         std::any::type_name::<Self>()
     }
 
-    fn process_schedule<C, F>(
+    fn process_schedule<C, F, P>(
         &self,
-        solver_state: &SolverSearchState<T>,
+        solver_state: &SolverSearchState<T, P>,
         chains: &C,
         on_scheduled_item: F,
     ) -> Result<(), SchedulingError>
     where
         C: ChainSetView,
-        F: FnMut(&Schedule<T>);
+        F: FnMut(&Schedule<T>),
+        P: CostPolicy<T>;
 
     #[inline]
-    fn check_schedule<C: ChainSetView>(
+    fn check_schedule<C: ChainSetView, P: CostPolicy<T>>(
         &self,
-        solver_state: &SolverSearchState<T>,
+        solver_state: &SolverSearchState<T, P>,
         chains: &C,
     ) -> Result<(), SchedulingError> {
         self.process_schedule(solver_state, chains, |_| {})
     }
 
     #[inline]
-    fn solution<'problem, C: ChainSetView>(
+    fn solution<'problem, C: ChainSetView, P: CostPolicy<T>>(
         &self,
-        solver_state: &'problem SolverSearchState<T>,
+        solver_state: &'problem SolverSearchState<T, P>,
         chains: &C,
     ) -> Result<berth_alloc_model::prelude::SolutionRef<'problem, T>, SchedulingError>
     where

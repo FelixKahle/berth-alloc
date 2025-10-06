@@ -21,7 +21,6 @@
 
 use crate::state::{
     berth::{berthocc::BerthOccupancy, traits::BerthWrite},
-    cost_policy::CostPolicy,
     err::{MissingRequestError, SolverModelBuildError},
     index::{BerthIndex, RequestIndex},
     index_manager::SolverIndexManager,
@@ -37,15 +36,12 @@ use num_traits::{CheckedAdd, CheckedSub};
 pub struct SolverModel<'problem, T: Copy + Ord> {
     index_manager: SolverIndexManager,
     weights: Vec<Cost>,                                     // len = R
-    unperformed_penalties: Vec<Cost>,                       // len = R
     feasible_intervals: Vec<TimeInterval<T>>,               // len = R
     processing_times: Vec<Option<TimeDelta<T>>>,            // len = R * B
-    costs: Vec<Option<Cost>>,                               // len = R * B
     berths_len: usize,                                      // B
     requests_len: usize,                                    // R
     baseline_occupancies: Vec<BerthOccupancy<'problem, T>>, // len = B
-    empty_schedule_cost: Cost, // cost of empty schedule (sum of unperformed penalties)
-    problem: &'problem Problem<T>, // reference to original problem
+    problem: &'problem Problem<T>,                          // reference to original problem
 }
 
 impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T> {
@@ -84,28 +80,8 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
     }
 
     #[inline]
-    pub fn cost(&self, req: RequestIndex, berth: BerthIndex) -> Option<Cost> {
-        self.costs.get(self.flat_index(req, berth)).and_then(|c| *c)
-    }
-
-    #[inline]
-    pub fn costs(&self) -> &[Option<Cost>] {
-        &self.costs
-    }
-
-    #[inline]
-    pub fn unperformed_penalties(&self) -> &[Cost] {
-        &self.unperformed_penalties
-    }
-
-    #[inline]
     pub fn berths_len(&self) -> usize {
         self.berths_len
-    }
-
-    #[inline]
-    pub fn empty_schedule_cost(&self) -> Cost {
-        self.empty_schedule_cost
     }
 
     #[inline]
@@ -136,69 +112,42 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
         self.problem
     }
 
-    pub fn from_problem<P: CostPolicy>(
-        p: &'problem Problem<T>,
-        cost_policy: &P,
-    ) -> Result<Self, SolverModelBuildError>
+    pub fn from_problem(p: &'problem Problem<T>) -> Result<Self, SolverModelBuildError>
     where
-        T: Copy + Ord + CheckedAdd + CheckedSub + std::fmt::Debug + Into<Cost>,
+        T: Copy + Ord + CheckedAdd + CheckedSub + std::fmt::Debug,
     {
         let index_manager = SolverIndexManager::from(p);
         let berths_len = index_manager.berths_len();
         let requests_len = index_manager.requests_len();
 
         let mut weights = Vec::with_capacity(requests_len);
-        let mut unperformed_penalties = Vec::with_capacity(requests_len);
         let mut feasible_intervals = Vec::with_capacity(requests_len);
+        let mut processing_times = vec![None; requests_len * berths_len];
 
-        // R×B flattened matrices
-        let mut processing_times: Vec<Option<TimeDelta<T>>> = vec![None; requests_len * berths_len];
-        let mut costs: Vec<Option<Cost>> = vec![None; requests_len * berths_len];
-
-        // Per-request arrays + per-(request, berth) entries
         for ri_u in 0..requests_len {
             let ri = RequestIndex(ri_u);
             let rid = index_manager
                 .request_id(ri)
                 .expect("request_id must exist for 0..requests_len");
 
-            // Domain view of the request (implements RequestView<T>)
-            let req_view = p.flexible_requests().get(rid).ok_or_else(|| {
+            let rq = p.flexible_requests().get(rid).ok_or_else(|| {
                 SolverModelBuildError::MissingRequest(MissingRequestError::new(rid))
             })?;
 
-            let w = req_view.weight();
-            let win = req_view.feasible_window();
+            weights.push(rq.weight());
+            feasible_intervals.push(rq.feasible_window());
 
-            weights.push(w);
-            feasible_intervals.push(win);
-
-            // Precompute per-request unperformed penalty via policy
-            unperformed_penalties.push(cost_policy.unperformed_penalty(req_view));
-
-            // Fill per-berth processing time and static cost (if feasible)
-            for (&bid, &dt) in req_view.processing_times().iter() {
+            for (&bid, &dt) in rq.processing_times().iter() {
                 let bi = index_manager.berth_index(bid).ok_or_else(|| {
                     SolverModelBuildError::BerthNotFound(
-                        berth_alloc_model::problem::err::BerthNotFoundError::new(
-                            req_view.id(),
-                            bid,
-                        ),
+                        berth_alloc_model::problem::err::BerthNotFoundError::new(rq.id(), bid),
                     )
                 })?;
-
-                let berth_ref = p
-                    .berths()
-                    .get(bid)
-                    .expect("berth id from manager must exist in Problem");
-
                 let flat = ri_u * berths_len + bi.0;
                 processing_times[flat] = Some(dt);
-                costs[flat] = cost_policy.scheduled_cost(req_view, berth_ref);
             }
         }
 
-        // Build baseline occupancies (availability + fixed)
         let mut baseline_occupancies = Vec::with_capacity(berths_len);
         for bi_u in 0..berths_len {
             let bid = index_manager
@@ -211,7 +160,6 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
             baseline_occupancies.push(BerthOccupancy::new(berth_ref));
         }
 
-        // Seed fixed assignments into the baseline
         for a in p.iter_fixed_assignments() {
             let bid = a.berth_id();
             let bi = index_manager
@@ -223,27 +171,33 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
                 .expect("seeding fixed assignment should not fail");
         }
 
-        let unperformed_penalty_sum: Cost = unperformed_penalties.iter().sum();
-
         Ok(SolverModel {
             index_manager,
             weights,
-            unperformed_penalties,
             feasible_intervals,
             processing_times,
-            costs,
             berths_len,
             requests_len,
-            baseline_occupancies,
-            empty_schedule_cost: unperformed_penalty_sum,
             problem: p,
+            baseline_occupancies,
         })
+    }
+}
+
+impl<'problem, T> TryFrom<&'problem Problem<T>> for SolverModel<'problem, T>
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub + std::fmt::Debug,
+{
+    type Error = SolverModelBuildError;
+
+    fn try_from(p: &'problem Problem<T>) -> Result<Self, Self::Error> {
+        Self::from_problem(p)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::state::{berth::traits::BerthRead, cost_policy::WeightedFlowTime};
+    use crate::state::berth::traits::BerthRead;
 
     use super::*;
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
@@ -351,17 +305,16 @@ mod tests {
     }
 
     #[test]
-    fn test_from_problem_builds_consistent_indices_and_arrays_and_costs() {
+    fn test_try_from_problem_builds_consistent_indices_and_arrays() {
         let p = make_problem_basic();
-        let model =
-            SolverModel::from_problem(&p, &WeightedFlowTime).expect("conversion should succeed");
+        let m = SolverModel::try_from(&p).expect("conversion should succeed");
 
         // Dimensions
-        assert_eq!(model.berths_len(), 2);
-        assert_eq!(model.flexible_requests_len(), 2);
+        assert_eq!(m.berths_len(), 2);
+        assert_eq!(m.flexible_requests_len(), 2);
 
         // Index manager orders by ascending ids
-        let im = model.index_manager();
+        let im = m.index_manager();
         assert_eq!(im.berth_id(bi(0)), Some(bid(1)));
         assert_eq!(im.berth_id(bi(1)), Some(bid(2)));
         assert_eq!(im.berth_index(bid(1)), Some(bi(0)));
@@ -373,31 +326,19 @@ mod tests {
         assert_eq!(im.request_index(rid(20)), Some(ri(1)));
 
         // Weights follow sorted request-id order: rid 10 -> 3, rid 20 -> 7
-        assert_eq!(model.weights(), &[3, 7]);
+        assert_eq!(m.weights(), &[3, 7]);
 
         // Feasible windows follow the same order
-        assert_eq!(model.feasible_intervals(), &[iv(0, 100), iv(0, 100)]);
-
-        // Unperformed penalties with WeightedFlowTime = weight * window_length(=100)
-        assert_eq!(model.unperformed_penalties(), &[300, 700]);
+        assert_eq!(m.feasible_intervals(), &[iv(0, 100), iv(0, 100)]);
 
         // Processing times matrix (R x B) via accessor:
         // rid 10: [None, Some(4)] because only berth 2 is present
-        assert_eq!(model.processing_time(ri(0), bi(0)), Some(None));
-        assert_eq!(model.processing_time(ri(0), bi(1)), Some(Some(td(4))));
+        assert_eq!(m.processing_time(ri(0), bi(0)), Some(None));
+        assert_eq!(m.processing_time(ri(0), bi(1)), Some(Some(td(4))));
 
         // rid 20: [Some(5), Some(9)]
-        assert_eq!(model.processing_time(ri(1), bi(0)), Some(Some(td(5))));
-        assert_eq!(model.processing_time(ri(1), bi(1)), Some(Some(td(9))));
-
-        // Static scheduled costs with WeightedFlowTime = weight * pt
-        // r10 on b2: 3 * 4 = 12
-        assert_eq!(model.cost(ri(0), bi(0)), None);
-        assert_eq!(model.cost(ri(0), bi(1)), Some(12));
-
-        // r20 on b1: 7 * 5 = 35; on b2: 7 * 9 = 63
-        assert_eq!(model.cost(ri(1), bi(0)), Some(35));
-        assert_eq!(model.cost(ri(1), bi(1)), Some(63));
+        assert_eq!(m.processing_time(ri(1), bi(0)), Some(Some(td(5))));
+        assert_eq!(m.processing_time(ri(1), bi(1)), Some(Some(td(9))));
     }
 
     #[test]
@@ -458,8 +399,7 @@ mod tests {
 
         let p = builder.build().expect("problem should be valid");
 
-        let m =
-            SolverModel::from_problem(&p, &WeightedFlowTime).expect("model build should succeed");
+        let m = SolverModel::try_from(&p).expect("model build should succeed");
 
         // Ensure index order is (1)->bi(0), (2)->bi(1)
         let im = m.index_manager();
@@ -495,7 +435,7 @@ mod tests {
         builder.add_flexible(req_flex(1001, (0, 30), &[(1, 3)]));
 
         let p = builder.build().unwrap();
-        let m = SolverModel::from_problem(&p, &WeightedFlowTime).unwrap();
+        let m = SolverModel::try_from(&p).unwrap();
 
         // Free should be [0,5), [15,30)
         let occ = &m.baseline_occupancies[0];
@@ -526,7 +466,7 @@ mod tests {
         builder.add_flexible(req_flex(1002, (0, 100), &[(1, 5), (2, 5)]));
 
         let p = builder.build().unwrap();
-        let m = SolverModel::from_problem(&p, &WeightedFlowTime).unwrap();
+        let m = SolverModel::try_from(&p).unwrap();
 
         // Verify berth-index mapping is 1->0, 2->1 again
         let im = m.index_manager();
@@ -577,7 +517,7 @@ mod tests {
         builder.add_flexible(r10.clone());
 
         let p = builder.build().unwrap();
-        let m = SolverModel::from_problem(&p, &WeightedFlowTime).unwrap();
+        let m = SolverModel::try_from(&p).unwrap();
 
         // Dimensions
         assert_eq!(m.berths_len(), 2);
@@ -602,12 +542,6 @@ mod tests {
 
         assert_eq!(m.processing_time(ri(1), bi(0)), Some(Some(td(5)))); // r20 on b1
         assert_eq!(m.processing_time(ri(1), bi(1)), Some(Some(td(9)))); // r20 on b2
-
-        // Static costs reflect weight * pt:
-        assert_eq!(m.cost(ri(0), bi(0)), None);
-        assert_eq!(m.cost(ri(0), bi(1)), Some(12));
-        assert_eq!(m.cost(ri(1), bi(0)), Some(35));
-        assert_eq!(m.cost(ri(1), bi(1)), Some(63));
 
         // Baseline free for b1 should reflect fixed [10,15)
         let free_b1: Vec<_> = m.baseline_occupancies[0]

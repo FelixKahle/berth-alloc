@@ -31,6 +31,7 @@ use crate::{
             traits::{BerthRead, BerthWrite},
         },
         chain_set::{index::ChainIndex, view::ChainSetView},
+        cost_policy::CostPolicy,
         index::{BerthIndex, RequestIndex},
         model::SolverModel,
         search_state::SolverSearchState,
@@ -51,15 +52,16 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub + Zero + std::fmt::Debug> Scheduler
         "GreedyEarliest"
     }
 
-    fn process_schedule<C, F>(
+    fn process_schedule<C, F, P>(
         &self,
-        solver_state: &SolverSearchState<T>,
+        solver_state: &SolverSearchState<T, P>,
         chains: &C,
         mut on_scheduled_item: F,
     ) -> Result<(), SchedulingError>
     where
         C: ChainSetView,
         F: FnMut(&Schedule<T>),
+        P: CostPolicy<T>,
     {
         let model: &SolverModel<T> = solver_state.model();
         let mut modified_berths: HashMap<BerthIndex, BerthOccupancy<'_, T>> =
@@ -208,8 +210,10 @@ mod solution_tests {
     }
 
     #[inline]
-    fn make_state<'p>(model: &'p SolverModel<'p, i64>) -> SolverSearchState<'p, 'p, i64> {
-        SolverSearchState::new(model)
+    fn make_state<'p>(
+        model: &'p SolverModel<'p, i64>,
+    ) -> SolverSearchState<'p, 'p, i64, WeightedFlowTime<'p, 'p, i64>> {
+        SolverSearchState::new(model, WeightedFlowTime::new(model))
     }
 
     // Link a sequence into a given chain: head -> n0 -> n1 -> ... -> tail
@@ -239,7 +243,7 @@ mod solution_tests {
         pb.add_flexible(f1);
         let p = pb.build().unwrap();
 
-        let model = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
+        let model = SolverModel::from_problem(&p).unwrap();
         let state = make_state(&model);
 
         let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());
@@ -270,7 +274,7 @@ mod solution_tests {
         pb.add_flexible(f1);
         let p = pb.build().unwrap();
 
-        let model = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
+        let model = SolverModel::from_problem(&p).unwrap();
         let state = make_state(&model);
 
         let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());
@@ -297,7 +301,7 @@ mod solution_tests {
         pb.add_flexible(f1);
         let p = pb.build().unwrap();
 
-        let model = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
+        let model = SolverModel::from_problem(&p).unwrap();
         let state = make_state(&model);
 
         let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());
@@ -330,7 +334,7 @@ mod solution_tests {
         pb.add_flexible(fx);
         let p = pb.build().unwrap();
 
-        let model = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
+        let model = SolverModel::from_problem(&p).unwrap();
         let state = make_state(&model);
 
         let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());

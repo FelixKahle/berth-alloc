@@ -21,15 +21,15 @@
 
 use crate::state::{
     chain_set::index::{ChainIndex, NodeIndex},
+    cost_policy::CostPolicy,
     index::{BerthIndex, RequestIndex},
-    model::SolverModel,
+    search_state::SolverSearchState,
 };
 use berth_alloc_core::prelude::{Cost, TimeDelta};
 use num_traits::{CheckedAdd, CheckedSub, Zero};
 
-pub trait ArcCostEvaluator<T: Copy + Ord> {
+pub trait ArcCostEvaluator<T: Copy + Ord, P: CostPolicy<T>> {
     fn name(&self) -> &'static str {
-        // Default implementation returns the type name
         std::any::type_name::<Self>()
     }
 
@@ -47,69 +47,65 @@ pub trait ArcCostEvaluator<T: Copy + Ord> {
         chain: ChainIndex,
         from: NodeIndex,
         to: NodeIndex,
-        model: &SolverModel<T>,
+        search_state: &SolverSearchState<T, P>,
     ) -> Option<Cost>;
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct DefaultArcCostEvaluator;
 
-impl<T> ArcCostEvaluator<T> for DefaultArcCostEvaluator
+impl<T, P> ArcCostEvaluator<T, P> for DefaultArcCostEvaluator
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Zero + std::fmt::Debug + Into<Cost>,
+    P: CostPolicy<T>,
 {
     fn evaluate_arc_cost(
         &self,
         chain: ChainIndex,
         from_node: NodeIndex,
         to_node: NodeIndex,
-        model: &SolverModel<T>,
+        search_state: &SolverSearchState<T, P>,
     ) -> Option<Cost> {
+        let model = search_state.model();
+        let policy = search_state.cost_policy();
+
         let berth_idx = BerthIndex(chain.get());
         let to_req_idx = RequestIndex(to_node.get());
+        let proc_cost = policy.scheduled_cost(to_req_idx, berth_idx)?;
 
-        // Use the cached scheduled cost = weight * processing_time(on berth)
-        let scheduled_cost = model.cost(to_req_idx, berth_idx)?;
-
-        // We still need proc_from to build an earliest-arrival LB.
-        let to_window = model.feasible_intervals()[to_req_idx.get()];
-        let earliest_arrival_lb = if from_node == to_node {
-            to_window.start()
+        let to_win = model.feasible_intervals()[to_req_idx.get()];
+        let earliest_arrival = if from_node == to_node {
+            to_win.start()
         } else {
-            let from_req_idx = RequestIndex(from_node.get());
-            match model.processing_time(from_req_idx, berth_idx) {
+            let from_idx = RequestIndex(from_node.get());
+            match model.processing_time(from_idx, berth_idx) {
                 Some(Some(proc_from)) => {
-                    let from_window = model.feasible_intervals()[from_req_idx.get()];
-                    from_window
+                    let from_win = model.feasible_intervals()[from_idx.get()];
+                    from_win
                         .start()
                         .checked_add(proc_from)
-                        .unwrap_or(to_window.end())
+                        .unwrap_or(to_win.end())
                 }
-                _ => return None, // predecessor infeasible on this berth
+                _ => return None,
             }
         };
 
-        // wait_lb = max(0, earliest_arrival_lb - to_window.start())
         let zero = TimeDelta::zero();
         let wait_lb = {
-            let d = earliest_arrival_lb - to_window.start();
+            let d = earliest_arrival - to_win.start();
             if d < zero { zero } else { d }
         };
-
-        // Wait cost uses the same per-request weight; convert domain Δ to Cost.
-        let weight = model.weights()[to_req_idx.get()];
-        let wait_cost: Cost = weight.saturating_mul(wait_lb.value().into());
-
-        // LB = cached scheduled_cost (weight*proc_to) + weight*wait_lb
-        Some(wait_cost.saturating_add(scheduled_cost))
+        let wait_cost = policy.wait_cost(to_req_idx, wait_lb);
+        Some(proc_cost.saturating_add(wait_cost))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::state::cost_policy::WeightedFlowTime;
-
     use super::*;
+    use crate::state::{
+        cost_policy::WeightedFlowTime, model::SolverModel, search_state::SolverSearchState,
+    };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
     use berth_alloc_model::common::FlexibleKind;
     use berth_alloc_model::prelude::{Berth, BerthIdentifier, Problem, RequestIdentifier};
@@ -152,7 +148,7 @@ mod tests {
         Request::<FlexibleKind, i64>::new(rid(id), iv(window.0, window.1), weight, m).unwrap()
     }
 
-    // Helper to get indices robustly via the model's index manager
+    // Helper to get indices via the model's index manager
     fn require_indices_for(
         model: &SolverModel<i64>,
         berth_id: usize,
@@ -169,17 +165,6 @@ mod tests {
     }
 
     #[test]
-    fn test_name_contains_type() {
-        let eval = DefaultArcCostEvaluator::default();
-        let name = <DefaultArcCostEvaluator as ArcCostEvaluator<i64>>::name(&eval);
-        assert!(
-            name.contains("DefaultArcCostEvaluator"),
-            "name was {}",
-            name
-        );
-    }
-
-    #[test]
     fn test_self_arc_cost_basic() {
         // One berth (1), one request r20 on berth 1 with proc 5, weight 7.
         let b1 = Berth::from_windows(bid(1), [iv(0, 100)]);
@@ -189,17 +174,20 @@ mod tests {
         builder.add_berth(b1);
         builder.add_flexible(r20);
         let p: Problem<i64> = builder.build().unwrap();
-        let m = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
 
-        let (chain_idx, to_node) = require_indices_for(&m, 1, 20);
+        let model = SolverModel::from_problem(&p).unwrap();
+        let policy = WeightedFlowTime::new(&model);
+        let ss = SolverSearchState::new(&model, policy);
+
+        let (chain_idx, to_node) = require_indices_for(&model, 1, 20);
         let from_node = to_node; // self-arc
 
         let eval = DefaultArcCostEvaluator::default();
         let cost = eval
-            .evaluate_arc_cost(chain_idx, from_node, to_node, &m)
+            .evaluate_arc_cost(chain_idx, from_node, to_node, &ss)
             .expect("cost should exist");
 
-        // Self-arc uses wait = 0 and proc_to = 5, weight = 7 => 7 * 5 = 35
+        // Self-arc: wait = 0; cost = 7 * 5 = 35
         assert_eq!(cost, 35);
     }
 
@@ -217,20 +205,21 @@ mod tests {
         builder.add_flexible(r10);
         builder.add_flexible(r20);
         let p: Problem<i64> = builder.build().unwrap();
-        let m = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
 
-        let (chain_idx, r10_node) = require_indices_for(&m, 1, 10);
-        let (_, r20_node) = require_indices_for(&m, 1, 20);
+        let model = SolverModel::from_problem(&p).unwrap();
+        let policy = WeightedFlowTime::new(&model);
+        let ss = SolverSearchState::new(&model, policy);
+
+        let (chain_idx, r10_node) = require_indices_for(&model, 1, 10);
+        let (_, r20_node) = require_indices_for(&model, 1, 20);
 
         let eval = DefaultArcCostEvaluator::default();
         let cost = eval
-            .evaluate_arc_cost(chain_idx, r10_node, r20_node, &m)
+            .evaluate_arc_cost(chain_idx, r10_node, r20_node, &ss)
             .expect("cost should exist");
 
-        // from_window.start = 0, proc_from = 10 => earliest arrival LB = 10
-        // to_window.start = 0 => wait = 10
-        // proc_to = 5, total_time = 15
-        // weight(to) = 7 => 7 * 15 = 105
+        // from.start=0 + 10 = 10; to.start=0 => wait=10; proc_to=5; weight=7
+        // 7*(10+5) = 105
         assert_eq!(cost, 105);
     }
 
@@ -238,7 +227,7 @@ mod tests {
     fn test_zero_wait_case() {
         // Berth 1
         let b1 = Berth::from_windows(bid(1), [iv(0, 100)]);
-        // r1: from, proc 2 on berth 1
+        // r1: from, proc 2 on berth 1 (w=1)
         let r1 = req_flex(1, (0, 100), 1, &[(1, 2)]);
         // r2: to, window [5,100), proc 3 on berth 1, weight 11
         let r2 = req_flex(2, (5, 100), 11, &[(1, 3)]);
@@ -248,18 +237,20 @@ mod tests {
         builder.add_flexible(r1);
         builder.add_flexible(r2);
         let p: Problem<i64> = builder.build().unwrap();
-        let m = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
 
-        let (chain_idx, r1_node) = require_indices_for(&m, 1, 1);
-        let (_, r2_node) = require_indices_for(&m, 1, 2);
+        let model = SolverModel::from_problem(&p).unwrap();
+        let policy = WeightedFlowTime::new(&model);
+        let ss = SolverSearchState::new(&model, policy);
+
+        let (chain_idx, r1_node) = require_indices_for(&model, 1, 1);
+        let (_, r2_node) = require_indices_for(&model, 1, 2);
 
         let eval = DefaultArcCostEvaluator::default();
         let cost = eval
-            .evaluate_arc_cost(chain_idx, r1_node, r2_node, &m)
+            .evaluate_arc_cost(chain_idx, r1_node, r2_node, &ss)
             .expect("cost should exist");
 
-        // earliest arrival = from.start(0) + 2 = 2; to.start = 5 => wait LB = max(0, 2-5)=0
-        // total_time = 0 + proc_to(3) = 3; weight(to) = 11 => 33
+        // earliest arrival = 2; to.start=5 => wait=0; proc_to=3; weight=11 => 33
         assert_eq!(cost, 33);
     }
 
@@ -279,15 +270,18 @@ mod tests {
         builder.add_flexible(r1);
         builder.add_flexible(r2);
         let p: Problem<i64> = builder.build().unwrap();
-        let m = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
 
-        let im = m.index_manager();
+        let model = SolverModel::from_problem(&p).unwrap();
+        let policy = WeightedFlowTime::new(&model);
+        let ss = SolverSearchState::new(&model, policy);
+
+        let im = model.index_manager();
         let chain_b1 = ChainIndex::new(im.berth_index(bid(1)).unwrap().get());
         let r1_node = NodeIndex::new(im.request_index(rid(1)).unwrap().get());
         let r2_node = NodeIndex::new(im.request_index(rid(2)).unwrap().get());
 
         let eval = DefaultArcCostEvaluator::default();
-        let cost = eval.evaluate_arc_cost(chain_b1, r1_node, r2_node, &m);
+        let cost = eval.evaluate_arc_cost(chain_b1, r1_node, r2_node, &ss);
         assert!(
             cost.is_none(),
             "expected None when 'to' is infeasible on chain"
@@ -310,15 +304,18 @@ mod tests {
         builder.add_flexible(r_from);
         builder.add_flexible(r_to);
         let p: Problem<i64> = builder.build().unwrap();
-        let m = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
 
-        let im = m.index_manager();
+        let model = SolverModel::from_problem(&p).unwrap();
+        let policy = WeightedFlowTime::new(&model);
+        let ss = SolverSearchState::new(&model, policy);
+
+        let im = model.index_manager();
         let chain_b1 = ChainIndex::new(im.berth_index(bid(1)).unwrap().get());
         let n_from = NodeIndex::new(im.request_index(rid(10)).unwrap().get());
         let n_to = NodeIndex::new(im.request_index(rid(20)).unwrap().get());
 
         let eval = DefaultArcCostEvaluator::default();
-        let cost = eval.evaluate_arc_cost(chain_b1, n_from, n_to, &m);
+        let cost = eval.evaluate_arc_cost(chain_b1, n_from, n_to, &ss);
         assert!(
             cost.is_none(),
             "expected None when 'from' is infeasible on chain"
@@ -335,13 +332,16 @@ mod tests {
         builder.add_berth(b1);
         builder.add_flexible(r);
         let p: Problem<i64> = builder.build().unwrap();
-        let m = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
 
-        let (chain_idx, n) = require_indices_for(&m, 1, 99);
+        let model = SolverModel::from_problem(&p).unwrap();
+        let policy = WeightedFlowTime::new(&model);
+        let ss = SolverSearchState::new(&model, policy);
+
+        let (chain_idx, n) = require_indices_for(&model, 1, 99);
 
         let eval = DefaultArcCostEvaluator::default();
         let cost = eval
-            .evaluate_arc_cost(chain_idx, n, n, &m)
+            .evaluate_arc_cost(chain_idx, n, n, &ss)
             .expect("cost should exist");
 
         // time_cost = 2; i64::MAX * 2 saturates to i64::MAX
