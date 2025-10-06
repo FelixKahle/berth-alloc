@@ -22,7 +22,6 @@
 pub mod common;
 pub mod problem;
 pub mod solution;
-pub mod validation;
 
 pub mod prelude {
     pub use crate::common::{FixedKind, FlexibleKind, Kind};
@@ -37,5 +36,4 @@ pub mod prelude {
         req::{Request, RequestContainer, RequestIdentifier},
     };
     pub use crate::solution::{Solution, SolutionRef, SolutionView};
-    pub use crate::validation::{StateValidator, err::*};
 }

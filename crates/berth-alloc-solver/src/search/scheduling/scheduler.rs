@@ -20,37 +20,30 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    search::scheduling::err::SchedulingError,
-    state::{
-        chain_set::view::ChainSetView,
-        index::{BerthIndex, RequestIndex},
-        model::SolverModel,
-        search_state::SolverSearchState,
-    },
+    search::scheduling::{err::SchedulingError, schedule::Schedule},
+    state::{chain_set::view::ChainSetView, search_state::SolverSearchState},
 };
-use berth_alloc_core::prelude::TimeInterval;
-use berth_alloc_model::{
-    common::FlexibleKind,
-    prelude::{
-        CrossValidationError, IncompatibleBerthError, MissingFlexibleAssignmentError, SolutionRef,
-    },
-    problem::asg::AssignmentRef,
-    solution::SolutionError,
-};
+use berth_alloc_model::{common::FlexibleKind, prelude::SolutionRef, problem::asg::AssignmentRef};
 use num_traits::{CheckedAdd, CheckedSub, Zero};
 
-pub trait Scheduler<T: Copy + Ord + CheckedAdd + CheckedSub + Zero + std::fmt::Debug> {
-    fn name(&self) -> &str;
+pub trait Scheduler<T: Copy + Ord + CheckedAdd + CheckedSub + Zero> {
+    #[inline]
+    fn name(&self) -> &str {
+        std::any::type_name::<Self>()
+    }
 
     #[inline]
     fn solution<'problem, C: ChainSetView>(
         &self,
         solver_state: &'problem SolverSearchState<T>,
         chains: &C,
-    ) -> Result<berth_alloc_model::prelude::SolutionRef<'problem, T>, SolutionError> {
+    ) -> Result<berth_alloc_model::prelude::SolutionRef<'problem, T>, SchedulingError>
+    where
+        T: std::fmt::Debug + std::fmt::Display,
+    {
         let model = solver_state.model();
         let problem = model.problem();
-        let im = model.index_manager();
+        let index_manager = model.index_manager();
 
         let fixed_refs = problem
             .fixed_assignments()
@@ -64,25 +57,32 @@ pub trait Scheduler<T: Copy + Ord + CheckedAdd + CheckedSub + Zero + std::fmt::D
             AssignmentRef<'problem, 'problem, FlexibleKind, T>,
         >::new();
 
-        self.process_schedule(solver_state, chains, |req, berth, iv| {
-            let req_id = im.request_id(req).expect("valid request index");
-            let berth_id = im.berth_id(berth).expect("valid berth index");
+        self.process_schedule(solver_state, chains, |schedule| {
+            let req = schedule.request_index();
+            let berth = schedule.berth_index();
+            let iv = schedule.assigned_time_interval();
+            let req_id = index_manager
+                .request_id(req)
+                .expect("request_id map is total after preprocessing");
 
+            let berth_id = index_manager
+                .berth_id(berth)
+                .expect("berth_id map is total after preprocessing");
             let req_ref = problem
                 .flexible_requests()
                 .get(req_id)
-                .expect("flex request present");
-            let berth_ref = problem.berths().get(berth_id).expect("berth present");
+                .expect("flexible request must exist");
+
+            let berth_ref = problem.berths().get(berth_id).expect("berth must exist");
 
             let start = iv.start();
 
             let aref = AssignmentRef::<FlexibleKind, T>::new_flexible(req_ref, berth_ref, start)
-                .expect("greedy placement must be feasible for assignment ref");
+                .expect("greedy placement must construct a feasible AssignmentRef");
 
             flex_refs.insert(aref);
-        })
-        .map_err(|e| map_sched_to_solution(e, model))?;
-        SolutionRef::new(fixed_refs, flex_refs, problem)
+        })?;
+        Ok(SolutionRef::new(fixed_refs, flex_refs))
     }
 
     #[inline]
@@ -91,7 +91,7 @@ pub trait Scheduler<T: Copy + Ord + CheckedAdd + CheckedSub + Zero + std::fmt::D
         solver_state: &SolverSearchState<T>,
         chains: &C,
     ) -> Result<(), SchedulingError> {
-        self.process_schedule(solver_state, chains, |_, _, _| {})
+        self.process_schedule(solver_state, chains, |_| {})
     }
 
     fn process_schedule<C, F>(
@@ -102,32 +102,5 @@ pub trait Scheduler<T: Copy + Ord + CheckedAdd + CheckedSub + Zero + std::fmt::D
     ) -> Result<(), SchedulingError>
     where
         C: ChainSetView,
-        F: FnMut(RequestIndex, BerthIndex, TimeInterval<T>);
-}
-
-fn map_sched_to_solution<T: Copy + Ord + CheckedAdd + CheckedSub>(
-    err: SchedulingError,
-    model: &SolverModel<T>,
-) -> SolutionError {
-    let im = model.index_manager();
-    match err {
-        SchedulingError::NotAllowedOnBerth(e) => {
-            let rid = im.request_id(e.request()).expect("map rid");
-            let bid = im.berth_id(e.berth()).expect("map bid");
-            SolutionError::CrossValidation(CrossValidationError::IncompatibleBerth(
-                IncompatibleBerthError::new(rid, bid),
-            ))
-        }
-        SchedulingError::FeasiblyWindowViolation(e) => {
-            let rid = im.request_id(e.request()).expect("map rid");
-            SolutionError::MissingFlexibleAssignment(MissingFlexibleAssignmentError::new(rid))
-        }
-        SchedulingError::Overlap(e) => {
-            let a = im.request_id(e.right()).expect("map a");
-            let b = im.request_id(e.left()).expect("map b");
-            SolutionError::CrossValidation(CrossValidationError::Overlap(
-                berth_alloc_model::problem::err::AssignmentOverlapError::new(a, b),
-            ))
-        }
-    }
+        F: FnMut(&Schedule<T>);
 }

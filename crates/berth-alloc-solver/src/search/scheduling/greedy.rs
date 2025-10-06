@@ -22,6 +22,7 @@
 use crate::{
     search::scheduling::{
         err::{FeasiblyWindowViolationError, NotAllowedOnBerthError, SchedulingError},
+        schedule::Schedule,
         scheduler::Scheduler,
     },
     state::{
@@ -58,7 +59,7 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub + Zero + std::fmt::Debug> Scheduler
     ) -> Result<(), SchedulingError>
     where
         C: ChainSetView,
-        F: FnMut(RequestIndex, BerthIndex, TimeInterval<T>),
+        F: FnMut(&Schedule<T>),
     {
         let model: &SolverModel<T> = solver_state.model();
         let mut modified_berths: HashMap<BerthIndex, BerthOccupancy<'_, T>> =
@@ -126,7 +127,7 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub + Zero + std::fmt::Debug> Scheduler
                 berth_occupancy.occupy(service_interval).unwrap();
 
                 // Call the callback with the scheduled item.
-                on_scheduled_item(request_index, berth_index, service_interval);
+                on_scheduled_item(&Schedule::new(request_index, berth_index, service_interval));
 
                 prev_end_time = Some(end_time);
             }
@@ -151,7 +152,6 @@ mod solution_tests {
     };
     use berth_alloc_model::problem::builder::ProblemBuilder;
     use berth_alloc_model::problem::req::Request;
-    use berth_alloc_model::solution::SolutionError;
     use std::collections::BTreeMap;
 
     // ---------- small helpers ----------
@@ -273,14 +273,7 @@ mod solution_tests {
         let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());
         link_sequence(&mut cs, ChainIndex(0), &[0, 1]);
 
-        let err = GreedyEarliest.solution(&state, &cs).unwrap_err();
-        match err {
-            SolutionError::MissingFlexibleAssignment(e) => {
-                // The second request violates its window → mapped to "missing flexible"
-                assert_eq!(e.request_id(), rid(101));
-            }
-            other => panic!("expected MissingFlexibleAssignment, got {other:?}"),
-        }
+        assert!(GreedyEarliest.solution(&state, &cs).is_err());
     }
 
     #[test]

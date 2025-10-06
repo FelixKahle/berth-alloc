@@ -21,4 +21,5 @@
 
 pub mod err;
 pub mod greedy;
+pub mod schedule;
 pub mod scheduler;

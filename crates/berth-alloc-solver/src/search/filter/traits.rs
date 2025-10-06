@@ -1,0 +1,93 @@
+// Copyright (c) 2025 Felix Kahle.
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+//
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+use crate::state::{chain_set::delta::ChainSetDelta, search_state::SolverSearchState};
+
+pub trait FeasibilityFilter<'model, 'problem, T>
+where
+    T: Copy + Ord,
+{
+    #[inline]
+    fn name(&self) -> &str {
+        std::any::type_name::<Self>()
+    }
+
+    #[inline]
+    fn complexity(&self) -> usize {
+        1
+    }
+
+    fn is_feasible(
+        &self,
+        delta: &ChainSetDelta,
+        search_state: &SolverSearchState<'model, 'problem, T>,
+    ) -> bool;
+}
+
+impl<'model, 'problem, T> PartialEq for dyn FeasibilityFilter<'model, 'problem, T>
+where
+    T: Copy + Ord,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.complexity() == other.complexity()
+    }
+}
+
+impl<'model, 'problem, T> Eq for dyn FeasibilityFilter<'model, 'problem, T> where T: Copy + Ord {}
+
+impl<'model, 'problem, T> PartialOrd for dyn FeasibilityFilter<'model, 'problem, T>
+where
+    T: Copy + Ord,
+{
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<'model, 'problem, T> Ord for dyn FeasibilityFilter<'model, 'problem, T>
+where
+    T: Copy + Ord,
+{
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.complexity().cmp(&other.complexity())
+    }
+}
+
+impl<'model, 'problem, T> std::fmt::Debug for dyn FeasibilityFilter<'model, 'problem, T>
+where
+    T: Copy + Ord,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Filter")
+            .field("name", &self.name())
+            .field("complexity", &self.complexity())
+            .finish()
+    }
+}
+
+impl<'model, 'problem, T> std::fmt::Display for dyn FeasibilityFilter<'model, 'problem, T>
+where
+    T: Copy + Ord,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (complexity: {})", self.name(), self.complexity())
+    }
+}
