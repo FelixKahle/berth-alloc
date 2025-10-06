@@ -38,6 +38,13 @@ use num_traits::{CheckedAdd, CheckedSub};
 #[derive(Debug, Clone, Default)]
 pub struct FeasibleBerthFilter;
 
+impl FeasibleBerthFilter {
+    #[inline]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
 impl<'model, 'problem, T, P> FeasibilityFilter<'model, 'problem, T, P> for FeasibleBerthFilter
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
