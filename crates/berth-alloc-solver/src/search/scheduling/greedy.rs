@@ -131,11 +131,10 @@ where
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if self.current_node.is_none() {
-                if !self.start_next_chain() {
+            if self.current_node.is_none()
+                && !self.start_next_chain() {
                     return None;
                 }
-            }
 
             let node = self.current_node.unwrap();
             let end = self.end_sentinel.unwrap();
