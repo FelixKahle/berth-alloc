@@ -21,6 +21,7 @@
 
 pub mod berth;
 pub mod chain_set;
+pub mod cost_policy;
 pub mod err;
 pub mod index;
 pub mod index_manager;

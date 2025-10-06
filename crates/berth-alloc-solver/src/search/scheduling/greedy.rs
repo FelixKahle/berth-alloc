@@ -139,11 +139,14 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub + Zero + std::fmt::Debug> Scheduler
 #[cfg(test)]
 mod solution_tests {
     use super::*;
-    use crate::state::chain_set::{
-        base::ChainSet,
-        delta_builder::ChainSetDeltaBuilder,
-        index::{ChainIndex, NodeIndex},
-        view::ChainSetView,
+    use crate::state::{
+        chain_set::{
+            base::ChainSet,
+            delta_builder::ChainSetDeltaBuilder,
+            index::{ChainIndex, NodeIndex},
+            view::ChainSetView,
+        },
+        cost_policy::WeightedFlowTime,
     };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
     use berth_alloc_model::common::{FixedKind, FlexibleKind};
@@ -236,7 +239,7 @@ mod solution_tests {
         pb.add_flexible(f1);
         let p = pb.build().unwrap();
 
-        let model = SolverModel::try_from(&p).unwrap();
+        let model = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
         let state = make_state(&model);
 
         let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());
@@ -267,7 +270,7 @@ mod solution_tests {
         pb.add_flexible(f1);
         let p = pb.build().unwrap();
 
-        let model = SolverModel::try_from(&p).unwrap();
+        let model = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
         let state = make_state(&model);
 
         let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());
@@ -294,7 +297,7 @@ mod solution_tests {
         pb.add_flexible(f1);
         let p = pb.build().unwrap();
 
-        let model = SolverModel::try_from(&p).unwrap();
+        let model = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
         let state = make_state(&model);
 
         let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());
@@ -327,7 +330,7 @@ mod solution_tests {
         pb.add_flexible(fx);
         let p = pb.build().unwrap();
 
-        let model = SolverModel::try_from(&p).unwrap();
+        let model = SolverModel::from_problem(&p, &WeightedFlowTime::default()).unwrap();
         let state = make_state(&model);
 
         let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());

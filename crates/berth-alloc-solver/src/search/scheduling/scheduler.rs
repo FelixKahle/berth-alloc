@@ -32,6 +32,25 @@ pub trait Scheduler<T: Copy + Ord + CheckedAdd + CheckedSub + Zero> {
         std::any::type_name::<Self>()
     }
 
+    fn process_schedule<C, F>(
+        &self,
+        solver_state: &SolverSearchState<T>,
+        chains: &C,
+        on_scheduled_item: F,
+    ) -> Result<(), SchedulingError>
+    where
+        C: ChainSetView,
+        F: FnMut(&Schedule<T>);
+
+    #[inline]
+    fn check_schedule<C: ChainSetView>(
+        &self,
+        solver_state: &SolverSearchState<T>,
+        chains: &C,
+    ) -> Result<(), SchedulingError> {
+        self.process_schedule(solver_state, chains, |_| {})
+    }
+
     #[inline]
     fn solution<'problem, C: ChainSetView>(
         &self,
@@ -84,23 +103,4 @@ pub trait Scheduler<T: Copy + Ord + CheckedAdd + CheckedSub + Zero> {
         })?;
         Ok(SolutionRef::new(fixed_refs, flex_refs))
     }
-
-    #[inline]
-    fn check_schedule<C: ChainSetView>(
-        &self,
-        solver_state: &SolverSearchState<T>,
-        chains: &C,
-    ) -> Result<(), SchedulingError> {
-        self.process_schedule(solver_state, chains, |_| {})
-    }
-
-    fn process_schedule<C, F>(
-        &self,
-        solver_state: &SolverSearchState<T>,
-        chains: &C,
-        on_scheduled_item: F,
-    ) -> Result<(), SchedulingError>
-    where
-        C: ChainSetView,
-        F: FnMut(&Schedule<T>);
 }
