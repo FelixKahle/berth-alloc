@@ -25,7 +25,7 @@ use crate::{
     state::{
         chain_set::{
             index::NodeIndex,
-            view::{ChainRef, ChainSetView},
+            view::{ChainRef, ChainSetView, ChainViewDyn},
         },
         model::SolverModel,
     },
@@ -85,10 +85,10 @@ pub trait Propagator<T: Copy + Ord + CheckedAdd> {
         std::any::type_name::<Self>()
     }
 
-    fn propagate<'a, C: ChainSetView>(
+    fn propagate(
         &self,
-        model: &SolverModel<'a, T>,
-        chain: ChainRef<'_, C>,
-        interval_vars: &mut [IntervalVar<T>], // aligned by RequestIndex = node.get()
+        solver_model: &SolverModel<'_, T>,
+        chain: &dyn ChainViewDyn,
+        iv: &mut [IntervalVar<T>],
     ) -> Result<(), SchedulingError>;
 }

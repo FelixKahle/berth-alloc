@@ -21,5 +21,6 @@
 
 pub mod err;
 pub mod greedy;
+pub mod pipeline;
 pub mod tightener;
 pub mod traits;

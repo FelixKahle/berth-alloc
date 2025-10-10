@@ -18,21 +18,3 @@
 // LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-use berth_alloc_core::prelude::TimePoint;
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct IntervalVar<T> {
-    pub start_time_lower_bound: TimePoint<T>,
-    pub start_time_upper_bound: TimePoint<T>,
-}
-
-impl<T> IntervalVar<T> {
-    #[inline]
-    pub fn new(start_time_lower_bound: TimePoint<T>, start_time_upper_bound: TimePoint<T>) -> Self {
-        Self {
-            start_time_lower_bound,
-            start_time_upper_bound,
-        }
-    }
-}

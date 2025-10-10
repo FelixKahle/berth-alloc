@@ -27,19 +27,22 @@ use crate::{
         search_state::SolverSearchState,
     },
 };
+use berth_alloc_core::prelude::Cost;
 use num_traits::{CheckedAdd, CheckedSub, Zero};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FeasibleScheduleFilter<
-    T: Copy + Ord + CheckedAdd + CheckedSub + Zero,
-    S: CalendarScheduler<T>,
+    T: Copy + Ord + CheckedAdd + CheckedSub + Zero + Into<Cost> + Send + Sync,
+    S: CalendarScheduler<T> + Send + Sync,
 > {
     scheduler: S,
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T: Copy + Ord + CheckedAdd + CheckedSub + Zero, S: CalendarScheduler<T>>
-    FeasibleScheduleFilter<T, S>
+impl<T, S> FeasibleScheduleFilter<T, S>
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub + Zero + Into<Cost> + Send + Sync,
+    S: CalendarScheduler<T> + Send + Sync,
 {
     #[inline]
     pub fn new(scheduler: S) -> Self {
@@ -52,8 +55,8 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub + Zero, S: CalendarScheduler<T>>
 
 impl<'model, 'problem, T, S> FeasibilityFilter<'model, 'problem, T> for FeasibleScheduleFilter<T, S>
 where
-    T: Copy + Ord + CheckedAdd + CheckedSub + Zero,
-    S: CalendarScheduler<T>,
+    T: Copy + Ord + CheckedAdd + CheckedSub + Zero + Into<Cost> + Send + Sync,
+    S: CalendarScheduler<T> + Send + Sync,
 {
     #[inline]
     fn complexity(&self) -> usize {
@@ -200,14 +203,12 @@ mod tests {
         delta
     }
 
-    // ---------- tests ----------
-
     #[test]
     fn empty_delta_is_trivially_feasible() {
         // No affected chains => should be feasible
         let p = build_problem(&[vec![(0, 100)]], &[(0, 100)], &[vec![Some(5)]]);
         let m = SolverModel::from_problem(&p).unwrap();
-        let ss = SolverSearchState::new(&m);
+        let ss = SolverSearchState::new_unassigned(&m, 0, 0);
 
         let filter = FeasibleScheduleFilter::<i64, GreedyCalendar>::new(GreedyCalendar);
         let delta = ChainSetDelta::new();
@@ -220,7 +221,7 @@ mod tests {
         // One berth and one feasible request
         let p = build_problem(&[vec![(0, 100)]], &[(0, 100)], &[vec![Some(5)]]);
         let m = SolverModel::from_problem(&p).unwrap();
-        let ss = SolverSearchState::new(&m);
+        let ss = SolverSearchState::new_unassigned(&m, 0, 0);
 
         let base = ss.chain_set();
         let delta = delta_link_chain(base, ChainIndex(0), &[0]);
@@ -241,7 +242,7 @@ mod tests {
         // Force infeasibility via lb > ub on the only request
         let p = build_problem(&[vec![(0, 100)]], &[(0, 100)], &[vec![Some(10)]]);
         let m = SolverModel::from_problem(&p).unwrap();
-        let mut ss = SolverSearchState::new(&m);
+        let mut ss = SolverSearchState::new_unassigned(&m, 0, 0);
 
         // lb > ub makes it impossible regardless of calendar
         let ivars = ss.interval_vars_mut();
@@ -264,7 +265,7 @@ mod tests {
             &[vec![None, Some(7)]],
         );
         let m = SolverModel::from_problem(&p).unwrap();
-        let ss = SolverSearchState::new(&m);
+        let ss = SolverSearchState::new_unassigned(&m, 0, 0);
 
         let base = ss.chain_set();
         let delta = delta_link_chain(base, ChainIndex(0), &[0]);
@@ -278,7 +279,7 @@ mod tests {
         // free: [0,5), [8,20); req window [0,30), PT=4; LB=3 ⇒ [3,5) too short -> next segment at 8
         let p = build_problem(&[vec![(0, 5), (8, 20)]], &[(0, 30)], &[vec![Some(4)]]);
         let m = SolverModel::from_problem(&p).unwrap();
-        let mut ss = SolverSearchState::new(&m);
+        let mut ss = SolverSearchState::new_unassigned(&m, 0, 0);
 
         // Sanity check calendar
         let cal = m.calendar_for_berth(bi(0)).unwrap();
@@ -308,7 +309,7 @@ mod tests {
             ],
         );
         let m = SolverModel::from_problem(&p).unwrap();
-        let mut ss = SolverSearchState::new(&m);
+        let mut ss = SolverSearchState::new_unassigned(&m, 0, 0);
 
         // Make request 1 infeasible via lb > ub
         let ivars = ss.interval_vars_mut();
@@ -340,7 +341,7 @@ mod tests {
         // Mark a chain as affected but keep it empty (no overlay edges); should be treated as no-op and true.
         let p = build_problem(&[vec![(0, 100)]], &[], &[]);
         let m = SolverModel::from_problem(&p).unwrap();
-        let ss = SolverSearchState::new(&m);
+        let ss = SolverSearchState::new_unassigned(&m, 0, 0);
 
         let mut delta = ChainSetDelta::new();
         delta.mark_chain(ChainIndex(0)); // affected, but earliest_impacted_on_chain will return None

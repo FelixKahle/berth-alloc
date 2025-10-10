@@ -29,7 +29,7 @@ use crate::{
 use berth_alloc_core::prelude::{Cost, TimePoint};
 use num_traits::{CheckedAdd, CheckedSub};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WeightedTurnaroundTimeObjective;
 
 impl<T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost>> Objective<T>

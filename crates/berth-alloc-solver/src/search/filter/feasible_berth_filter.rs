@@ -29,7 +29,8 @@ use crate::{
         search_state::SolverSearchState,
     },
 };
-use num_traits::{CheckedAdd, CheckedSub};
+use berth_alloc_core::prelude::Cost;
+use num_traits::{CheckedAdd, CheckedSub, Zero};
 
 #[derive(Debug, Clone, Default)]
 pub struct FeasibleBerthFilter;
@@ -43,7 +44,7 @@ impl FeasibleBerthFilter {
 
 impl<'model, 'problem, T> FeasibilityFilter<'model, 'problem, T> for FeasibleBerthFilter
 where
-    T: Copy + Ord + CheckedAdd + CheckedSub,
+    T: Copy + Ord + CheckedAdd + CheckedSub + Zero + Into<Cost> + Send + Sync,
 {
     #[inline]
     fn complexity(&self) -> usize {

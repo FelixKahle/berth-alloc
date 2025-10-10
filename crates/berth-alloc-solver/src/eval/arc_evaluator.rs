@@ -34,8 +34,20 @@ use crate::{
     },
 };
 
+pub trait ArcEvaluator<T: Copy + Ord> {
+    fn evaluate<V>(
+        &self,
+        model: &SolverModel<T>,
+        chain: ChainRef<'_, V>,
+        from: NodeIndex,
+        to: NodeIndex,
+    ) -> Option<Cost>
+    where
+        V: ChainSetView;
+}
+
 #[derive(Debug, Clone)]
-pub struct ArcEvaluator<'objective, T, O>
+pub struct ObjectiveArcEvaluator<'objective, T, O>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
     O: Objective<T>,
@@ -44,7 +56,7 @@ where
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<'objective, T, O> ArcEvaluator<'objective, T, O>
+impl<'objective, T, O> ObjectiveArcEvaluator<'objective, T, O>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
     O: Objective<T>,
@@ -62,12 +74,12 @@ where
     }
 }
 
-impl<'objective, T, O> ArcEvaluator<'objective, T, O>
+impl<'objective, T, O> ArcEvaluator<T> for ObjectiveArcEvaluator<'objective, T, O>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
     O: Objective<T>,
 {
-    pub fn evaluate<V>(
+    fn evaluate<V>(
         &self,
         model: &SolverModel<T>,
         chain: ChainRef<'_, V>,
@@ -223,12 +235,12 @@ mod tests {
         cs.apply_delta(delta);
     }
 
-    fn make_eval<'a, T, O>(objective: &'a O) -> ArcEvaluator<'a, T, O>
+    fn make_eval<'a, T, O>(objective: &'a O) -> ObjectiveArcEvaluator<'a, T, O>
     where
         T: Copy + Ord + CheckedAdd + CheckedSub,
         O: Objective<T>,
     {
-        ArcEvaluator {
+        ObjectiveArcEvaluator {
             objective,
             _phantom: std::marker::PhantomData,
         }

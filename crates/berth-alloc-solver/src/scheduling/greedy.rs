@@ -18,9 +18,6 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-// Copyright (c) 2025 Felix Kahle.
-// MIT License — see header in repository root.
-
 use crate::{
     core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
     scheduling::{
@@ -55,7 +52,7 @@ use num_traits::{CheckedAdd, CheckedSub};
 /// - **Safe Traversal**: Safely handles and skips sentinel nodes (placeholders at the
 ///   start and end of a chain) and includes a defensive loop guard to prevent infinite
 ///   loops in case of malformed chain structures (e.g., cycles).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GreedyCalendar;
 
 impl<T> CalendarScheduler<T> for GreedyCalendar

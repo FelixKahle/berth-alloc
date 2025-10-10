@@ -19,20 +19,22 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use berth_alloc_core::prelude::TimePoint;
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct IntervalVar<T> {
-    pub start_time_lower_bound: TimePoint<T>,
-    pub start_time_upper_bound: TimePoint<T>,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VarPatch<V> {
+    patch: V,
+    index: usize,
 }
 
-impl<T> IntervalVar<T> {
-    #[inline]
-    pub fn new(start_time_lower_bound: TimePoint<T>, start_time_upper_bound: TimePoint<T>) -> Self {
-        Self {
-            start_time_lower_bound,
-            start_time_upper_bound,
-        }
+impl<V> VarPatch<V> {
+    pub fn new(patch: V, index: usize) -> Self {
+        Self { patch, index }
+    }
+
+    pub fn patch(&self) -> &V {
+        &self.patch
+    }
+
+    pub fn index(&self) -> usize {
+        self.index
     }
 }

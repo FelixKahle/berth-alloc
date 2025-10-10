@@ -21,4 +21,5 @@
 
 pub mod arc_evaluator;
 pub mod objective;
+pub mod search;
 pub mod wtt;

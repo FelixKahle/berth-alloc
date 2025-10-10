@@ -20,10 +20,11 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::state::{chain_set::delta::ChainSetDelta, search_state::SolverSearchState};
+use num_traits::{CheckedAdd, CheckedSub};
 
-pub trait FeasibilityFilter<'model, 'problem, T>
+pub trait FeasibilityFilter<'model, 'problem, T>: Send + Sync
 where
-    T: Copy + Ord,
+    T: Copy + Ord + CheckedAdd + CheckedSub,
 {
     #[inline]
     fn name(&self) -> &str {
@@ -41,18 +42,21 @@ where
 
 impl<'model, 'problem, T> PartialEq for dyn FeasibilityFilter<'model, 'problem, T>
 where
-    T: Copy + Ord,
+    T: Copy + Ord + CheckedAdd + CheckedSub,
 {
     fn eq(&self, other: &Self) -> bool {
         self.complexity() == other.complexity()
     }
 }
 
-impl<'model, 'problem, T> Eq for dyn FeasibilityFilter<'model, 'problem, T> where T: Copy + Ord {}
+impl<'model, 'problem, T> Eq for dyn FeasibilityFilter<'model, 'problem, T> where
+    T: Copy + Ord + CheckedAdd + CheckedSub
+{
+}
 
 impl<'model, 'problem, T> PartialOrd for dyn FeasibilityFilter<'model, 'problem, T>
 where
-    T: Copy + Ord,
+    T: Copy + Ord + CheckedAdd + CheckedSub,
 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -61,7 +65,7 @@ where
 
 impl<'model, 'problem, T> Ord for dyn FeasibilityFilter<'model, 'problem, T>
 where
-    T: Copy + Ord,
+    T: Copy + Ord + CheckedAdd + CheckedSub,
 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.complexity().cmp(&other.complexity())
@@ -70,7 +74,7 @@ where
 
 impl<'model, 'problem, T> std::fmt::Debug for dyn FeasibilityFilter<'model, 'problem, T>
 where
-    T: Copy + Ord,
+    T: Copy + Ord + CheckedAdd + CheckedSub,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Filter")
@@ -82,7 +86,7 @@ where
 
 impl<'model, 'problem, T> std::fmt::Display for dyn FeasibilityFilter<'model, 'problem, T>
 where
-    T: Copy + Ord,
+    T: Copy + Ord + CheckedAdd + CheckedSub,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} (complexity: {})", self.name(), self.complexity())

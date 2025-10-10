@@ -20,6 +20,7 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 pub mod core;
+pub mod engine;
 pub mod eval;
 pub mod scheduling;
 pub mod search;

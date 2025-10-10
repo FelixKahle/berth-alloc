@@ -19,20 +19,24 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use berth_alloc_core::prelude::TimePoint;
+use crate::{
+    engine::traits::Opening,
+    state::{model::SolverModel, search_state::SolverSearchState},
+};
+use berth_alloc_core::prelude::Cost;
+use num_traits::{CheckedAdd, CheckedSub, Zero};
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct IntervalVar<T> {
-    pub start_time_lower_bound: TimePoint<T>,
-    pub start_time_upper_bound: TimePoint<T>,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EmptyOpening;
 
-impl<T> IntervalVar<T> {
-    #[inline]
-    pub fn new(start_time_lower_bound: TimePoint<T>, start_time_upper_bound: TimePoint<T>) -> Self {
-        Self {
-            start_time_lower_bound,
-            start_time_upper_bound,
-        }
+impl<'model, 'problem, T> Opening<'model, 'problem, T> for EmptyOpening
+where
+    T: Copy + Ord + Send + Sync + Zero + Into<Cost> + CheckedAdd + CheckedSub,
+{
+    fn build(
+        &self,
+        _model: &'model SolverModel<'problem, T>,
+    ) -> SolverSearchState<'model, 'problem, T> {
+        todo!()
     }
 }

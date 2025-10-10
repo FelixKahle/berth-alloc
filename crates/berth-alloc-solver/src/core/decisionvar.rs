@@ -22,7 +22,7 @@
 use crate::state::index::BerthIndex;
 use berth_alloc_core::prelude::TimePoint;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Decision<T> {
     pub berth_index: BerthIndex,
     pub start_time: TimePoint<T>,
@@ -38,7 +38,7 @@ impl<T> Decision<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum DecisionVar<T> {
     Unassigned,
     Assigned(Decision<T>),
