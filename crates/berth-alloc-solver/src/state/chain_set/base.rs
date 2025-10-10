@@ -257,6 +257,43 @@ impl ChainSetView for ChainSet {
     }
 
     #[inline]
+    fn chain_of_node(&self, node: NodeIndex) -> Option<ChainIndex> {
+        if self.is_sentinel_node(node) || node.get() >= self.num_nodes {
+            return None;
+        }
+        let mut cur = node;
+        let mut steps_left = self.num_total_nodes();
+        while steps_left > 0 {
+            if self.is_head_node(cur) {
+                let cid = (cur.get() - self.num_nodes) >> 1;
+                return Some(ChainIndex(cid));
+            }
+            cur = self.prev[cur.get()];
+            steps_left -= 1;
+        }
+        None
+    }
+
+    #[inline]
+    fn position_in_chain(&self, node: NodeIndex) -> Option<usize> {
+        if self.is_sentinel_node(node) || node.get() >= self.num_nodes {
+            return None;
+        }
+        let mut cur = node;
+        let mut pos = 0usize;
+        let mut steps_left = self.num_total_nodes();
+        while steps_left > 0 {
+            if self.is_head_node(cur) {
+                return Some(pos);
+            }
+            cur = self.prev[cur.get()];
+            pos += 1;
+            steps_left -= 1;
+        }
+        None
+    }
+
+    #[inline]
     fn iter_chain(&self, chain: ChainIndex) -> Self::NodeIter<'_> {
         debug_assert!(chain.get() < self.num_chains());
 
@@ -740,5 +777,109 @@ mod tests {
         let after: Vec<NodeIndex> = collect_chain(&cs, ChainIndex(0));
         assert_eq!(before, after);
         assert!(cs.is_chain_empty(ChainIndex(0)));
+    }
+
+    #[test]
+    fn test_chain_of_node_and_position_in_chain_basic() {
+        let mut cs = ChainSet::new(8, 2);
+
+        // Chain 0: [2, 4, 1]
+        link_sequence(
+            &mut cs,
+            ChainIndex(0),
+            &[NodeIndex(2), NodeIndex(4), NodeIndex(1)],
+        );
+
+        // Chain 1: [5]
+        link_sequence(&mut cs, ChainIndex(1), &[NodeIndex(5)]);
+
+        // On-chain nodes report correct chain and position (position is 1-based from head)
+        assert_eq!(cs.chain_of_node(NodeIndex(2)), Some(ChainIndex(0)));
+        assert_eq!(cs.position_in_chain(NodeIndex(2)), Some(1));
+
+        assert_eq!(cs.chain_of_node(NodeIndex(4)), Some(ChainIndex(0)));
+        assert_eq!(cs.position_in_chain(NodeIndex(4)), Some(2));
+
+        assert_eq!(cs.chain_of_node(NodeIndex(1)), Some(ChainIndex(0)));
+        assert_eq!(cs.position_in_chain(NodeIndex(1)), Some(3));
+
+        assert_eq!(cs.chain_of_node(NodeIndex(5)), Some(ChainIndex(1)));
+        assert_eq!(cs.position_in_chain(NodeIndex(5)), Some(1));
+
+        // Unperformed nodes: no chain, no position
+        for &n in &[NodeIndex(0), NodeIndex(3), NodeIndex(6), NodeIndex(7)] {
+            assert_eq!(
+                cs.chain_of_node(n),
+                None,
+                "node {:?} should have no chain",
+                n
+            );
+            assert_eq!(
+                cs.position_in_chain(n),
+                None,
+                "node {:?} should have no position",
+                n
+            );
+        }
+
+        // Sentinel nodes must return None
+        let s0 = cs.start_of_chain(ChainIndex(0));
+        let e0 = cs.end_of_chain(ChainIndex(0));
+        let s1 = cs.start_of_chain(ChainIndex(1));
+        let e1 = cs.end_of_chain(ChainIndex(1));
+        for &x in &[s0, e0, s1, e1] {
+            assert!(cs.is_sentinel_node(x));
+            assert_eq!(cs.chain_of_node(x), None);
+            assert_eq!(cs.position_in_chain(x), None);
+        }
+
+        // Out-of-bounds nodes must return None as well
+        let last_end = cs.end_of_chain(ChainIndex(cs.num_chains() - 1));
+        let oob = NodeIndex(last_end.get() + 1);
+        assert_eq!(cs.chain_of_node(oob), None);
+        assert_eq!(cs.position_in_chain(oob), None);
+    }
+
+    #[test]
+    fn test_chain_of_node_and_position_in_chain_multiple_nodes() {
+        let mut cs = ChainSet::new(10, 1);
+
+        // Chain 0: [0, 3, 9, 4]
+        link_sequence(
+            &mut cs,
+            ChainIndex(0),
+            &[NodeIndex(0), NodeIndex(3), NodeIndex(9), NodeIndex(4)],
+        );
+
+        // Positions should be 1, 2, 3, 4 respectively
+        let expected = &[
+            (NodeIndex(0), 1usize),
+            (NodeIndex(3), 2usize),
+            (NodeIndex(9), 3usize),
+            (NodeIndex(4), 4usize),
+        ];
+        for &(n, pos) in expected {
+            assert_eq!(cs.chain_of_node(n), Some(ChainIndex(0)));
+            assert_eq!(
+                cs.position_in_chain(n),
+                Some(pos),
+                "node {:?} should be at position {}",
+                n,
+                pos
+            );
+        }
+
+        // Nodes not present remain None
+        for &n in &[
+            NodeIndex(1),
+            NodeIndex(2),
+            NodeIndex(5),
+            NodeIndex(6),
+            NodeIndex(7),
+            NodeIndex(8),
+        ] {
+            assert_eq!(cs.chain_of_node(n), None);
+            assert_eq!(cs.position_in_chain(n), None);
+        }
     }
 }

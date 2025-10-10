@@ -70,8 +70,8 @@ impl<'model, 'problem, T: Copy + Ord> FilterStack<'model, 'problem, T> {
         F: FeasibilityFilter<'model, 'problem, T> + 'static,
     {
         self.filters.push(Box::new(filter));
-        self.filters
-            .sort_by_key(|f| std::cmp::Reverse(f.complexity()));
+        // Sort filters. Lower complexity filters should be evaluated first.
+        self.filters.sort_by_key(|f| f.complexity());
     }
 }
 
@@ -93,5 +93,9 @@ impl<'model, 'problem, T: Copy + Ord> FeasibilityFilter<'model, 'problem, T>
             }
         }
         true
+    }
+
+    fn complexity(&self) -> usize {
+        1
     }
 }

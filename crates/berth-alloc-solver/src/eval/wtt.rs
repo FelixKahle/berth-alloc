@@ -19,55 +19,43 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::state::index::{BerthIndex, RequestIndex};
-use berth_alloc_core::prelude::TimeInterval;
+use crate::{
+    eval::objective::Objective,
+    state::{
+        index::{BerthIndex, RequestIndex},
+        model::SolverModel,
+    },
+};
+use berth_alloc_core::prelude::{Cost, TimePoint};
+use num_traits::{CheckedAdd, CheckedSub};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Schedule<T> {
-    request_index: RequestIndex,
-    berth_index: BerthIndex,
-    assigned_time_interval: TimeInterval<T>,
-}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightedTurnaroundTimeObjective;
 
-impl<T> Schedule<T> {
-    #[inline]
-    pub fn new(
+impl<T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost>> Objective<T>
+    for WeightedTurnaroundTimeObjective
+{
+    fn assignment_cost(
+        &self,
+        model: &SolverModel<'_, T>,
         request_index: RequestIndex,
         berth_index: BerthIndex,
-        assigned_time_interval: TimeInterval<T>,
-    ) -> Self {
-        Self {
-            request_index,
-            berth_index,
-            assigned_time_interval,
-        }
+        _start_time: TimePoint<T>,
+    ) -> Option<Cost> {
+        let processing_time = model
+            .processing_time(request_index, berth_index)
+            .flatten()?;
+        let weight = model.weights()[request_index.get()];
+        Some(weight.saturating_mul(processing_time.value().into()))
     }
 
-    #[inline]
-    pub fn request_index(&self) -> RequestIndex {
-        self.request_index
-    }
-
-    #[inline]
-    pub fn berth_index(&self) -> BerthIndex {
-        self.berth_index
-    }
-
-    #[inline]
-    pub fn assigned_time_interval(&self) -> TimeInterval<T>
-    where
-        T: Copy,
-    {
-        self.assigned_time_interval
-    }
-}
-
-impl<T: std::fmt::Display> std::fmt::Display for Schedule<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Request {} assigned to Berth {} during {}",
-            self.request_index, self.berth_index, self.assigned_time_interval
-        )
+    fn unassignment_cost(
+        &self,
+        model: &SolverModel<'_, T>,
+        request: RequestIndex,
+    ) -> berth_alloc_core::prelude::Cost {
+        let weight = model.weights()[request.get()];
+        let feasible_window_length = model.feasible_intervals()[request.get()].length();
+        weight.saturating_mul(feasible_window_length.value().into())
     }
 }

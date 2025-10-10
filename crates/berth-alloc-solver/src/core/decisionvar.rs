@@ -19,6 +19,52 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod arc_evaluator;
-pub mod objective;
-pub mod wtt;
+use crate::state::index::BerthIndex;
+use berth_alloc_core::prelude::TimePoint;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decision<T> {
+    pub berth_index: BerthIndex,
+    pub start_time: TimePoint<T>,
+}
+
+impl<T> Decision<T> {
+    #[inline]
+    pub fn new(berth_index: BerthIndex, start_time: TimePoint<T>) -> Self {
+        Self {
+            berth_index,
+            start_time,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionVar<T> {
+    Unassigned,
+    Assigned(Decision<T>),
+}
+
+impl<T> DecisionVar<T> {
+    #[inline]
+    pub fn unassigned() -> Self {
+        Self::Unassigned
+    }
+
+    #[inline]
+    pub fn assigned(berth_index: BerthIndex, start_time: TimePoint<T>) -> Self {
+        Self::Assigned(Decision::new(berth_index, start_time))
+    }
+
+    #[inline]
+    pub fn is_assigned(&self) -> bool {
+        matches!(self, Self::Assigned(_))
+    }
+
+    #[inline]
+    pub fn as_assigned(&self) -> Option<&Decision<T>> {
+        match self {
+            Self::Assigned(decision) => Some(decision),
+            Self::Unassigned => None,
+        }
+    }
+}

@@ -30,7 +30,15 @@ pub trait ChainSetView {
     fn num_chains(&self) -> usize;
 
     fn start_of_chain(&self, chain: ChainIndex) -> NodeIndex;
+    fn real_start_of_chain(&self, chain: ChainIndex) -> Option<NodeIndex> {
+        let start = self.start_of_chain(chain);
+        self.next_node(start)
+    }
     fn end_of_chain(&self, chain: ChainIndex) -> NodeIndex;
+    fn real_end_of_chain(&self, chain: ChainIndex) -> Option<NodeIndex> {
+        let end = self.end_of_chain(chain);
+        self.prev_node(end)
+    }
     fn chain(&self, chain: ChainIndex) -> ChainRef<'_, Self>
     where
         Self: Sized,
@@ -38,8 +46,63 @@ pub trait ChainSetView {
         ChainRef::new(self, chain)
     }
 
+    #[inline]
+    fn first_real_node(&self, start_node: NodeIndex) -> Option<NodeIndex> {
+        let mut current = start_node;
+        let mut steps_left = self.num_nodes() + 2 * self.num_chains();
+        while steps_left > 0 {
+            let next = self.next_node(current)?;
+            if !self.is_sentinel_node(next) {
+                return Some(next);
+            }
+            if next == current {
+                return None;
+            }
+            current = next;
+            steps_left -= 1;
+        }
+        None
+    }
+
     fn next_node(&self, node: NodeIndex) -> Option<NodeIndex>;
+
+    #[inline]
+    fn next_real_node(&self, node: NodeIndex) -> Option<NodeIndex> {
+        let mut current = node;
+        let mut steps_left = self.num_nodes() + 2 * self.num_chains();
+        while steps_left > 0 {
+            let next = self.next_node(current)?;
+            if !self.is_sentinel_node(next) {
+                return Some(next);
+            }
+            if next == current {
+                return None;
+            }
+            current = next;
+            steps_left -= 1;
+        }
+        None
+    }
+
     fn prev_node(&self, node: NodeIndex) -> Option<NodeIndex>;
+
+    #[inline]
+    fn prev_real_node(&self, node: NodeIndex) -> Option<NodeIndex> {
+        let mut current = node;
+        let mut steps_left = self.num_nodes() + 2 * self.num_chains();
+        while steps_left > 0 {
+            let prev = self.prev_node(current)?;
+            if !self.is_sentinel_node(prev) {
+                return Some(prev);
+            }
+            if prev == current {
+                return None;
+            }
+            current = prev;
+            steps_left -= 1;
+        }
+        None
+    }
 
     fn is_sentinel_node(&self, node: NodeIndex) -> bool;
     fn is_head_node(&self, node: NodeIndex) -> bool;
@@ -49,7 +112,31 @@ pub trait ChainSetView {
 
     fn is_chain_empty(&self, chain: ChainIndex) -> bool;
 
+    fn chain_of_node(&self, node: NodeIndex) -> Option<ChainIndex>;
+    fn position_in_chain(&self, node: NodeIndex) -> Option<usize>;
+
     fn iter_chain(&self, chain: ChainIndex) -> Self::NodeIter<'_>;
+
+    #[inline]
+    fn resolve_slice_bounds(
+        &self,
+        chain: ChainIndex,
+        start_node: NodeIndex,
+        end_node_exclusive: Option<NodeIndex>,
+    ) -> (Option<NodeIndex>, NodeIndex) {
+        let end_exclusive = end_node_exclusive.unwrap_or_else(|| self.end_of_chain(chain));
+        if start_node == end_exclusive {
+            return (None, end_exclusive);
+        }
+        if self.is_sentinel_node(start_node) {
+            let first = self
+                .next_real_node(start_node)
+                .filter(|&n| n != end_exclusive);
+            (first, end_exclusive)
+        } else {
+            (Some(start_node), end_exclusive)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -62,7 +149,6 @@ impl<'chain, C: ChainSetView> ChainRef<'chain, C> {
     #[inline]
     pub fn new(chain_view: &'chain C, chain: ChainIndex) -> Self {
         assert!(chain.get() < chain_view.num_chains());
-
         Self { chain_view, chain }
     }
 
@@ -82,8 +168,78 @@ impl<'chain, C: ChainSetView> ChainRef<'chain, C> {
     }
 
     #[inline]
+    pub fn real_start(&self) -> Option<NodeIndex> {
+        self.chain_view.real_start_of_chain(self.chain)
+    }
+
+    #[inline]
     pub fn end(&self) -> NodeIndex {
         self.chain_view.end_of_chain(self.chain)
+    }
+
+    #[inline]
+    pub fn real_end(&self) -> Option<NodeIndex> {
+        self.chain_view.real_end_of_chain(self.chain)
+    }
+
+    #[inline]
+    pub fn chain_index(&self) -> ChainIndex {
+        self.chain
+    }
+
+    #[inline]
+    pub fn next(&self, node: NodeIndex) -> Option<NodeIndex> {
+        self.chain_view.next_node(node)
+    }
+
+    #[inline]
+    pub fn next_real(&self, node: NodeIndex) -> Option<NodeIndex> {
+        self.chain_view.next_real_node(node)
+    }
+
+    #[inline]
+    pub fn prev(&self, node: NodeIndex) -> Option<NodeIndex> {
+        self.chain_view.prev_node(node)
+    }
+
+    #[inline]
+    pub fn prev_real(&self, node: NodeIndex) -> Option<NodeIndex> {
+        self.chain_view.prev_real_node(node)
+    }
+
+    #[inline]
+    pub fn first_real_node(&self, start_node: NodeIndex) -> Option<NodeIndex> {
+        self.chain_view.first_real_node(start_node)
+    }
+
+    #[inline]
+    pub fn is_sentinel_node(&self, node: NodeIndex) -> bool {
+        self.chain_view.is_sentinel_node(node)
+    }
+
+    #[inline]
+    pub fn is_head_node(&self, node: NodeIndex) -> bool {
+        self.chain_view.is_head_node(node)
+    }
+
+    #[inline]
+    pub fn is_tail_node(&self, node: NodeIndex) -> bool {
+        self.chain_view.is_tail_node(node)
+    }
+
+    #[inline]
+    pub fn resolve_slice(
+        &self,
+        start_node: NodeIndex,
+        end_node_exclusive: Option<NodeIndex>,
+    ) -> (Option<NodeIndex>, NodeIndex) {
+        self.chain_view
+            .resolve_slice_bounds(self.chain, start_node, end_node_exclusive)
+    }
+
+    #[inline]
+    pub fn chain_view(&self) -> &'chain C {
+        self.chain_view
     }
 }
 
@@ -212,6 +368,24 @@ mod tests {
             = std::iter::Copied<std::slice::Iter<'a, NodeIndex>>
         where
             Self: 'a;
+
+        fn chain_of_node(&self, node: NodeIndex) -> Option<ChainIndex> {
+            for (ci, chain) in self.chains.iter().enumerate() {
+                if chain.contains(&node) {
+                    return Some(ChainIndex(ci));
+                }
+            }
+            None
+        }
+
+        fn position_in_chain(&self, node: NodeIndex) -> Option<usize> {
+            for (_, chain) in self.chains.iter().enumerate() {
+                if let Some(pos) = chain.iter().position(|&n| n == node) {
+                    return Some(pos);
+                }
+            }
+            None
+        }
     }
 
     #[test]

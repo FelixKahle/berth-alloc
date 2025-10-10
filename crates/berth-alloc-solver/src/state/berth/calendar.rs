@@ -19,6 +19,21 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod arc_evaluator;
-pub mod objective;
-pub mod wtt;
+use berth_alloc_core::prelude::TimeInterval;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BerthCalendar<T> {
+    free: Vec<TimeInterval<T>>,
+}
+
+impl<T> BerthCalendar<T> {
+    #[inline]
+    pub fn new(free: Vec<TimeInterval<T>>) -> Self {
+        Self { free }
+    }
+
+    #[inline]
+    pub fn free_intervals(&self) -> &[TimeInterval<T>] {
+        &self.free
+    }
+}

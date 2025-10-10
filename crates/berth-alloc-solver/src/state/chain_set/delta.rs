@@ -63,6 +63,7 @@ pub struct ChainSetDelta {
     head_prev_overrides: Vec<NodeIndex>,
     changed_tails: Vec<NodeIndex>,
     affected_chains: Vec<ChainIndex>,
+    affected_slice_starts: Vec<Option<NodeIndex>>,
     touched_marks: Vec<u32>,
     tail_next_marks: Vec<u32>,
     head_prev_marks: Vec<u32>,
@@ -88,6 +89,7 @@ impl Default for ChainSetDelta {
             changed_tails: Vec::new(),
             changed_tail_marks: Vec::new(),
             affected_chains: Vec::new(),
+            affected_slice_starts: Vec::new(),
             chain_marks: Vec::new(),
             chain_epoch: 1,
             override_epoch: 1,
@@ -120,6 +122,7 @@ impl ChainSetDelta {
             changed_tail_marks: Vec::new(),
 
             affected_chains: Vec::with_capacity(capacity),
+            affected_slice_starts: Vec::new(),
             chain_marks: Vec::new(),
             chain_epoch: 1,
 

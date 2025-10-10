@@ -19,13 +19,18 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::state::{chain_set::base::ChainSet, model::SolverModel};
+use crate::{
+    core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
+    state::{chain_set::base::ChainSet, model::SolverModel},
+};
 use num_traits::{CheckedAdd, CheckedSub};
 
 #[derive(Debug, Clone)]
 pub struct SolverSearchState<'model, 'problem, T: Copy + Ord> {
     model: &'model SolverModel<'problem, T>,
     chain_set: ChainSet,
+    interval_vars: Vec<IntervalVar<T>>,
+    decision_vars: Vec<DecisionVar<T>>,
 }
 
 impl<'problem, 'model, T: Copy + Ord + CheckedAdd + CheckedSub>
@@ -36,9 +41,19 @@ impl<'problem, 'model, T: Copy + Ord + CheckedAdd + CheckedSub>
         let num_chains = model.berths_len();
         let num_nodes = model.flexible_requests_len();
 
+        let interval_vars = model
+            .feasible_intervals()
+            .iter()
+            .map(|w| IntervalVar::new(w.start(), w.end()))
+            .collect();
+
+        let decision_vars = vec![DecisionVar::Unassigned; num_nodes];
+
         Self {
             model,
-            chain_set: ChainSet::new(num_chains, num_nodes),
+            chain_set: ChainSet::new(num_nodes, num_chains),
+            interval_vars,
+            decision_vars,
         }
     }
 
@@ -50,5 +65,25 @@ impl<'problem, 'model, T: Copy + Ord + CheckedAdd + CheckedSub>
     #[inline]
     pub fn chain_set(&self) -> &ChainSet {
         &self.chain_set
+    }
+
+    #[inline]
+    pub fn interval_vars(&self) -> &[IntervalVar<T>] {
+        &self.interval_vars
+    }
+
+    #[inline]
+    pub fn interval_vars_mut(&mut self) -> &mut [IntervalVar<T>] {
+        &mut self.interval_vars
+    }
+
+    #[inline]
+    pub fn decision_vars(&self) -> &[DecisionVar<T>] {
+        &self.decision_vars
+    }
+
+    #[inline]
+    pub fn decision_vars_mut(&mut self) -> &mut [DecisionVar<T>] {
+        &mut self.decision_vars
     }
 }

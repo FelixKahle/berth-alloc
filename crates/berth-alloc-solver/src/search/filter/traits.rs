@@ -30,10 +30,7 @@ where
         std::any::type_name::<Self>()
     }
 
-    #[inline]
-    fn complexity(&self) -> usize {
-        1
-    }
+    fn complexity(&self) -> usize;
 
     fn is_feasible(
         &self,

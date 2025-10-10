@@ -23,10 +23,7 @@ use crate::{
     search::filter::traits::FeasibilityFilter,
     state::{
         chain_set::{
-            delta::ChainSetDelta,
-            index::{ChainIndex, NodeIndex},
-            overlay::ChainSetOverlay,
-            view::ChainSetView,
+            delta::ChainSetDelta, index::NodeIndex, overlay::ChainSetOverlay, view::ChainSetView,
         },
         index::{BerthIndex, RequestIndex},
         search_state::SolverSearchState,
@@ -50,7 +47,7 @@ where
 {
     #[inline]
     fn complexity(&self) -> usize {
-        1 // O(num_berths * num_requests_in_chain_set_delta)
+        10
     }
 
     #[inline]
@@ -58,18 +55,18 @@ where
         &self,
         delta: &ChainSetDelta,
         search_state: &SolverSearchState<'model, 'problem, T>,
-    ) -> bool
-    where
-        T: Copy + Ord + CheckedAdd + CheckedSub,
-    {
+    ) -> bool {
+        let affected = delta.affected_chains();
+        if affected.is_empty() {
+            return true;
+        }
+
         let chain_set = search_state.chain_set();
         let model = search_state.model();
-
         let overlay = ChainSetOverlay::new(chain_set, delta);
-
-        for b in 0..model.berths_len() {
-            let bi = BerthIndex(b);
-            let chain = overlay.chain(ChainIndex(b));
+        for &ci in affected {
+            let bi = BerthIndex(ci.get()); // BerthIndex == ChainIndex
+            let chain = overlay.chain(ci);
 
             let ok = chain
                 .iter()

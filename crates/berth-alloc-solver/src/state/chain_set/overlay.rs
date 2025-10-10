@@ -60,6 +60,47 @@ impl<'base, 'delta> ChainSetOverlay<'base, 'delta> {
             self.base.previous_slice()[node.get()]
         }
     }
+
+    #[inline]
+    pub fn earliest_impacted_on_chain(&self, chain: ChainIndex) -> Option<NodeIndex> {
+        let head = self.start_of_chain(chain);
+        let first = {
+            let n = self.next_of(head);
+            if self.is_sentinel_node(n) {
+                return None;
+            } else {
+                n
+            }
+        };
+
+        if self.delta.is_node_touched(first) {
+            return Some(first);
+        }
+        if self.delta.is_tail_overridden(first) {
+            let succ = self.next_of(first);
+            return if self.is_sentinel_node(succ) {
+                Some(first)
+            } else {
+                Some(succ)
+            };
+        }
+
+        let mut prev = first;
+        loop {
+            let succ = self.next_of(prev);
+            if self.is_sentinel_node(succ) {
+                break;
+            }
+            let cur = succ;
+
+            if self.delta.is_tail_overridden(prev) || self.delta.is_node_touched(cur) {
+                return Some(cur);
+            }
+            prev = cur;
+        }
+
+        Some(first)
+    }
 }
 
 impl<'base, 'delta> ChainSetView for ChainSetOverlay<'base, 'delta> {
@@ -144,6 +185,49 @@ impl<'base, 'delta> ChainSetView for ChainSetOverlay<'base, 'delta> {
         }
     }
 
+    #[inline]
+    fn chain_of_node(&self, node: NodeIndex) -> Option<ChainIndex> {
+        if self.is_sentinel_node(node) || node.get() >= self.num_nodes() {
+            return None;
+        }
+
+        let mut cur = node;
+        let mut steps_left = self.total_nodes();
+        while steps_left > 0 {
+            if self.is_head_node(cur) {
+                let cid = (cur.get() - self.num_nodes()) >> 1;
+                if cid < self.num_chains() {
+                    return Some(ChainIndex(cid));
+                } else {
+                    return None;
+                }
+            }
+            cur = self.prev_of(cur);
+            steps_left -= 1;
+        }
+        None
+    }
+
+    #[inline]
+    fn position_in_chain(&self, node: NodeIndex) -> Option<usize> {
+        if self.is_sentinel_node(node) || node.get() >= self.num_nodes() {
+            return None;
+        }
+
+        let mut cur = node;
+        let mut pos = 0usize;
+        let mut steps_left = self.total_nodes();
+        while steps_left > 0 {
+            if self.is_head_node(cur) {
+                return Some(pos);
+            }
+            cur = self.prev_of(cur);
+            pos += 1;
+            steps_left -= 1;
+        }
+        None
+    }
+
     type NodeIter<'a>
         = ChainSetOverlayIter<'a>
     where
@@ -172,8 +256,8 @@ impl<'a> Iterator for ChainSetOverlayIter<'a> {
 }
 
 #[cfg(test)]
-mod apply_tests {
-    use super::ChainSet;
+mod tests {
+    use super::*;
     use crate::state::chain_set::{
         delta::{ChainNextRewire, ChainSetDelta},
         index::{ChainIndex, NodeIndex},
@@ -301,5 +385,261 @@ mod apply_tests {
         let after: Vec<NodeIndex> = collect_chain(&cs, ChainIndex(0));
         assert_eq!(before, after);
         assert!(cs.is_chain_empty(ChainIndex(0)));
+    }
+
+    #[test]
+    fn test_overlay_chain_of_node_and_position_basic() {
+        use super::ChainSetOverlay;
+
+        let base = ChainSet::new(8, 2);
+        let s0 = base.start_of_chain(ChainIndex(0));
+        let e0 = base.end_of_chain(ChainIndex(0));
+        let s1 = base.start_of_chain(ChainIndex(1));
+        let e1 = base.end_of_chain(ChainIndex(1));
+
+        // Compose chains entirely via delta overrides:
+        // Chain 0: [2, 4, 1]
+        // Chain 1: [5]
+        let mut delta = ChainSetDelta::new();
+        delta.push_rewire(ChainNextRewire::new(s0, NodeIndex(2)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(2), NodeIndex(4)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(4), NodeIndex(1)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(1), e0));
+
+        delta.push_rewire(ChainNextRewire::new(s1, NodeIndex(5)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(5), e1));
+
+        let overlay = ChainSetOverlay::new(&base, &delta);
+
+        // On-chain nodes report correct chain and position (1-based from head)
+        assert_eq!(overlay.chain_of_node(NodeIndex(2)), Some(ChainIndex(0)));
+        assert_eq!(overlay.position_in_chain(NodeIndex(2)), Some(1));
+
+        assert_eq!(overlay.chain_of_node(NodeIndex(4)), Some(ChainIndex(0)));
+        assert_eq!(overlay.position_in_chain(NodeIndex(4)), Some(2));
+
+        assert_eq!(overlay.chain_of_node(NodeIndex(1)), Some(ChainIndex(0)));
+        assert_eq!(overlay.position_in_chain(NodeIndex(1)), Some(3));
+
+        assert_eq!(overlay.chain_of_node(NodeIndex(5)), Some(ChainIndex(1)));
+        assert_eq!(overlay.position_in_chain(NodeIndex(5)), Some(1));
+
+        // Unperformed nodes remain None
+        for &n in &[NodeIndex(0), NodeIndex(3), NodeIndex(6), NodeIndex(7)] {
+            assert_eq!(
+                overlay.chain_of_node(n),
+                None,
+                "node {:?} should have no chain",
+                n
+            );
+            assert_eq!(
+                overlay.position_in_chain(n),
+                None,
+                "node {:?} should have no position",
+                n
+            );
+        }
+
+        // Sentinel nodes must return None
+        for &x in &[s0, e0, s1, e1] {
+            assert!(overlay.is_sentinel_node(x));
+            assert_eq!(overlay.chain_of_node(x), None);
+            assert_eq!(overlay.position_in_chain(x), None);
+        }
+
+        // Out-of-bounds index also yields None
+        let last_end = base.end_of_chain(ChainIndex(base.num_chains() - 1));
+        let oob = NodeIndex(last_end.get() + 1);
+        assert_eq!(overlay.chain_of_node(oob), None);
+        assert_eq!(overlay.position_in_chain(oob), None);
+    }
+
+    #[test]
+    fn test_overlay_chain_of_node_and_position_multiple_nodes() {
+        use super::ChainSetOverlay;
+
+        let base = ChainSet::new(10, 1);
+        let s = base.start_of_chain(ChainIndex(0));
+        let e = base.end_of_chain(ChainIndex(0));
+
+        // Chain 0 via delta: [0, 3, 9, 4]
+        let mut delta = ChainSetDelta::new();
+        delta.push_rewire(ChainNextRewire::new(s, NodeIndex(0)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(0), NodeIndex(3)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(3), NodeIndex(9)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(9), NodeIndex(4)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(4), e));
+
+        let overlay = ChainSetOverlay::new(&base, &delta);
+
+        // Positions should be 1..=4 respectively
+        let expected = &[
+            (NodeIndex(0), 1usize),
+            (NodeIndex(3), 2usize),
+            (NodeIndex(9), 3usize),
+            (NodeIndex(4), 4usize),
+        ];
+        for &(n, pos) in expected {
+            assert_eq!(overlay.chain_of_node(n), Some(ChainIndex(0)));
+            assert_eq!(overlay.position_in_chain(n), Some(pos));
+        }
+
+        // Nodes not present remain None
+        for &n in &[
+            NodeIndex(1),
+            NodeIndex(2),
+            NodeIndex(5),
+            NodeIndex(6),
+            NodeIndex(7),
+            NodeIndex(8),
+        ] {
+            assert_eq!(overlay.chain_of_node(n), None);
+            assert_eq!(overlay.position_in_chain(n), None);
+        }
+    }
+
+    #[test]
+    fn test_earliest_none_on_empty_chain() {
+        let base = ChainSet::new(8, 1); // empty chain 0
+        let delta = ChainSetDelta::new(); // no overrides
+        let ov = ChainSetOverlay::new(&base, &delta);
+
+        assert_eq!(ov.earliest_impacted_on_chain(ChainIndex(0)), None);
+    }
+
+    /// Build a concrete chain in `base` by applying a delta (so the overlay can be clean/empty).
+    fn build_chain(base: &mut ChainSet, chain: ChainIndex, nodes: &[NodeIndex]) {
+        let s = base.start_of_chain(chain);
+        let e = base.end_of_chain(chain);
+        let mut d = ChainSetDelta::new();
+        let mut prev = s;
+        for &n in nodes {
+            d.push_rewire(ChainNextRewire::new(prev, n));
+            prev = n;
+        }
+        d.push_rewire(ChainNextRewire::new(prev, e));
+        base.apply_delta(d);
+    }
+
+    #[test]
+    fn test_earliest_falls_back_to_first_when_no_impact() {
+        let mut base = ChainSet::new(16, 1);
+        build_chain(
+            &mut base,
+            ChainIndex(0),
+            &[NodeIndex(1), NodeIndex(2), NodeIndex(3)],
+        );
+        let delta = ChainSetDelta::new(); // no changes
+        let ov = ChainSetOverlay::new(&base, &delta);
+
+        assert_eq!(
+            ov.earliest_impacted_on_chain(ChainIndex(0)),
+            Some(NodeIndex(1))
+        );
+    }
+
+    #[test]
+    fn test_earliest_is_first_when_first_touched() {
+        let mut base = ChainSet::new(16, 1);
+        build_chain(
+            &mut base,
+            ChainIndex(0),
+            &[NodeIndex(1), NodeIndex(2), NodeIndex(3)],
+        );
+
+        let mut delta = ChainSetDelta::new();
+        delta.touch_node(NodeIndex(1)); // touch first real node
+        let ov = ChainSetOverlay::new(&base, &delta);
+
+        assert_eq!(
+            ov.earliest_impacted_on_chain(ChainIndex(0)),
+            Some(NodeIndex(1))
+        );
+    }
+
+    #[test]
+    fn earliest_successor_when_first_tail_changed_but_successor_unchanged() {
+        // Build: s -> 1 -> 2 -> 3 -> e
+        let mut base = ChainSet::new(16, 1);
+        build_chain(
+            &mut base,
+            ChainIndex(0),
+            &[NodeIndex(1), NodeIndex(2), NodeIndex(3)],
+        );
+
+        // Mark the *edge* at 1 as changed but keep the same successor 2.
+        // (This is how to flag "changed tail" without altering topology.)
+        let mut delta = ChainSetDelta::new();
+        delta.set_next(NodeIndex(1), NodeIndex(2));
+        let ov = ChainSetOverlay::new(&base, &delta);
+
+        assert_eq!(
+            ov.earliest_impacted_on_chain(ChainIndex(0)),
+            Some(NodeIndex(2))
+        );
+    }
+
+    #[test]
+    fn test_earliest_middle_successor_when_middle_tail_changed() {
+        // Build: s -> 1 -> 2 -> 3 -> 4 -> e
+        let mut base = ChainSet::new(20, 1);
+        build_chain(
+            &mut base,
+            ChainIndex(0),
+            &[NodeIndex(1), NodeIndex(2), NodeIndex(3), NodeIndex(4)],
+        );
+
+        // Flag the edge at node 2 as changed but keep successor (3) the same.
+        let mut delta = ChainSetDelta::new();
+        delta.set_next(NodeIndex(2), NodeIndex(3));
+        let ov = ChainSetOverlay::new(&base, &delta);
+
+        assert_eq!(
+            ov.earliest_impacted_on_chain(ChainIndex(0)),
+            Some(NodeIndex(3))
+        );
+    }
+
+    #[test]
+    fn test_earliest_respects_overlay_rewiring_of_first_edge() {
+        // Build: s -> 1 -> 2 -> 3 -> e
+        let mut base = ChainSet::new(16, 1);
+        build_chain(
+            &mut base,
+            ChainIndex(0),
+            &[NodeIndex(1), NodeIndex(2), NodeIndex(3)],
+        );
+
+        // Rewire 1 -> 3 in the delta (edge changed and successor different).
+        let mut delta = ChainSetDelta::new();
+        delta.set_next(NodeIndex(1), NodeIndex(3));
+        let ov = ChainSetOverlay::new(&base, &delta);
+
+        // Now overlay traversal sees s -> 1 -> 3 ..., so earliest impacted is 3.
+        assert_eq!(
+            ov.earliest_impacted_on_chain(ChainIndex(0)),
+            Some(NodeIndex(3))
+        );
+    }
+
+    #[test]
+    fn test_earliest_detects_touched_non_first() {
+        // Build: s -> 1 -> 2 -> 3 -> e
+        let mut base = ChainSet::new(16, 1);
+        build_chain(
+            &mut base,
+            ChainIndex(0),
+            &[NodeIndex(1), NodeIndex(2), NodeIndex(3)],
+        );
+
+        // Touch node 3 only
+        let mut delta = ChainSetDelta::new();
+        delta.touch_node(NodeIndex(3));
+        let ov = ChainSetOverlay::new(&base, &delta);
+
+        assert_eq!(
+            ov.earliest_impacted_on_chain(ChainIndex(0)),
+            Some(NodeIndex(3))
+        );
     }
 }
