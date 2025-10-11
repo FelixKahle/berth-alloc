@@ -46,3 +46,19 @@ features = ["std", "attributes"]
 
 [dev-dependencies]
 static_assertions = "1.1.0"
+criterion = "0.7.0"
+
+[[bench]]
+name = "chain_set_benches"
+path = "benches/state/chain_set/chain_set_benches.rs"
+harness = false
+
+[[bench]]
+name = "chain_set_overlay_benches"
+path = "benches/state/chain_set/chain_set_overlay_benches.rs"
+harness = false
+
+[[bench]]
+name = "bounds_tightener_benches"
+path = "benches/search/bounds_tightener_benches.rs"
+harness = false

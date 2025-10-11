@@ -38,6 +38,16 @@ impl<T> Decision<T> {
     }
 }
 
+impl<T: std::fmt::Display> std::fmt::Display for Decision<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Berth: {}, Start Time: {}",
+            self.berth_index, self.start_time
+        )
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum DecisionVar<T> {
     Unassigned,
@@ -65,6 +75,15 @@ impl<T> DecisionVar<T> {
         match self {
             Self::Assigned(decision) => Some(decision),
             Self::Unassigned => None,
+        }
+    }
+}
+
+impl<T: std::fmt::Display> std::fmt::Display for DecisionVar<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unassigned => write!(f, "Unassigned"),
+            Self::Assigned(decision) => write!(f, "{}", decision),
         }
     }
 }

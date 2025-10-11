@@ -7,6 +7,7 @@
 // distribute, sublicense, and/or sell copies of the Software, and to
 // permit persons to whom the Software is furnished to do so, subject to
 // the following conditions:
+//
 // The above copyright notice and this permission notice shall be
 // included in all copies or substantial portions of the Software.
 //
@@ -20,7 +21,7 @@
 
 use crate::{
     core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
-    engine::context::EngineContext,
+    engine::context::SearchContext,
     eval::objective::Objective,
     scheduling::traits::CalendarScheduler,
     search::{filter::traits::FeasibilityFilter, operator::patch::VarPatch},
@@ -34,39 +35,23 @@ use crate::{
 use berth_alloc_core::prelude::Cost;
 use num_traits::{CheckedAdd, CheckedSub, Zero};
 
-#[derive(Debug, Clone)]
-struct Scratch<T> {
-    iv: Vec<IntervalVar<T>>,
-    dv: Vec<DecisionVar<T>>,
-}
-
-impl<T: Copy + Ord> Scratch<T> {
-    fn new(iv_base: &[IntervalVar<T>], dv_base: &[DecisionVar<T>]) -> Self {
-        Self {
-            iv: iv_base.to_vec(),
-            dv: dv_base.to_vec(),
-        }
-    }
-
-    fn reset_from_base(
-        &mut self,
-        iv_base: &[IntervalVar<T>],
-        dv_base: &[DecisionVar<T>],
-        touched: &[usize],
-    ) {
-        for &i in touched {
-            self.iv[i] = iv_base[i];
-            self.dv[i] = dv_base[i];
-        }
-    }
-}
-
+/// Represents a fully evaluated, feasible "move" that a search algorithm can apply.
+///
+/// This struct is the output of the `CandidateEvaluator`. It contains everything the
+/// main search loop needs to accept a change: the structural `delta`, the resulting
+/// changes to decision variables, and the calculated change in cost (for both the
+/// true and search objectives).
 #[derive(Debug, Clone)]
 pub struct NeighborhoodCandidate<T> {
+    /// The structural change to the chain set (e.g., "move request 5 after request 10").
     pub delta: ChainSetDelta,
+    /// A sparse list of changes to the `IntervalVar`s, resulting from re-scheduling.
     pub interval_var_patch: Vec<VarPatch<IntervalVar<T>>>,
+    /// A sparse list of changes to the `DecisionVar`s, resulting from re-scheduling.
     pub decision_vars_patch: Vec<VarPatch<DecisionVar<T>>>,
+    /// The incremental change in cost according to the "true" objective function.
     pub true_delta_cost: Cost,
+    /// The incremental change in cost according to the "search" objective function.
     pub search_delta_cost: Cost,
 }
 
@@ -89,124 +74,199 @@ impl<T> NeighborhoodCandidate<T> {
     }
 }
 
-/// CandidateEvaluator: given a pure structural delta, check feasibility, repair/schedule,
-/// compute sparse patches, and score incremental cost. No RNG, no ArcEvaluator, no operator call.
+/// A reusable, temporary workspace for evaluating a candidate move.
+///
+/// This is a critical performance optimization. Instead of allocating new vectors
+/// for every "what-if" scenario, the `CandidateEvaluator` uses this pre-allocated
+/// buffer. It copies in the relevant parts of the current state, mutates them during
+/// evaluation, and then is reset for the next candidate.
+#[derive(Debug)]
+struct ScratchBuffer<T>
+where
+    T: Copy + Ord,
+{
+    /// A mutable copy of the solver's interval variables.
+    interval_vars: Vec<IntervalVar<T>>,
+    /// A mutable copy of the solver's decision variables.
+    decision_vars: Vec<DecisionVar<T>>,
+    /// A list of indices that have been affected by a delta.
+    touched: Vec<usize>,
+}
+
+impl<T> ScratchBuffer<T>
+where
+    T: Copy + Ord,
+{
+    /// Creates a new scratch buffer, cloning the initial state. This is typically done
+    /// once per thread at the start of the search.
+    #[inline]
+    fn new(interval_vars_base: &[IntervalVar<T>], decision_vars_base: &[DecisionVar<T>]) -> Self {
+        let num_nodes = interval_vars_base.len();
+        Self {
+            interval_vars: interval_vars_base.to_vec(),
+            decision_vars: decision_vars_base.to_vec(),
+            touched: Vec::with_capacity(num_nodes),
+        }
+    }
+
+    /// Clears the list of affected indices, ready for a new evaluation.
+    #[inline]
+    fn clear_touched(&mut self) {
+        self.touched.clear();
+    }
+
+    /// Sorts and removes duplicates from the list of touched indices.
+    #[inline]
+    fn sort_and_dedup_touched(&mut self) {
+        self.touched.sort_unstable();
+        self.touched.dedup();
+    }
+
+    /// Records a request index as being affected by a move.
+    #[inline]
+    fn push_touched(&mut self, index: usize) {
+        self.touched.push(index);
+    }
+
+    /// Resets the scratch variables for the affected indices back to the base state.
+    /// This provides a clean slate for the next "what-if" evaluation.
+    #[inline]
+    fn reset_from_base_touched(&mut self, iv: &[IntervalVar<T>], dv: &[DecisionVar<T>]) {
+        debug_assert_eq!(iv.len(), self.interval_vars.len());
+        debug_assert_eq!(dv.len(), self.decision_vars.len());
+        for &i in &self.touched {
+            debug_assert!(i < self.interval_vars.len());
+            self.interval_vars[i] = iv[i];
+            self.decision_vars[i] = dv[i];
+        }
+    }
+}
+
+/// A core engine component responsible for evaluating a proposed `ChainSetDelta`.
+///
+/// This struct takes a purely structural change (e.g., "move this block of requests"),
+/// and performs the full evaluation pipeline:
+/// 1. Checks feasibility filters.
+/// 2. Re-schedules the affected parts of the solution to repair it.
+/// 3. Diffs the result to create sparse "patches" of what changed.
+/// 4. Scores the change incrementally.
+///
+/// It is deterministic and does not contain any operator-specific logic.
 pub struct CandidateEvaluator<T>
 where
     T: Copy + Ord,
 {
-    scratch: Scratch<T>,
+    /// A thread-local, reusable buffer to avoid allocations in the hot loop.
+    buffer: ScratchBuffer<T>,
 }
 
 impl<T> CandidateEvaluator<T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Zero + Send + Sync + Into<Cost>,
 {
+    /// Creates a new evaluator, which should be done once per search thread.
     #[inline]
     pub fn new<'model, 'problem>(state: &SolverSearchState<'model, 'problem, T>) -> Self {
         Self {
-            scratch: Scratch::new(state.interval_vars(), state.decision_vars()),
+            buffer: ScratchBuffer::new(state.interval_vars(), state.decision_vars()),
         }
     }
 
-    /// Evaluate a candidate delta against the current search state.
-    /// Returns None if any filter rejects it or the scheduler cannot repair.
-    pub fn evaluate<'model, 'problem, S>(
+    /// Evaluates a single `ChainSetDelta` against the current search state.
+    pub fn evaluate<'engine, 'model, 'problem, S>(
         &mut self,
-        engine_context: &EngineContext<'model, 'problem, T, S>,
+        search_context: &SearchContext<'engine, 'model, 'problem, T, S>,
         state: &SolverSearchState<'model, 'problem, T>,
         delta: ChainSetDelta,
     ) -> Option<NeighborhoodCandidate<T>>
     where
         S: CalendarScheduler<T>,
     {
-        // 1) fast feasibility via filters
-        if !engine_context.filters().is_feasible(&delta, state) {
+        // Quick pre-flight check: does the move violate any basic rules?
+        if !search_context.filters().is_feasible(&delta, state) {
             return None;
         }
 
-        // 2) overlay + touched nodes
-        let base_cs = state.chain_set();
-        let overlay = ChainSetOverlay::new(base_cs, &delta);
-
-        let mut touched: Vec<usize> = Vec::new();
-        for &cid in delta.affected_chains() {
-            for n in overlay.iter_chain(cid) {
-                if overlay.is_sentinel_node(n) {
-                    continue;
+        // Identify all requests affected by this delta.
+        let overlay = ChainSetOverlay::new(state.chain_set(), &delta);
+        self.buffer.clear_touched();
+        for &chain_id in delta.affected_chains() {
+            for node in overlay.iter_chain(chain_id) {
+                if !overlay.is_sentinel_node(node) {
+                    self.buffer.push_touched(node.get());
                 }
-                touched.push(n.get());
             }
         }
-        touched.sort_unstable();
-        touched.dedup();
+        self.buffer.sort_and_dedup_touched();
 
-        // 3) reset scratch rows from base
-        self.scratch
-            .reset_from_base(state.interval_vars(), state.decision_vars(), &touched);
+        // 3. Reset the scratch space for only the affected requests to match the current state.
+        let iv_base = state.interval_vars();
+        let dv_base = state.decision_vars();
+        self.buffer.reset_from_base_touched(iv_base, dv_base);
 
-        // 4) schedule only impacted slices per affected chain
-        for &cid in delta.affected_chains() {
-            if let Some(start) = overlay.earliest_impacted_on_chain(cid) {
-                let chain = overlay.chain(cid);
-                let end_excl = chain.end();
-                if engine_context
+        // Repair the solution by re-scheduling the impacted parts of each affected chain.
+        for &chain_id in delta.affected_chains() {
+            if let Some(start_node) = overlay.earliest_impacted_on_chain(chain_id) {
+                let chain_view = overlay.chain(chain_id);
+                // Schedule from the first impacted node to the end of the chain.
+                if search_context
                     .scheduler()
                     .schedule_chain_slice(
                         state.model(),
-                        chain,
-                        start,
-                        Some(end_excl),
-                        &mut self.scratch.iv,
-                        &mut self.scratch.dv,
+                        chain_view,
+                        start_node,
+                        Some(chain_view.end()),
+                        &mut self.buffer.interval_vars,
+                        &mut self.buffer.decision_vars,
                     )
                     .is_err()
                 {
-                    // could not repair ⇒ infeasible
+                    // If re-scheduling fails, the move is infeasible.
                     return None;
                 }
             }
         }
 
-        // 5) sparse patches by diffing touched indices
-        let mut iv_patch = Vec::with_capacity(touched.len());
-        let mut dv_patch = Vec::with_capacity(touched.len());
-        let iv_base = state.interval_vars();
-        let dv_base = state.decision_vars();
-
-        for i in touched {
-            if self.scratch.iv[i] != iv_base[i] {
-                iv_patch.push(VarPatch::new(self.scratch.iv[i], i));
+        // Compare the "what-if" state in the buffer to the original state
+        // to generate sparse patches of what actually changed.
+        let mut interval_vars_patch = Vec::with_capacity(self.buffer.touched.len());
+        let mut decision_var_patch = Vec::with_capacity(self.buffer.touched.len());
+        for &index in &self.buffer.touched {
+            if self.buffer.interval_vars[index] != iv_base[index] {
+                interval_vars_patch.push(VarPatch::new(self.buffer.interval_vars[index], index));
             }
-            if self.scratch.dv[i] != dv_base[i] {
-                dv_patch.push(VarPatch::new(self.scratch.dv[i], i));
+            if self.buffer.decision_vars[index] != dv_base[index] {
+                decision_var_patch.push(VarPatch::new(self.buffer.decision_vars[index], index));
             }
         }
 
-        // 6) incremental scoring using the Objective (assignment/unassignment deltas)
+        // Calculate the change in cost ("delta cost") by only scoring the patched variables.
+        // This is the core of delta evaluation and is extremely fast.
         let true_delta_cost = Self::incremental_cost_with_against(
             state.model(),
-            engine_context.objective(),
+            search_context.objective(),
             dv_base,
-            &dv_patch,
+            &decision_var_patch,
         )?;
-
         let search_delta_cost = Self::incremental_cost_with_against(
             state.model(),
-            engine_context.search_objective(),
+            search_context.search_objective(),
             dv_base,
-            &dv_patch,
+            &decision_var_patch,
         )?;
 
+        // If successful, package everything into a candidate for the main search loop to consider.
         Some(NeighborhoodCandidate::new(
             delta,
-            iv_patch,
-            dv_patch,
+            interval_vars_patch,
+            decision_var_patch,
             true_delta_cost,
             search_delta_cost,
         ))
     }
 
+    /// Helper function to perform incremental cost calculation (delta evaluation).
+    /// It calculates `(cost_after - cost_before)` only for the variables that changed.
     #[inline]
     fn incremental_cost_with_against<O>(
         model: &SolverModel<T>,
@@ -218,18 +278,19 @@ where
         O: Objective<T>,
     {
         let mut acc: Cost = 0;
-        for p in dv_patch {
-            let idx = p.index();
-            let before = dv_before[idx];
-            let after = *p.patch();
+        for patch in dv_patch {
+            let index = patch.index();
+            let before = dv_before[index];
+            let after = *patch.patch();
 
-            let cb = Self::cost_of_dv(model, obj, idx, before)?;
-            let ca = Self::cost_of_dv(model, obj, idx, after)?;
-            acc = acc.saturating_add(ca.saturating_sub(cb));
+            let cost_before = Self::cost_of_dv(model, obj, index, before)?;
+            let cost_after = Self::cost_of_dv(model, obj, index, after)?;
+            acc = acc.saturating_add(cost_after.saturating_sub(cost_before));
         }
         Some(acc)
     }
 
+    /// Helper to get the cost of a single decision variable.
     #[inline]
     fn cost_of_dv<O>(
         model: &SolverModel<T>,
@@ -240,12 +301,314 @@ where
     where
         O: Objective<T>,
     {
-        let ri = RequestIndex(req_idx_usize);
+        let request_index = RequestIndex(req_idx_usize);
         match dv {
-            DecisionVar::Unassigned => Some(objective.unassignment_cost(model, ri)),
-            DecisionVar::Assigned(dec) => {
-                objective.assignment_cost(model, ri, dec.berth_index, dec.start_time)
-            }
+            DecisionVar::Unassigned => Some(objective.unassignment_cost(model, request_index)),
+            DecisionVar::Assigned(decision) => objective.assignment_cost(
+                model,
+                request_index,
+                decision.berth_index,
+                decision.start_time,
+            ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        engine::context::{EngineContext, SearchContext},
+        scheduling::greedy::GreedyCalendar,
+        search::filter::traits::FeasibilityFilter,
+        state::{
+            chain_set::{
+                delta::{ChainNextRewire, ChainSetDelta},
+                index::{ChainIndex, NodeIndex},
+                view::ChainSetView,
+            },
+            index::BerthIndex,
+            model::SolverModel,
+        },
+    };
+    use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
+    use berth_alloc_model::{
+        common::FlexibleKind,
+        prelude::{Berth, BerthIdentifier, Problem, RequestIdentifier},
+        problem::builder::ProblemBuilder,
+        problem::req::Request,
+    };
+    use std::collections::BTreeMap;
+
+    #[inline]
+    fn tp(v: i64) -> TimePoint<i64> {
+        TimePoint::new(v)
+    }
+    #[inline]
+    fn td(v: i64) -> TimeDelta<i64> {
+        TimeDelta::new(v)
+    }
+    #[inline]
+    fn iv(a: i64, b: i64) -> TimeInterval<i64> {
+        TimeInterval::new(tp(a), tp(b))
+    }
+    #[inline]
+    fn bid(n: usize) -> BerthIdentifier {
+        BerthIdentifier::new(n)
+    }
+    #[inline]
+    fn rid(n: usize) -> RequestIdentifier {
+        RequestIdentifier::new(n)
+    }
+    #[inline]
+    fn bi(n: usize) -> BerthIndex {
+        BerthIndex(n)
+    }
+
+    // Build a Problem:
+    // - berths_windows[b] = vec![(s,e), ...] availability windows for berth b (ids 0..B-1).
+    // - request_windows[r] = (s,e) feasible window for request r (ids 0..R-1).
+    // - weights[r] = weight for request r
+    // - processing[r][b] = Some(dur) if r allowed on berth b with PT=dur; None otherwise.
+    fn build_problem_with_weights(
+        berths_windows: &[Vec<(i64, i64)>],
+        request_windows: &[(i64, i64)],
+        weights: &[i64],
+        processing: &[Vec<Option<i64>>],
+    ) -> Problem<i64> {
+        let b_len = berths_windows.len();
+        let r_len = request_windows.len();
+        assert_eq!(weights.len(), r_len);
+        assert_eq!(processing.len(), r_len);
+        for row in processing {
+            assert_eq!(
+                row.len(),
+                b_len,
+                "processing times per request must match number of berths"
+            );
+        }
+
+        let mut builder = ProblemBuilder::new();
+
+        for (i, windows) in berths_windows.iter().enumerate() {
+            let b = Berth::from_windows(bid(i), windows.iter().map(|&(s, e)| iv(s, e)));
+            builder.add_berth(b);
+        }
+
+        for (i, &(ws, we)) in request_windows.iter().enumerate() {
+            let mut map = BTreeMap::new();
+            for (j, p) in processing[i].iter().copied().enumerate() {
+                if let Some(dur) = p {
+                    map.insert(bid(j), td(dur));
+                }
+            }
+            let req =
+                Request::<FlexibleKind, i64>::new(rid(i), iv(ws, we), weights[i], map).unwrap();
+            builder.add_flexible(req);
+        }
+
+        builder.build().expect("problem should build")
+    }
+
+    struct AlwaysFalseFilter;
+    impl<'model, 'problem, T> FeasibilityFilter<'model, 'problem, T> for AlwaysFalseFilter
+    where
+        T: Copy + Ord + CheckedAdd + CheckedSub,
+    {
+        fn complexity(&self) -> usize {
+            1
+        }
+        fn is_feasible(
+            &self,
+            _delta: &ChainSetDelta,
+            _search_state: &SolverSearchState<'model, 'problem, T>,
+        ) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn test_evaluate_returns_none_when_filter_rejects() {
+        // 1 berth, 1 request allowed
+        let p = build_problem_with_weights(&[vec![(0, 100)]], &[(0, 100)], &[1], &[vec![Some(5)]]);
+        let m = SolverModel::from_problem(&p).unwrap();
+
+        let state = SolverSearchState::new_unassigned(&m, 0, 0);
+        let engine =
+            EngineContext::new(&m, GreedyCalendar).with_filter(Box::new(AlwaysFalseFilter));
+        let search = SearchContext::new(&engine, 0.0);
+
+        // Any delta: mark the chain, but AlwaysFalseFilter should reject before any scheduling.
+        let mut delta = ChainSetDelta::new();
+        delta.mark_chain(ChainIndex(0));
+
+        let mut eval = CandidateEvaluator::<i64>::new(&state);
+        let cand = eval.evaluate(&search, &state, delta);
+        assert!(cand.is_none(), "filter should reject candidate");
+    }
+
+    #[test]
+    fn test_evaluate_returns_none_when_scheduler_fails() {
+        // 1 berth with [0,10); two requests both with PT=7 -> cannot place them back-to-back
+        let p = build_problem_with_weights(
+            &[vec![(0, 10)]],
+            &[(0, 10), (0, 10)],
+            &[1, 1],
+            &[vec![Some(7)], vec![Some(7)]],
+        );
+        let m = SolverModel::from_problem(&p).unwrap();
+
+        let state = SolverSearchState::new_unassigned(&m, 0, 0);
+        let engine = EngineContext::new(&m, GreedyCalendar);
+        let search = SearchContext::new(&engine, 0.0);
+
+        // Overlay a chain 0 with nodes [0,1]
+        let mut delta = ChainSetDelta::new();
+        let s = state.chain_set().start_of_chain(ChainIndex(0));
+        let e = state.chain_set().end_of_chain(ChainIndex(0));
+        delta.push_rewire(ChainNextRewire::new(s, NodeIndex(0)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(0), NodeIndex(1)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(1), e));
+        delta.mark_chain(ChainIndex(0));
+
+        let mut eval = CandidateEvaluator::<i64>::new(&state);
+        let cand = eval.evaluate(&search, &state, delta);
+        assert!(
+            cand.is_none(),
+            "scheduler should fail and evaluator returns None"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_success_produces_patches_and_correct_delta_costs() {
+        // 1 berth with [0,30), two requests, weights 2 and 3, PTs 5 and 7
+        let p = build_problem_with_weights(
+            &[vec![(0, 30)]],
+            &[(0, 30), (0, 30)],
+            &[2, 3],
+            &[vec![Some(5)], vec![Some(7)]],
+        );
+        let m = SolverModel::from_problem(&p).unwrap();
+
+        let state = SolverSearchState::new_unassigned(&m, 0, 0);
+        let engine = EngineContext::new(&m, GreedyCalendar);
+        // λ = 1.0 (SearchObjective will scale unassignment cost by 2x)
+        let search = SearchContext::new(&engine, 1.0);
+
+        // Overlay a chain 0: [0,1]
+        let mut delta = ChainSetDelta::new();
+        let s = state.chain_set().start_of_chain(ChainIndex(0));
+        let e = state.chain_set().end_of_chain(ChainIndex(0));
+        delta.push_rewire(ChainNextRewire::new(s, NodeIndex(0)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(0), NodeIndex(1)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(1), e));
+        delta.mark_chain(ChainIndex(0));
+
+        let mut eval = CandidateEvaluator::<i64>::new(&state);
+        let cand = eval
+            .evaluate(&search, &state, delta)
+            .expect("evaluation should succeed");
+
+        // DV patches: 2 (both now assigned), IV patches: 0 (GreedyCalendar does not mutate bounds)
+        assert_eq!(cand.decision_vars_patch.len(), 2);
+        assert_eq!(cand.interval_var_patch.len(), 0);
+
+        // Verify DV patches are assigned to berth 0 with expected start times from greedy: 0 then 5
+        let p0 = &cand.decision_vars_patch[0];
+        let p1 = &cand.decision_vars_patch[1];
+        let (i0, v0) = (p0.index(), p0.patch());
+        let (i1, v1) = (p1.index(), p1.patch());
+
+        assert_eq!(i0, 0);
+        assert_eq!(i1, 1);
+        let d0 = v0.as_assigned().expect("should be assigned");
+        let d1 = v1.as_assigned().expect("should be assigned");
+        assert_eq!(d0.berth_index, bi(0));
+        assert_eq!(d1.berth_index, bi(0));
+        assert_eq!(d0.start_time, tp(0));
+        assert_eq!(d1.start_time, tp(5)); // PT(0)=5, so second starts at t=5
+
+        // Expected costs:
+        // Assignment cost (true/search same for assignment): 2*5 + 3*7 = 31
+        // Unassignment cost (true): (2*30) + (3*30) = 150
+        //   => true delta = 31 - 150 = -119
+        // Unassignment cost (search): scaled by (1 + λ) with λ=1.0 => 2x => 300
+        //   => search delta = 31 - 300 = -269
+        assert_eq!(cand.true_delta_cost, 31 - 150);
+        assert_eq!(cand.search_delta_cost, 31 - 300);
+    }
+
+    #[test]
+    fn test_incremental_cost_and_cost_of_dv_helpers_work() {
+        // 1 berth with [0,10), 1 request weight=2, PT=5
+        let p = build_problem_with_weights(&[vec![(0, 10)]], &[(0, 10)], &[2], &[vec![Some(5)]]);
+        let m = SolverModel::from_problem(&p).unwrap();
+
+        // before: Unassigned; patch: Assigned on berth 0 at t=0
+        let dv_before = vec![DecisionVar::Unassigned];
+        let dv_after = DecisionVar::assigned(bi(0), tp(0));
+        let dv_patch = vec![VarPatch::new(dv_after, 0)];
+
+        // true objective = WeightedTurnaroundTimeObjective
+        let true_obj = crate::eval::wtt::WeightedTurnaroundTimeObjective;
+        let delta_true = super::CandidateEvaluator::<i64>::incremental_cost_with_against(
+            &m, &true_obj, &dv_before, &dv_patch,
+        )
+        .expect("delta should compute");
+        // Assignment = 2*5=10, unassignment=2*10=20 => delta = -10
+        assert_eq!(delta_true, 10 - 20);
+
+        // cost_of_dv for assigned and unassigned
+        let c_assigned = super::CandidateEvaluator::<i64>::cost_of_dv(&m, &true_obj, 0, dv_after)
+            .expect("assigned cost");
+        let c_unassigned =
+            super::CandidateEvaluator::<i64>::cost_of_dv(&m, &true_obj, 0, DecisionVar::Unassigned)
+                .expect("unassigned cost");
+        assert_eq!(c_assigned, 10);
+        assert_eq!(c_unassigned, 20);
+    }
+
+    #[test]
+    fn test_scratch_buffer_tracks_and_resets_touched_indices() {
+        let iv_base = vec![
+            IntervalVar::new(tp(0), tp(10)),
+            IntervalVar::new(tp(5), tp(15)),
+        ];
+        let dv_base = vec![DecisionVar::Unassigned, DecisionVar::Unassigned];
+
+        let mut buf = super::ScratchBuffer::new(&iv_base, &dv_base);
+
+        // Touch out-of-order with duplicates
+        buf.push_touched(1);
+        buf.push_touched(0);
+        buf.push_touched(1);
+        buf.sort_and_dedup_touched();
+        assert_eq!(buf.touched, vec![0, 1]);
+
+        // Mutate buffer and then reset from base only for touched
+        buf.interval_vars[0].start_time_lower_bound = tp(99);
+        buf.decision_vars[1] = DecisionVar::assigned(bi(0), tp(3));
+        buf.reset_from_base_touched(&iv_base, &dv_base);
+        assert_eq!(buf.interval_vars, iv_base);
+        assert_eq!(buf.decision_vars, dv_base);
+
+        // Clear and ensure touched is empty
+        buf.clear_touched();
+        assert!(buf.touched.is_empty());
+    }
+
+    #[test]
+    fn test_neighborhood_candidate_new_packs_fields() {
+        let cand = NeighborhoodCandidate::new(
+            ChainSetDelta::new(),
+            vec![VarPatch::new(IntervalVar::new(tp(0), tp(1)), 0)],
+            vec![VarPatch::new(DecisionVar::assigned(bi(0), tp(0)), 0)],
+            -7,
+            -9,
+        );
+        assert_eq!(cand.interval_var_patch.len(), 1);
+        assert_eq!(cand.decision_vars_patch.len(), 1);
+        assert_eq!(cand.true_delta_cost, -7);
+        assert_eq!(cand.search_delta_cost, -9);
     }
 }

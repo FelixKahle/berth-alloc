@@ -22,4 +22,3 @@
 pub mod context;
 pub mod patch;
 pub mod runner;
-pub mod traits;

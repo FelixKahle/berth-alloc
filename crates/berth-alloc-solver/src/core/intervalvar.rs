@@ -36,3 +36,13 @@ impl<T> IntervalVar<T> {
         }
     }
 }
+
+impl<T: std::fmt::Display> std::fmt::Display for IntervalVar<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "IntervalVar(start_upper_bound: {}, start_lower_bound: {})",
+            self.start_time_lower_bound, self.start_time_upper_bound
+        )
+    }
+}
