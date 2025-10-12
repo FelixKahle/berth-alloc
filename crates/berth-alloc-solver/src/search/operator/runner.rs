@@ -319,7 +319,9 @@ mod tests {
     use super::*;
     use crate::{
         engine::context::{EngineContext, SearchContext},
-        scheduling::greedy::GreedyCalendar,
+        scheduling::{
+            greedy::GreedyCalendar, pipeline::PipelineScheduler, tightener::BoundsTightener,
+        },
         search::filter::traits::FeasibilityFilter,
         state::{
             chain_set::{
@@ -458,8 +460,13 @@ mod tests {
         );
         let m = SolverModel::from_problem(&p).unwrap();
 
+        let bounds = BoundsTightener::default();
+
         let state = SolverSearchState::new_unassigned(&m, 0, 0);
-        let engine = EngineContext::new(&m, GreedyCalendar);
+        let engine = EngineContext::new(
+            &m,
+            PipelineScheduler::new(vec![Box::new(bounds)], GreedyCalendar),
+        );
         let search = SearchContext::new(&engine, 0.0);
 
         // Overlay a chain 0 with nodes [0,1]

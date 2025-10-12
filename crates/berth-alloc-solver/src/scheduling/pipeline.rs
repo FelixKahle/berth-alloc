@@ -75,18 +75,38 @@ where
         self.placer
             .schedule_chain_slice(model, chain, start_inclusive, end_exclusive, iv, dv)
     }
+}
 
-    #[inline]
-    fn valid_schedule_slice<C: ChainSetView>(
-        &self,
-        model: &SolverModel<'_, T>,
-        chain: ChainRef<'_, C>,
-        start_inclusive: NodeIndex,
-        end_exclusive: Option<NodeIndex>,
-        iv: &[IntervalVar<T>],
-    ) -> Result<(), SchedulingError> {
-        self.placer
-            .valid_schedule_slice(model, chain, start_inclusive, end_exclusive, iv)
+pub struct PipelineBuilder<S, T> {
+    props: Vec<Box<dyn Propagator<T> + Send + Sync>>,
+    placer: S,
+}
+impl<S, T> PipelineBuilder<S, T>
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub,
+    S: CalendarScheduler<T>,
+{
+    pub fn new(placer: S) -> Self {
+        Self {
+            props: vec![],
+            placer,
+        }
+    }
+
+    pub fn with_propagator<P>(self, p: P) -> Self
+    where
+        P: Propagator<T> + Send + Sync + 'static,
+    {
+        self.with_propagator_box(Box::new(p))
+    }
+
+    pub fn with_propagator_box(mut self, p: Box<dyn Propagator<T> + Send + Sync>) -> Self {
+        self.props.push(p);
+        self
+    }
+
+    pub fn build(self) -> PipelineScheduler<S, T> {
+        PipelineScheduler::new(self.props, self.placer)
     }
 }
 

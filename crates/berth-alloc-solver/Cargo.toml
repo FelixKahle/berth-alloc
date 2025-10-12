@@ -62,3 +62,13 @@ harness = false
 name = "bounds_tightener_benches"
 path = "benches/search/bounds_tightener_benches.rs"
 harness = false
+
+[[bench]]
+name = "greedy_benches"
+path = "benches/search/greedy_benches.rs"
+harness = false
+
+[[bench]]
+name = "pipeline_benches"
+path = "benches/search/pipeline_benches.rs"
+harness = false

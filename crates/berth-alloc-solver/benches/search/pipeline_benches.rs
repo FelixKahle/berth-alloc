@@ -25,8 +25,12 @@ use berth_alloc_model::prelude::*;
 use berth_alloc_model::problem::builder::ProblemBuilder;
 use berth_alloc_model::problem::req::Request;
 use berth_alloc_solver::{
-    core::intervalvar::IntervalVar,
-    scheduling::{tightener::BoundsTightener, traits::Propagator},
+    core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
+    scheduling::{
+        greedy::GreedyCalendar,
+        tightener::BoundsTightener,
+        traits::{CalendarScheduler, Propagator},
+    },
     state::{
         chain_set::{
             base::ChainSet,
@@ -62,6 +66,7 @@ fn rid(n: usize) -> RequestIdentifier {
     RequestIdentifier::new(n)
 }
 
+/// Build a simple 1-berth problem with identical request windows and PTs.
 fn build_problem(
     num_requests: usize,
     berth_window: (i64, i64),
@@ -81,7 +86,7 @@ fn build_problem(
             1,
             map,
         )
-        .expect("req ok");
+        .expect("request ok");
         builder.add_flexible(req);
     }
 
@@ -104,15 +109,20 @@ fn link_chain(cs: &mut ChainSet, c: usize, nodes: &[usize]) {
     cs.apply_delta(delta);
 }
 
-/// Build fresh interval variables with identical windows.
+/// Fresh IVs from model windows.
 fn default_ivars(m: &SolverModel<'_, i64>) -> Vec<IntervalVar<i64>> {
     m.feasible_intervals()
         .iter()
         .map(|w| IntervalVar::new(w.start(), w.end()))
-        .collect::<Vec<_>>() // <-- explicit type
+        .collect()
 }
 
-fn bench_bounds_tightener(c: &mut Criterion) {
+/// Fresh DVs (all Unassigned).
+fn default_dvars(m: &SolverModel<'_, i64>) -> Vec<DecisionVar<i64>> {
+    vec![DecisionVar::Unassigned; m.flexible_requests_len()]
+}
+
+fn bench_pipeline_scheduler(c: &mut Criterion) {
     // --- setup ---
     let num_requests = 25;
     let berth_window = (0, 500);
@@ -122,24 +132,44 @@ fn bench_bounds_tightener(c: &mut Criterion) {
     let problem = build_problem(num_requests, berth_window, request_window, processing_time);
     let model = SolverModel::from_problem(&problem).unwrap();
 
-    let ivars = default_ivars(&model);
-
     let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());
     link_chain(&mut cs, 0, &(0..num_requests).collect::<Vec<_>>());
     let c0 = cs.chain(ChainIndex(0));
     let dyn_c0 = ChainViewDynAdapter(c0);
 
-    let propagator = BoundsTightener;
+    // explicit propagator to mirror your docs bench
+    let tightener = BoundsTightener;
+    let pipeline = berth_alloc_solver::scheduling::pipeline::PipelineScheduler::new(
+        vec![Box::new(tightener) as Box<dyn Propagator<i64> + Send + Sync>],
+        GreedyCalendar,
+    );
 
-    // --- benchmark ---
-    c.bench_function("BoundsTightener propagate (25 nodes, 1 berth)", |b| {
-        b.iter(|| {
-            let mut ivars_copy = ivars.clone();
-            black_box(propagator.propagate(&model, &dyn_c0, ivars_copy.as_mut_slice()))
-                .expect("valid schedule");
-        });
-    });
+    c.bench_function(
+        "PipelineScheduler (Tightener + Greedy) schedule_chain (25 nodes)",
+        |b| {
+            b.iter(|| {
+                let mut ivars = default_ivars(&model);
+                let mut dvars = default_dvars(&model);
+
+                // (Optional) show the propagator alone; mostly to match your narrative.
+                // Not required because PipelineScheduler will call it again; comment out if you want pure pipeline cost.
+                black_box(BoundsTightener.propagate(&model, &dyn_c0, ivars.as_mut_slice()))
+                    .expect("propagation ok");
+
+                black_box(
+                    pipeline
+                        .schedule_chain(&model, c0, &mut ivars, &mut dvars)
+                        .expect("pipeline schedule ok"),
+                );
+
+                // sanity: monotone increasing, contiguous placement
+                let d0 = dvars[0].as_assigned().unwrap();
+                let d1 = dvars[1].as_assigned().unwrap();
+                assert!(d1.start_time >= d0.start_time);
+            });
+        },
+    );
 }
 
-criterion_group!(benches, bench_bounds_tightener);
+criterion_group!(benches, bench_pipeline_scheduler);
 criterion_main!(benches);

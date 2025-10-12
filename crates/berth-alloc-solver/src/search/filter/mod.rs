@@ -20,6 +20,5 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 pub mod feasible_berth_filter;
-pub mod feasible_schedule_filter;
 pub mod filter_stack;
 pub mod traits;

@@ -268,19 +268,91 @@ where
                 }
             }
 
-            // Final check: After both passes, ensure that for every request, the
-            // lower bound is still less than or equal to the upper bound.
-            for (i, ivar) in interval_variables.iter().enumerate() {
-                if ivar.start_time_lower_bound > ivar.start_time_upper_bound {
-                    return Err(SchedulingError::FeasiblyWindowViolation(
-                        FeasiblyWindowViolationError::new(RequestIndex(i)),
-                    ));
+            // Final sanity check: ensure no interval has LB > UB.
+            {
+                let mut cur = chain_view.real_start();
+                let mut guard = interval_variables.len();
+
+                while let Some(n) = cur {
+                    if guard == 0 {
+                        break;
+                    } // defensive
+                    guard -= 1;
+
+                    let i = RequestIndex(n.get()).get();
+                    let ivar = &interval_variables[i];
+                    if ivar.start_time_lower_bound > ivar.start_time_upper_bound {
+                        return Err(SchedulingError::FeasiblyWindowViolation(
+                            FeasiblyWindowViolationError::new(RequestIndex(i)),
+                        ));
+                    }
+                    cur = chain_view.next_real(n);
                 }
             }
         }
 
         Ok(())
     }
+}
+
+/// Computes the effective start-time bounds for the forward pass (tightening LBs).
+/// This version assumes a closed start-time domain [L, U].
+#[inline(always)]
+fn start_bounds_lb_pass<T: Copy + Ord + CheckedSub>(
+    feasible_window: TimeInterval<T>,
+    ivar: &IntervalVar<T>,
+    earliest_precedence_time: TimePoint<T>,
+    processing_time: TimeDelta<T>,
+    req: RequestIndex,
+) -> Result<(TimePoint<T>, TimePoint<T>), SchedulingError> {
+    // Combine precedence, request window, and prior lower bound.
+    let lower_bound = max(
+        earliest_precedence_time,
+        max(ivar.start_time_lower_bound, feasible_window.start()),
+    );
+
+    // Latest start allowed by the request’s own feasible window.
+    let ub_from_window = feasible_window
+        .end()
+        .checked_sub(processing_time)
+        .ok_or_else(|| {
+            SchedulingError::FeasiblyWindowViolation(FeasiblyWindowViolationError::new(req))
+        })?;
+
+    // Latest start allowed by current domain (already a start bound → no subtraction).
+    let upper_bound = min(ivar.start_time_upper_bound, ub_from_window);
+
+    Ok((lower_bound, upper_bound))
+}
+
+/// Computes the effective start-time bounds for the backward pass (tightening UBs).
+/// Also assumes a closed start-time domain [L, U].
+#[inline(always)]
+fn start_bounds_ub_pass<T: Copy + Ord + CheckedSub>(
+    feasible_window: TimeInterval<T>,
+    ivar: &IntervalVar<T>,
+    precedence_cap_on_start: Option<TimePoint<T>>,
+    processing_time: TimeDelta<T>,
+    req: RequestIndex,
+) -> Result<(TimePoint<T>, TimePoint<T>), SchedulingError> {
+    // Lower bound respects both prior propagation and feasible window.
+    let lower_bound = max(ivar.start_time_lower_bound, feasible_window.start());
+
+    // Latest start allowed by feasible window.
+    let ub_from_window = feasible_window
+        .end()
+        .checked_sub(processing_time)
+        .ok_or_else(|| {
+            SchedulingError::FeasiblyWindowViolation(FeasiblyWindowViolationError::new(req))
+        })?;
+
+    // Combine domain UB, feasible window, and successor constraint.
+    let mut upper_bound = min(ivar.start_time_upper_bound, ub_from_window);
+    if let Some(cap) = precedence_cap_on_start {
+        upper_bound = min(upper_bound, cap);
+    }
+
+    Ok((lower_bound, upper_bound))
 }
 
 /// Advances a cursor `index` through `free_intervals` to the first segment
@@ -322,70 +394,6 @@ fn retreat_to_segment<T: Copy + Ord>(
         }
         i -= 1;
     }
-}
-
-/// Calculates effective start bounds for the forward (LB tightening) pass.
-#[inline]
-fn start_bounds_lb_pass<T: Copy + Ord + CheckedSub>(
-    feasible_window: TimeInterval<T>,
-    interval_var: &IntervalVar<T>,
-    earliest_precedence_time: TimePoint<T>,
-    processing_time: TimeDelta<T>,
-    request_index: RequestIndex,
-) -> Result<(TimePoint<T>, TimePoint<T>), SchedulingError> {
-    let lower_bound = max(
-        earliest_precedence_time,
-        max(interval_var.start_time_lower_bound, feasible_window.start()),
-    );
-
-    let ub_from_window = feasible_window
-        .end()
-        .checked_sub(processing_time)
-        .ok_or_else(|| {
-            SchedulingError::FeasiblyWindowViolation(FeasiblyWindowViolationError::new(
-                request_index,
-            ))
-        })?;
-    let ub_from_finish_cap = interval_var
-        .start_time_upper_bound
-        .checked_sub(processing_time)
-        .ok_or_else(|| {
-            SchedulingError::FeasiblyWindowViolation(FeasiblyWindowViolationError::new(
-                request_index,
-            ))
-        })?;
-
-    Ok((lower_bound, min(ub_from_window, ub_from_finish_cap)))
-}
-
-/// Calculates effective start bounds for the backward (UB tightening) pass.
-#[inline]
-fn start_bounds_ub_pass<T: Copy + Ord + CheckedSub>(
-    feasible_window: TimeInterval<T>,
-    interval_var: &IntervalVar<T>,
-    precedence_cap_on_start: Option<TimePoint<T>>,
-    processing_time: TimeDelta<T>,
-    request_index: RequestIndex,
-) -> Result<(TimePoint<T>, TimePoint<T>), SchedulingError> {
-    let lower_bound = max(interval_var.start_time_lower_bound, feasible_window.start());
-
-    let ub_from_window = feasible_window
-        .end()
-        .checked_sub(processing_time)
-        .ok_or_else(|| {
-            SchedulingError::FeasiblyWindowViolation(FeasiblyWindowViolationError::new(
-                request_index,
-            ))
-        })?;
-
-    let mut upper_bound = min(interval_var.start_time_upper_bound, ub_from_window);
-
-    // Apply the additional constraint from the successor's position.
-    if let Some(cap) = precedence_cap_on_start {
-        upper_bound = min(upper_bound, cap);
-    }
-
-    Ok((lower_bound, upper_bound))
 }
 
 /// Finds the EARLIEST start `s` in `[lb, ub]` that fits in a single calendar segment.
@@ -672,6 +680,267 @@ mod tests {
                 assert_eq!(e.berth(), bi(0));
             }
             x => panic!("expected NotAllowedOnBerth, got {:?}", x),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::state::{
+            chain_set::{
+                base::ChainSet,
+                delta::{ChainNextRewire, ChainSetDelta},
+                index::{ChainIndex, NodeIndex},
+                view::{ChainSetView, ChainViewDynAdapter},
+            },
+            index::{BerthIndex, RequestIndex},
+            model::SolverModel,
+        };
+        use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
+        use berth_alloc_model::common::FlexibleKind;
+        use berth_alloc_model::prelude::{Berth, BerthIdentifier, Problem, RequestIdentifier};
+        use berth_alloc_model::problem::builder::ProblemBuilder;
+        use berth_alloc_model::problem::req::Request;
+        use std::collections::BTreeMap;
+
+        // ---- utilities ----
+        #[inline]
+        fn tp(v: i64) -> TimePoint<i64> {
+            TimePoint::new(v)
+        }
+        #[inline]
+        fn td(v: i64) -> TimeDelta<i64> {
+            TimeDelta::new(v)
+        }
+        #[inline]
+        fn iv(a: i64, b: i64) -> TimeInterval<i64> {
+            TimeInterval::new(tp(a), tp(b))
+        }
+        #[inline]
+        fn bid(n: usize) -> BerthIdentifier {
+            BerthIdentifier::new(n)
+        }
+        #[inline]
+        fn rid(n: usize) -> RequestIdentifier {
+            RequestIdentifier::new(n)
+        }
+        #[inline]
+        fn bi(n: usize) -> BerthIndex {
+            BerthIndex(n)
+        }
+        #[inline]
+        fn ri(n: usize) -> RequestIndex {
+            RequestIndex(n)
+        }
+
+        fn build_problem(
+            berths_windows: &[Vec<(i64, i64)>],
+            request_windows: &[(i64, i64)],
+            processing: &[Vec<Option<i64>>],
+        ) -> Problem<i64> {
+            let mut builder = ProblemBuilder::new();
+            for (i, windows) in berths_windows.iter().enumerate() {
+                let b = Berth::from_windows(bid(i), windows.iter().map(|&(s, e)| iv(s, e)));
+                builder.add_berth(b);
+            }
+            for (i, &(ws, we)) in request_windows.iter().enumerate() {
+                let mut map = BTreeMap::new();
+                for (j, p) in processing[i].iter().copied().enumerate() {
+                    if let Some(dur) = p {
+                        map.insert(bid(j), td(dur));
+                    }
+                }
+                let req = Request::<FlexibleKind, i64>::new(rid(i), iv(ws, we), 1, map)
+                    .expect("request ok");
+                builder.add_flexible(req);
+            }
+            builder.build().expect("problem ok")
+        }
+
+        fn default_ivars(m: &SolverModel<'_, i64>) -> Vec<IntervalVar<i64>> {
+            m.feasible_intervals()
+                .iter()
+                .zip(m.processing_times())
+                .map(|(w, p_times)| {
+                    // Find the first valid processing time for this request to use for initialization.
+                    // If none exist, it can't be scheduled anywhere, so we can default to 0 duration.
+                    let first_valid_pt = p_times
+                        .iter()
+                        .find_map(|&opt| Some(opt)) // Find the first Some(value) and return it
+                        .unwrap_or_else(|| td(0)); // Default to duration 0 if no valid times
+
+                    let ub = w
+                        .end()
+                        .checked_sub(first_valid_pt)
+                        .unwrap_or_else(TimePoint::zero);
+                    IntervalVar::new(w.start(), ub)
+                })
+                .collect()
+        }
+
+        fn link_chain(cs: &mut ChainSet, c: usize, nodes: &[usize]) {
+            let s = cs.start_of_chain(ChainIndex(c));
+            let e = cs.end_of_chain(ChainIndex(c));
+            if nodes.is_empty() {
+                return;
+            }
+            let mut delta = ChainSetDelta::new();
+            delta.push_rewire(ChainNextRewire::new(s, NodeIndex(nodes[0])));
+            for w in nodes.windows(2) {
+                delta.push_rewire(ChainNextRewire::new(NodeIndex(w[0]), NodeIndex(w[1])));
+            }
+            delta.push_rewire(ChainNextRewire::new(NodeIndex(*nodes.last().unwrap()), e));
+            cs.apply_delta(delta);
+        }
+
+        #[test]
+        fn test_forward_pass_respects_ivar_ub_as_start_time() {
+            let p = build_problem(&[vec![(0, 100)]], &[(0, 100)], &[vec![Some(10)]]);
+            let m = SolverModel::from_problem(&p).unwrap();
+            let mut ivars = default_ivars(&m);
+
+            // Manually set the narrow bounds that trigger the bug.
+            ivars[0].start_time_lower_bound = tp(45);
+            ivars[0].start_time_upper_bound = tp(50);
+
+            let mut cs = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+            link_chain(&mut cs, 0, &[0]);
+            let c0 = cs.chain(ChainIndex(0));
+            let dyn_c0 = ChainViewDynAdapter(c0);
+
+            // With the fix, this should now succeed.
+            let result = BoundsTightener.propagate(&m, &dyn_c0, &mut ivars);
+            assert!(result.is_ok());
+
+            // The forward pass should find the earliest start at 45.
+            // The backward pass will tighten the upper bound to 50.
+            assert_eq!(ivars[0].start_time_lower_bound, tp(45));
+            assert_eq!(ivars[0].start_time_upper_bound, tp(50));
+        }
+
+        #[test]
+        fn test_backward_tightens_ub_to_latest_fit_in_segment() {
+            // free: [0,5), [8,20); window [0,30), PT=4; UB large ⇒ latest start is 16
+            let p = build_problem(&[vec![(0, 5), (8, 20)]], &[(0, 30)], &[vec![Some(4)]]);
+            let m = SolverModel::from_problem(&p).unwrap();
+
+            let mut ivars = default_ivars(&m);
+            // Make UB permissive
+            ivars[0].start_time_upper_bound = tp(10_000);
+
+            let mut cs = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+            link_chain(&mut cs, 0, &[0]);
+
+            let c0 = cs.chain(ChainIndex(0));
+            let dyn_c0 = ChainViewDynAdapter(c0);
+            BoundsTightener.propagate(&m, &dyn_c0, &mut ivars).unwrap();
+
+            assert_eq!(ivars[0].start_time_upper_bound, tp(16));
+        }
+
+        #[test]
+        fn test_backward_respects_precedence_cap_from_successor() {
+            // free: [0,100); R0 pt=5, R1 pt=7.
+            // Set successor UB = 12 ⇒ R0 must satisfy s0 + 5 ≤ 12 ⇒ s0 ≤ 7 (plus window).
+            let p = build_problem(
+                &[vec![(0, 100)]],
+                &[(0, 100), (0, 100)],
+                &[vec![Some(5)], vec![Some(7)]],
+            );
+            let m = SolverModel::from_problem(&p).unwrap();
+
+            let mut ivars = default_ivars(&m);
+            ivars[1].start_time_upper_bound = tp(12); // successor cap
+
+            let mut cs = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+            link_chain(&mut cs, 0, &[0, 1]);
+
+            let c0 = cs.chain(ChainIndex(0));
+            let dyn_c0 = ChainViewDynAdapter(c0);
+            BoundsTightener.propagate(&m, &dyn_c0, &mut ivars).unwrap();
+
+            assert_eq!(ivars[0].start_time_upper_bound, tp(7)); // 12 - pt0(5)
+        }
+
+        #[test]
+        fn forward_and_backward_squeeze_to_meet_in_gap() {
+            // free: [0,5), [10,15); pt=4; window [0,20)
+            // Forward pass finds earliest start is 0, so LB becomes 0.
+            // Backward pass finds latest start is 11 (to finish by 15), so UB becomes 11.
+            let p = build_problem(&[vec![(0, 5), (10, 15)]], &[(0, 20)], &[vec![Some(4)]]);
+            let m = SolverModel::from_problem(&p).unwrap();
+
+            let mut ivars = default_ivars(&m);
+            ivars[0].start_time_upper_bound = tp(10_000); // Make UB permissive
+
+            let mut cs = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+            link_chain(&mut cs, 0, &[0]);
+
+            let c0 = cs.chain(ChainIndex(0));
+            let dyn_c0 = ChainViewDynAdapter(c0);
+            BoundsTightener.propagate(&m, &dyn_c0, &mut ivars).unwrap();
+
+            assert_eq!(ivars[0].start_time_lower_bound, tp(0));
+            assert_eq!(ivars[0].start_time_upper_bound, tp(11));
+        }
+
+        #[test]
+        fn test_backward_detects_infeasibility_when_ub_drops_below_lb() {
+            // free [0,100), pt=10, window [0,100)
+            // Force successor UB tight so predecessor UB < LB.
+            let p = build_problem(
+                &[vec![(0, 100)]],
+                &[(0, 100), (0, 100)],
+                &[vec![Some(10)], vec![Some(1)]],
+            );
+            let m = SolverModel::from_problem(&p).unwrap();
+
+            let mut ivars = default_ivars(&m);
+            // successor UB = 5 ⇒ pred s ≤ 5 - 10 = -5.
+            ivars[1].start_time_upper_bound = tp(5);
+            // pred LB high:
+            ivars[0].start_time_lower_bound = tp(0);
+
+            let mut cs = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+            link_chain(&mut cs, 0, &[0, 1]);
+
+            let c0 = cs.chain(ChainIndex(0));
+            let dyn_c0 = ChainViewDynAdapter(c0);
+            let err = BoundsTightener
+                .propagate(&m, &dyn_c0, &mut ivars)
+                .unwrap_err();
+            match err {
+                SchedulingError::FeasiblyWindowViolation(_) => {}
+                x => panic!("expected FWV, got {:?}", x),
+            }
+        }
+
+        #[test]
+        fn test_backward_not_allowed_on_berth_propagates_error() {
+            // two berths; req0 allowed only on berth1; chain is on berth0 -> error
+            let p = build_problem(
+                &[vec![(0, 100)], vec![(0, 100)]],
+                &[(0, 100)],
+                &[vec![None, Some(10)]],
+            );
+            let m = SolverModel::from_problem(&p).unwrap();
+
+            let mut ivars = default_ivars(&m);
+            let mut cs = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+            link_chain(&mut cs, 0, &[0]);
+
+            let c0 = cs.chain(ChainIndex(0));
+            let dyn_c0 = ChainViewDynAdapter(c0);
+            let err = BoundsTightener
+                .propagate(&m, &dyn_c0, &mut ivars)
+                .unwrap_err();
+            match err {
+                SchedulingError::NotAllowedOnBerth(e) => {
+                    assert_eq!(e.request(), ri(0));
+                    assert_eq!(e.berth(), bi(0));
+                }
+                x => panic!("expected NotAllowedOnBerth, got {:?}", x),
+            }
         }
     }
 }

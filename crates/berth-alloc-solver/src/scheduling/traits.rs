@@ -58,25 +58,6 @@ pub trait CalendarScheduler<T: Copy + Ord + CheckedAdd> {
         interval_vars: &mut [IntervalVar<T>],  // aligned by RequestIndex = node.get()
         decision_vars: &mut [DecisionVar<T>],  // aligned by RequestIndex = node.get()
     ) -> Result<(), SchedulingError>;
-
-    fn valid_schedule_slice<'a, C: ChainSetView>(
-        &self,
-        model: &SolverModel<'a, T>,
-        chain: ChainRef<'_, C>,
-        start_node: NodeIndex,
-        end_node_exclusive: Option<NodeIndex>, // None => chain end
-        interval_vars: &[IntervalVar<T>],      // aligned by RequestIndex = node.get()
-    ) -> Result<(), SchedulingError>;
-
-    fn valid_schedule<'a, C: ChainSetView>(
-        &self,
-        model: &SolverModel<'a, T>,
-        chain: ChainRef<'_, C>,
-        interval_vars: &[IntervalVar<T>], // aligned by RequestIndex = node.get()
-    ) -> Result<(), SchedulingError> {
-        let start = chain.start();
-        self.valid_schedule_slice(model, chain, start, None, interval_vars)
-    }
 }
 
 pub trait Propagator<T: Copy + Ord + CheckedAdd> {
