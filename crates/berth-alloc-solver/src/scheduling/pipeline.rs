@@ -21,92 +21,149 @@
 use crate::core::{decisionvar::DecisionVar, intervalvar::IntervalVar};
 use crate::scheduling::{
     err::SchedulingError,
-    traits::{CalendarScheduler, Propagator},
+    traits::{Propagator, Scheduler},
 };
+use crate::state::chain_set::base::ChainSet;
 use crate::state::chain_set::index::NodeIndex;
-use crate::state::chain_set::view::{ChainRef, ChainSetView, ChainViewDynAdapter};
+use crate::state::chain_set::overlay::ChainSetOverlay;
+use crate::state::chain_set::view::ChainRef;
 use crate::state::model::SolverModel;
 use num_traits::{CheckedAdd, CheckedSub};
 use std::marker::PhantomData;
 
-pub struct PipelineScheduler<S, T>
+pub trait PropagatorObject<T>
 where
-    S: CalendarScheduler<T>,
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {
-    props: Vec<Box<dyn Propagator<T> + Send + Sync>>,
-    placer: S,
-    _t: PhantomData<T>,
+    fn propagate_overlay<'a>(
+        &self,
+        model: &SolverModel<'a, T>,
+        chain: ChainRef<'_, ChainSetOverlay>,
+        interval_vars: &mut [IntervalVar<T>],
+    ) -> Result<(), SchedulingError>;
+
+    fn propagate_base<'a>(
+        &self,
+        model: &SolverModel<'a, T>,
+        chain: ChainRef<'_, ChainSet>,
+        interval_vars: &mut [IntervalVar<T>],
+    ) -> Result<(), SchedulingError>;
 }
 
-impl<S, T> PipelineScheduler<S, T>
+impl<T, P> PropagatorObject<T> for P
 where
-    S: CalendarScheduler<T>,
     T: Copy + Ord + CheckedAdd + CheckedSub,
+    P: Propagator<T>,
 {
-    pub fn new(props: Vec<Box<dyn Propagator<T> + Send + Sync>>, placer: S) -> Self {
-        Self {
-            props,
-            placer,
-            _t: PhantomData,
-        }
+    #[inline]
+    fn propagate_overlay<'a>(
+        &self,
+        model: &SolverModel<'a, T>,
+        chain: ChainRef<'_, ChainSetOverlay>,
+        interval_vars: &mut [IntervalVar<T>],
+    ) -> Result<(), SchedulingError> {
+        self.propagate(model, chain, interval_vars)
+    }
+
+    #[inline]
+    fn propagate_base<'a>(
+        &self,
+        model: &SolverModel<'a, T>,
+        chain: ChainRef<'_, ChainSet>,
+        interval_vars: &mut [IntervalVar<T>],
+    ) -> Result<(), SchedulingError> {
+        self.propagate(model, chain, interval_vars)
     }
 }
 
-impl<S, T> CalendarScheduler<T> for PipelineScheduler<S, T>
+pub struct SchedulingPipeline<T, S>
 where
-    S: CalendarScheduler<T>,
     T: Copy + Ord + CheckedAdd + CheckedSub,
+    S: Scheduler<T>,
 {
+    propagators: Vec<Box<dyn PropagatorObject<T>>>,
+    placer: S,
+    _phantom: PhantomData<T>,
+}
+
+impl<T, S> SchedulingPipeline<T, S>
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub,
+    S: Scheduler<T>,
+{
+    /// Legacy constructor if you’ve pre-wrapped into `PropagatorObject`.
+    pub fn new(props: Vec<Box<dyn PropagatorObject<T>>>, placer: S) -> Self {
+        Self {
+            propagators: props,
+            placer,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Run on a `ChainSet` (base).
     #[inline]
-    fn schedule_chain_slice<C: ChainSetView>(
+    pub fn run_slice_base(
         &self,
         model: &SolverModel<'_, T>,
-        chain: ChainRef<'_, C>,
+        chain: ChainRef<'_, ChainSet>,
         start_inclusive: NodeIndex,
         end_exclusive: Option<NodeIndex>,
         iv: &mut [IntervalVar<T>],
         dv: &mut [DecisionVar<T>],
     ) -> Result<(), SchedulingError> {
-        let dyn_chain = ChainViewDynAdapter(chain);
-        for p in &self.props {
-            p.propagate(model, &dyn_chain, iv)?;
+        for p in &self.propagators {
+            p.propagate_base(model, chain, iv)?;
         }
         self.placer
             .schedule_chain_slice(model, chain, start_inclusive, end_exclusive, iv, dv)
     }
-}
 
-pub struct PipelineBuilder<S, T> {
-    props: Vec<Box<dyn Propagator<T> + Send + Sync>>,
-    placer: S,
-}
-impl<S, T> PipelineBuilder<S, T>
-where
-    T: Copy + Ord + CheckedAdd + CheckedSub,
-    S: CalendarScheduler<T>,
-{
-    pub fn new(placer: S) -> Self {
-        Self {
-            props: vec![],
-            placer,
+    #[inline]
+    pub fn run_base(
+        &self,
+        model: &SolverModel<'_, T>,
+        chain: ChainRef<'_, ChainSet>,
+        iv: &mut [IntervalVar<T>],
+        dv: &mut [DecisionVar<T>],
+    ) -> Result<(), SchedulingError> {
+        self.run_slice_base(model, chain, chain.start(), None, iv, dv)
+    }
+
+    /// Run on a `ChainSetOverlay`.
+    #[inline]
+    pub fn run_slice_overlay(
+        &self,
+        model: &SolverModel<'_, T>,
+        chain: ChainRef<'_, ChainSetOverlay<'_, '_>>,
+        start_inclusive: NodeIndex,
+        end_exclusive: Option<NodeIndex>,
+        iv: &mut [IntervalVar<T>],
+        dv: &mut [DecisionVar<T>],
+    ) -> Result<(), SchedulingError> {
+        for p in &self.propagators {
+            p.propagate_overlay(model, chain, iv)?;
         }
+        self.placer
+            .schedule_chain_slice(model, chain, start_inclusive, end_exclusive, iv, dv)
     }
 
-    pub fn with_propagator<P>(self, p: P) -> Self
+    #[inline]
+    pub fn run_overlay(
+        &self,
+        model: &SolverModel<'_, T>,
+        chain: ChainRef<'_, ChainSetOverlay<'_, '_>>,
+        iv: &mut [IntervalVar<T>],
+        dv: &mut [DecisionVar<T>],
+    ) -> Result<(), SchedulingError> {
+        self.run_slice_overlay(model, chain, chain.start(), None, iv, dv)
+    }
+
+    /// Add another concrete propagator later.
+    pub fn add_propagator<P>(&mut self, p: P)
     where
-        P: Propagator<T> + Send + Sync + 'static,
+        P: Propagator<T> + 'static,
     {
-        self.with_propagator_box(Box::new(p))
-    }
-
-    pub fn with_propagator_box(mut self, p: Box<dyn Propagator<T> + Send + Sync>) -> Self {
-        self.props.push(p);
-        self
-    }
-
-    pub fn build(self) -> PipelineScheduler<S, T> {
-        PipelineScheduler::new(self.props, self.placer)
+        self.propagators.push(Box::new(p));
     }
 }
 
@@ -114,9 +171,7 @@ where
 mod tests {
     use super::*;
     use crate::core::{decisionvar::DecisionVar, intervalvar::IntervalVar};
-    use crate::scheduling::{
-        greedy::GreedyCalendar, tightener::BoundsTightener, traits::CalendarScheduler,
-    };
+    use crate::scheduling::{greedy::GreedyScheduler, tightener::BoundsTightener};
     use crate::state::{
         chain_set::{
             base::ChainSet,
@@ -134,7 +189,6 @@ mod tests {
     use berth_alloc_model::problem::req::Request;
     use std::collections::BTreeMap;
 
-    // ---------- helpers ----------
     #[inline]
     fn tp(v: i64) -> TimePoint<i64> {
         TimePoint::new(v)
@@ -245,10 +299,10 @@ mod tests {
         link_chain(&mut cs, 0, &[0, 1, 2]);
         let c0 = cs.chain(ChainIndex(0));
 
-        let pipeline = PipelineScheduler::new(vec![Box::new(BoundsTightener)], GreedyCalendar);
+        let pipeline = SchedulingPipeline::new(vec![Box::new(BoundsTightener)], GreedyScheduler);
 
         pipeline
-            .schedule_chain(&m, c0, &mut ivars, &mut dvars)
+            .run_base(&m, c0, &mut ivars, &mut dvars)
             .expect("pipeline should schedule");
 
         let d0 = dvars[0].as_assigned().unwrap();
@@ -276,10 +330,10 @@ mod tests {
         link_chain(&mut cs, 0, &[0]);
         let c0 = cs.chain(ChainIndex(0));
 
-        let pipeline = PipelineScheduler::new(vec![Box::new(BoundsTightener)], GreedyCalendar);
+        let pipeline = SchedulingPipeline::new(vec![Box::new(BoundsTightener)], GreedyScheduler);
 
         pipeline
-            .schedule_chain(&m, c0, &mut ivars, &mut dvars)
+            .run_base(&m, c0, &mut ivars, &mut dvars)
             .expect("pipeline should schedule");
 
         // BoundsTightener should raise LB to 10 (first segment can't fit PT=4), and Greedy should assign at 10.

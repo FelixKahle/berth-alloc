@@ -27,30 +27,33 @@ use crate::{
         arc_evaluator::ObjectiveArcEvaluator, search::SearchObjective,
         wtt::WeightedTurnaroundTimeObjective,
     },
-    scheduling::{greedy::GreedyCalendar, pipeline::PipelineScheduler, traits::CalendarScheduler},
+    scheduling::{pipeline::SchedulingPipeline, traits::Scheduler},
     search::filter::{filter_stack::FilterStack, traits::FeasibilityFilter},
     state::model::SolverModel,
 };
 
-pub struct EngineContext<'model, 'problem, T, S = PipelineScheduler<GreedyCalendar, T>>
+pub struct EngineContext<'model, 'problem, T, S>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
-    S: CalendarScheduler<T>,
+    S: Scheduler<T>,
 {
     model: &'model SolverModel<'problem, T>,
-    scheduler: S,
+    pipeline: SchedulingPipeline<T, S>,
     filters: FilterStack<'model, 'problem, T>,
 }
 
 impl<'model, 'problem, T, S> EngineContext<'model, 'problem, T, S>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
-    S: CalendarScheduler<T>,
+    S: Scheduler<T>,
 {
-    pub fn new(model: &'model SolverModel<'problem, T>, scheduler: S) -> Self {
+    pub fn new(
+        model: &'model SolverModel<'problem, T>,
+        scheduler: SchedulingPipeline<T, S>,
+    ) -> Self {
         Self {
             model,
-            scheduler,
+            pipeline: scheduler,
             filters: FilterStack::new(),
         }
     }
@@ -65,22 +68,20 @@ where
     pub fn model(&self) -> &SolverModel<'problem, T> {
         self.model
     }
-
     #[inline]
-    pub fn scheduler(&self) -> &S {
-        &self.scheduler
+    pub fn pipeline(&self) -> &SchedulingPipeline<T, S> {
+        &self.pipeline
     }
-
     #[inline]
     pub fn filters(&self) -> &FilterStack<'model, 'problem, T> {
         &self.filters
     }
 }
 
-pub struct SearchContext<'engine, 'model, 'problem, T, S = PipelineScheduler<GreedyCalendar, T>>
+pub struct SearchContext<'engine, 'model, 'problem, T, S>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
-    S: CalendarScheduler<T>,
+    S: Scheduler<T>,
 {
     engine_context: &'engine EngineContext<'model, 'problem, T, S>,
     objective: WeightedTurnaroundTimeObjective,
@@ -90,7 +91,7 @@ where
 impl<'engine, 'model, 'problem, T, S> SearchContext<'engine, 'model, 'problem, T, S>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
-    S: CalendarScheduler<T>,
+    S: Scheduler<T>,
 {
     pub fn new(
         engine_context: &'engine EngineContext<'model, 'problem, T, S>,
@@ -107,29 +108,26 @@ where
     pub fn engine_context(&self) -> &'engine EngineContext<'model, 'problem, T, S> {
         self.engine_context
     }
-
     #[inline]
     pub fn objective(&self) -> &WeightedTurnaroundTimeObjective {
         &self.objective
     }
-
     #[inline]
     pub fn set_lambda(&mut self, lambda: f64) {
         self.search_objective.set_lambda(lambda);
     }
-
     #[inline]
     pub fn search_objective(&self) -> &SearchObjective<WeightedTurnaroundTimeObjective> {
         &self.search_objective
     }
 
     #[inline]
-    pub fn scheduler(&self) -> &S {
-        self.engine_context.scheduler()
+    pub fn pipeline(&self) -> &'engine SchedulingPipeline<T, S> {
+        self.engine_context.pipeline()
     }
 
     #[inline]
-    pub fn filters(&self) -> &FilterStack<'model, 'problem, T> {
+    pub fn filters(&self) -> &'engine FilterStack<'model, 'problem, T> {
         self.engine_context.filters()
     }
 

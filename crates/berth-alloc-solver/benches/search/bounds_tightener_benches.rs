@@ -32,7 +32,7 @@ use berth_alloc_solver::{
             base::ChainSet,
             delta::{ChainNextRewire, ChainSetDelta},
             index::{ChainIndex, NodeIndex},
-            view::{ChainSetView, ChainViewDynAdapter},
+            view::ChainSetView,
         },
         model::SolverModel,
     },
@@ -127,7 +127,6 @@ fn bench_bounds_tightener(c: &mut Criterion) {
     let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());
     link_chain(&mut cs, 0, &(0..num_requests).collect::<Vec<_>>());
     let c0 = cs.chain(ChainIndex(0));
-    let dyn_c0 = ChainViewDynAdapter(c0);
 
     let propagator = BoundsTightener;
 
@@ -135,7 +134,7 @@ fn bench_bounds_tightener(c: &mut Criterion) {
     c.bench_function("BoundsTightener propagate (25 nodes, 1 berth)", |b| {
         b.iter(|| {
             let mut ivars_copy = ivars.clone();
-            black_box(propagator.propagate(&model, &dyn_c0, ivars_copy.as_mut_slice()))
+            black_box(propagator.propagate(&model, c0, ivars_copy.as_mut_slice()))
                 .expect("valid schedule");
         });
     });

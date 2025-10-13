@@ -25,14 +25,14 @@ use crate::{
     state::{
         chain_set::{
             index::NodeIndex,
-            view::{ChainRef, ChainSetView, ChainViewDyn},
+            view::{ChainRef, ChainSetView},
         },
         model::SolverModel,
     },
 };
 use num_traits::CheckedAdd;
 
-pub trait CalendarScheduler<T: Copy + Ord + CheckedAdd> {
+pub trait Scheduler<T: Copy + Ord + CheckedAdd> {
     #[inline]
     fn name(&self) -> &str {
         std::any::type_name::<Self>()
@@ -66,10 +66,10 @@ pub trait Propagator<T: Copy + Ord + CheckedAdd> {
         std::any::type_name::<Self>()
     }
 
-    fn propagate(
+    fn propagate<'a, C: ChainSetView>(
         &self,
-        solver_model: &SolverModel<'_, T>,
-        chain: &dyn ChainViewDyn,
+        solver_model: &SolverModel<'a, T>,
+        chain: ChainRef<'_, C>,
         iv: &mut [IntervalVar<T>],
     ) -> Result<(), SchedulingError>;
 }

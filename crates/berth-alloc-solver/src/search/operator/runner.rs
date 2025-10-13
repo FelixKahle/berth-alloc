@@ -23,7 +23,7 @@ use crate::{
     core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
     engine::context::SearchContext,
     eval::objective::Objective,
-    scheduling::traits::CalendarScheduler,
+    scheduling::traits::Scheduler,
     search::{filter::traits::FeasibilityFilter, operator::patch::VarPatch},
     state::{
         chain_set::{delta::ChainSetDelta, overlay::ChainSetOverlay, view::ChainSetView},
@@ -156,7 +156,6 @@ pub struct CandidateEvaluator<T>
 where
     T: Copy + Ord,
 {
-    /// A thread-local, reusable buffer to avoid allocations in the hot loop.
     buffer: ScratchBuffer<T>,
 }
 
@@ -172,21 +171,19 @@ where
         }
     }
 
-    /// Evaluates a single `ChainSetDelta` against the current search state.
-    pub fn evaluate<'engine, 'model, 'problem, S>(
+    pub fn evaluate<'search, 'engine, 'model, 'problem, S>(
         &mut self,
-        search_context: &SearchContext<'engine, 'model, 'problem, T, S>,
+        search_context: &'search SearchContext<'engine, 'model, 'problem, T, S>,
         state: &SolverSearchState<'model, 'problem, T>,
         delta: ChainSetDelta,
     ) -> Option<NeighborhoodCandidate<T>>
     where
-        S: CalendarScheduler<T>,
+        S: Scheduler<T>,
     {
         // Quick pre-flight check: does the move violate any basic rules?
         if !search_context.filters().is_feasible(&delta, state) {
             return None;
         }
-
         // Identify all requests affected by this delta.
         let overlay = ChainSetOverlay::new(state.chain_set(), &delta);
         self.buffer.clear_touched();
@@ -208,10 +205,9 @@ where
         for &chain_id in delta.affected_chains() {
             if let Some(start_node) = overlay.earliest_impacted_on_chain(chain_id) {
                 let chain_view = overlay.chain(chain_id);
-                // Schedule from the first impacted node to the end of the chain.
                 if search_context
-                    .scheduler()
-                    .schedule_chain_slice(
+                    .pipeline()
+                    .run_slice_overlay(
                         state.model(),
                         chain_view,
                         start_node,
@@ -221,7 +217,6 @@ where
                     )
                     .is_err()
                 {
-                    // If re-scheduling fails, the move is infeasible.
                     return None;
                 }
             }
@@ -320,7 +315,7 @@ mod tests {
     use crate::{
         engine::context::{EngineContext, SearchContext},
         scheduling::{
-            greedy::GreedyCalendar, pipeline::PipelineScheduler, tightener::BoundsTightener,
+            greedy::GreedyScheduler, pipeline::SchedulingPipeline, tightener::BoundsTightener,
         },
         search::filter::traits::FeasibilityFilter,
         state::{
@@ -435,9 +430,9 @@ mod tests {
         let p = build_problem_with_weights(&[vec![(0, 100)]], &[(0, 100)], &[1], &[vec![Some(5)]]);
         let m = SolverModel::from_problem(&p).unwrap();
 
+        let pipeline = SchedulingPipeline::new(vec![], GreedyScheduler);
         let state = SolverSearchState::new_unassigned(&m, 0, 0);
-        let engine =
-            EngineContext::new(&m, GreedyCalendar).with_filter(Box::new(AlwaysFalseFilter));
+        let engine = EngineContext::new(&m, pipeline).with_filter(Box::new(AlwaysFalseFilter));
         let search = SearchContext::new(&engine, 0.0);
 
         // Any delta: mark the chain, but AlwaysFalseFilter should reject before any scheduling.
@@ -463,10 +458,8 @@ mod tests {
         let bounds = BoundsTightener::default();
 
         let state = SolverSearchState::new_unassigned(&m, 0, 0);
-        let engine = EngineContext::new(
-            &m,
-            PipelineScheduler::new(vec![Box::new(bounds)], GreedyCalendar),
-        );
+        let pipeline = SchedulingPipeline::new(vec![Box::new(bounds)], GreedyScheduler);
+        let engine = EngineContext::new(&m, pipeline);
         let search = SearchContext::new(&engine, 0.0);
 
         // Overlay a chain 0 with nodes [0,1]
@@ -498,7 +491,8 @@ mod tests {
         let m = SolverModel::from_problem(&p).unwrap();
 
         let state = SolverSearchState::new_unassigned(&m, 0, 0);
-        let engine = EngineContext::new(&m, GreedyCalendar);
+        let pipeline = SchedulingPipeline::new(vec![], GreedyScheduler);
+        let engine = EngineContext::new(&m, pipeline);
         // λ = 1.0 (SearchObjective will scale unassignment cost by 2x)
         let search = SearchContext::new(&engine, 1.0);
 
@@ -516,7 +510,7 @@ mod tests {
             .evaluate(&search, &state, delta)
             .expect("evaluation should succeed");
 
-        // DV patches: 2 (both now assigned), IV patches: 0 (GreedyCalendar does not mutate bounds)
+        // DV patches: 2 (both now assigned), IV patches: 0 (GreedyScheduler does not mutate bounds)
         assert_eq!(cand.decision_vars_patch.len(), 2);
         assert_eq!(cand.interval_var_patch.len(), 0);
 

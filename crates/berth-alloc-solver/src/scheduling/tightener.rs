@@ -26,7 +26,7 @@ use crate::{
         traits::Propagator,
     },
     state::{
-        chain_set::view::ChainViewDyn,
+        chain_set::view::{ChainRef, ChainSetView},
         index::{BerthIndex, RequestIndex},
         model::SolverModel,
     },
@@ -58,12 +58,15 @@ impl<T> Propagator<T> for BoundsTightener
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {
-    fn propagate(
+    fn propagate<'a, C>(
         &self,
         solver_model: &SolverModel<'_, T>,
-        chain_view: &dyn ChainViewDyn,
+        chain_view: ChainRef<'_, C>,
         interval_variables: &mut [IntervalVar<T>],
-    ) -> Result<(), SchedulingError> {
+    ) -> Result<(), SchedulingError>
+    where
+        C: ChainSetView,
+    {
         let berth_index = BerthIndex(chain_view.chain_index().get());
         let berth_calendar = solver_model
             .calendar_for_berth(berth_index)
@@ -468,7 +471,7 @@ mod tests {
             base::ChainSet,
             delta::{ChainNextRewire, ChainSetDelta},
             index::{ChainIndex, NodeIndex},
-            view::{ChainSetView, ChainViewDynAdapter},
+            view::ChainSetView,
         },
         index::{BerthIndex, RequestIndex},
         model::SolverModel,
@@ -572,8 +575,7 @@ mod tests {
         link_chain(&mut cs, 0, &[0]);
 
         let c0 = cs.chain(ChainIndex(0));
-        let dyn_c0 = ChainViewDynAdapter(c0);
-        BoundsTightener.propagate(&m, &dyn_c0, &mut ivars).unwrap();
+        BoundsTightener.propagate(&m, c0, &mut ivars).unwrap();
 
         assert_eq!(ivars[0].start_time_upper_bound, tp(16));
     }
@@ -596,8 +598,7 @@ mod tests {
         link_chain(&mut cs, 0, &[0, 1]);
 
         let c0 = cs.chain(ChainIndex(0));
-        let dyn_c0 = ChainViewDynAdapter(c0);
-        BoundsTightener.propagate(&m, &dyn_c0, &mut ivars).unwrap();
+        BoundsTightener.propagate(&m, c0, &mut ivars).unwrap();
 
         assert_eq!(ivars[0].start_time_upper_bound, tp(7)); // 12 - pt0(5)
     }
@@ -617,8 +618,7 @@ mod tests {
         link_chain(&mut cs, 0, &[0]);
 
         let c0 = cs.chain(ChainIndex(0));
-        let dyn_c0 = ChainViewDynAdapter(c0);
-        BoundsTightener.propagate(&m, &dyn_c0, &mut ivars).unwrap();
+        BoundsTightener.propagate(&m, c0, &mut ivars).unwrap();
 
         assert_eq!(ivars[0].start_time_lower_bound, tp(0));
         assert_eq!(ivars[0].start_time_upper_bound, tp(11));
@@ -645,10 +645,7 @@ mod tests {
         link_chain(&mut cs, 0, &[0, 1]);
 
         let c0 = cs.chain(ChainIndex(0));
-        let dyn_c0 = ChainViewDynAdapter(c0);
-        let err = BoundsTightener
-            .propagate(&m, &dyn_c0, &mut ivars)
-            .unwrap_err();
+        let err = BoundsTightener.propagate(&m, c0, &mut ivars).unwrap_err();
         match err {
             SchedulingError::FeasiblyWindowViolation(_) => {}
             x => panic!("expected FWV, got {:?}", x),
@@ -670,10 +667,7 @@ mod tests {
         link_chain(&mut cs, 0, &[0]);
 
         let c0 = cs.chain(ChainIndex(0));
-        let dyn_c0 = ChainViewDynAdapter(c0);
-        let err = BoundsTightener
-            .propagate(&m, &dyn_c0, &mut ivars)
-            .unwrap_err();
+        let err = BoundsTightener.propagate(&m, c0, &mut ivars).unwrap_err();
         match err {
             SchedulingError::NotAllowedOnBerth(e) => {
                 assert_eq!(e.request(), ri(0));
@@ -691,7 +685,7 @@ mod tests {
                 base::ChainSet,
                 delta::{ChainNextRewire, ChainSetDelta},
                 index::{ChainIndex, NodeIndex},
-                view::{ChainSetView, ChainViewDynAdapter},
+                view::ChainSetView,
             },
             index::{BerthIndex, RequestIndex},
             model::SolverModel,
@@ -806,10 +800,9 @@ mod tests {
             let mut cs = ChainSet::new(m.flexible_requests_len(), m.berths_len());
             link_chain(&mut cs, 0, &[0]);
             let c0 = cs.chain(ChainIndex(0));
-            let dyn_c0 = ChainViewDynAdapter(c0);
 
             // With the fix, this should now succeed.
-            let result = BoundsTightener.propagate(&m, &dyn_c0, &mut ivars);
+            let result = BoundsTightener.propagate(&m, c0, &mut ivars);
             assert!(result.is_ok());
 
             // The forward pass should find the earliest start at 45.
@@ -832,8 +825,7 @@ mod tests {
             link_chain(&mut cs, 0, &[0]);
 
             let c0 = cs.chain(ChainIndex(0));
-            let dyn_c0 = ChainViewDynAdapter(c0);
-            BoundsTightener.propagate(&m, &dyn_c0, &mut ivars).unwrap();
+            BoundsTightener.propagate(&m, c0, &mut ivars).unwrap();
 
             assert_eq!(ivars[0].start_time_upper_bound, tp(16));
         }
@@ -856,8 +848,7 @@ mod tests {
             link_chain(&mut cs, 0, &[0, 1]);
 
             let c0 = cs.chain(ChainIndex(0));
-            let dyn_c0 = ChainViewDynAdapter(c0);
-            BoundsTightener.propagate(&m, &dyn_c0, &mut ivars).unwrap();
+            BoundsTightener.propagate(&m, c0, &mut ivars).unwrap();
 
             assert_eq!(ivars[0].start_time_upper_bound, tp(7)); // 12 - pt0(5)
         }
@@ -877,8 +868,7 @@ mod tests {
             link_chain(&mut cs, 0, &[0]);
 
             let c0 = cs.chain(ChainIndex(0));
-            let dyn_c0 = ChainViewDynAdapter(c0);
-            BoundsTightener.propagate(&m, &dyn_c0, &mut ivars).unwrap();
+            BoundsTightener.propagate(&m, c0, &mut ivars).unwrap();
 
             assert_eq!(ivars[0].start_time_lower_bound, tp(0));
             assert_eq!(ivars[0].start_time_upper_bound, tp(11));
@@ -905,10 +895,7 @@ mod tests {
             link_chain(&mut cs, 0, &[0, 1]);
 
             let c0 = cs.chain(ChainIndex(0));
-            let dyn_c0 = ChainViewDynAdapter(c0);
-            let err = BoundsTightener
-                .propagate(&m, &dyn_c0, &mut ivars)
-                .unwrap_err();
+            let err = BoundsTightener.propagate(&m, c0, &mut ivars).unwrap_err();
             match err {
                 SchedulingError::FeasiblyWindowViolation(_) => {}
                 x => panic!("expected FWV, got {:?}", x),
@@ -930,10 +917,7 @@ mod tests {
             link_chain(&mut cs, 0, &[0]);
 
             let c0 = cs.chain(ChainIndex(0));
-            let dyn_c0 = ChainViewDynAdapter(c0);
-            let err = BoundsTightener
-                .propagate(&m, &dyn_c0, &mut ivars)
-                .unwrap_err();
+            let err = BoundsTightener.propagate(&m, c0, &mut ivars).unwrap_err();
             match err {
                 SchedulingError::NotAllowedOnBerth(e) => {
                     assert_eq!(e.request(), ri(0));

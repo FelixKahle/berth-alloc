@@ -26,17 +26,13 @@ use berth_alloc_model::problem::builder::ProblemBuilder;
 use berth_alloc_model::problem::req::Request;
 use berth_alloc_solver::{
     core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
-    scheduling::{
-        greedy::GreedyCalendar,
-        tightener::BoundsTightener,
-        traits::{CalendarScheduler, Propagator},
-    },
+    scheduling::{greedy::GreedyScheduler, tightener::BoundsTightener, traits::Propagator},
     state::{
         chain_set::{
             base::ChainSet,
             delta::{ChainNextRewire, ChainSetDelta},
             index::{ChainIndex, NodeIndex},
-            view::{ChainSetView, ChainViewDynAdapter},
+            view::ChainSetView,
         },
         model::SolverModel,
     },
@@ -135,13 +131,12 @@ fn bench_pipeline_scheduler(c: &mut Criterion) {
     let mut cs = ChainSet::new(model.flexible_requests_len(), model.berths_len());
     link_chain(&mut cs, 0, &(0..num_requests).collect::<Vec<_>>());
     let c0 = cs.chain(ChainIndex(0));
-    let dyn_c0 = ChainViewDynAdapter(c0);
 
     // explicit propagator to mirror your docs bench
     let tightener = BoundsTightener;
-    let pipeline = berth_alloc_solver::scheduling::pipeline::PipelineScheduler::new(
-        vec![Box::new(tightener) as Box<dyn Propagator<i64> + Send + Sync>],
-        GreedyCalendar,
+    let pipeline = berth_alloc_solver::scheduling::pipeline::SchedulingPipeline::new(
+        vec![Box::new(tightener)],
+        GreedyScheduler,
     );
 
     c.bench_function(
@@ -153,12 +148,12 @@ fn bench_pipeline_scheduler(c: &mut Criterion) {
 
                 // (Optional) show the propagator alone; mostly to match your narrative.
                 // Not required because PipelineScheduler will call it again; comment out if you want pure pipeline cost.
-                black_box(BoundsTightener.propagate(&model, &dyn_c0, ivars.as_mut_slice()))
+                black_box(BoundsTightener.propagate(&model, c0, ivars.as_mut_slice()))
                     .expect("propagation ok");
 
                 black_box(
                     pipeline
-                        .schedule_chain(&model, c0, &mut ivars, &mut dvars)
+                        .run_base(&model, c0, &mut ivars, &mut dvars)
                         .expect("pipeline schedule ok"),
                 );
 

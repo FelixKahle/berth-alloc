@@ -22,7 +22,7 @@ use crate::{
     core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
     scheduling::{
         err::{FeasiblyWindowViolationError, NotAllowedOnBerthError, SchedulingError},
-        traits::CalendarScheduler,
+        traits::Scheduler,
     },
     state::{
         chain_set::{
@@ -36,9 +36,9 @@ use crate::{
 use num_traits::{CheckedAdd, CheckedSub};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct GreedyCalendar;
+pub struct GreedyScheduler;
 
-impl<T> CalendarScheduler<T> for GreedyCalendar
+impl<T> Scheduler<T> for GreedyScheduler
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {
@@ -168,7 +168,7 @@ where
 mod tests {
     use super::*;
     use crate::core::{decisionvar::DecisionVar, intervalvar::IntervalVar};
-    use crate::scheduling::traits::CalendarScheduler;
+    use crate::scheduling::traits::Scheduler;
     use crate::state::{
         chain_set::{
             base::ChainSet,
@@ -295,7 +295,7 @@ mod tests {
         link_chain(&mut cs, 0, &[0]);
 
         let c0 = cs.chain(ChainIndex(0));
-        let sched = GreedyCalendar;
+        let sched = GreedyScheduler;
 
         // Use schedule_chain (starts at sentinel head internally)
         sched
@@ -321,7 +321,7 @@ mod tests {
         link_chain(&mut cs, 0, &[0]);
 
         let c0 = cs.chain(ChainIndex(0));
-        GreedyCalendar
+        GreedyScheduler
             .schedule_chain(&m, c0, &mut ivars, &mut dvars)
             .unwrap();
 
@@ -346,7 +346,7 @@ mod tests {
         link_chain(&mut cs, 0, &[0, 1]);
 
         let c0 = cs.chain(ChainIndex(0));
-        GreedyCalendar
+        GreedyScheduler
             .schedule_chain(&m, c0, &mut ivars, &mut dvars)
             .unwrap();
 
@@ -373,7 +373,7 @@ mod tests {
         link_chain(&mut cs, 0, &[0]); // chain 0 ↔ berth 0
 
         let c0 = cs.chain(ChainIndex(0));
-        let err = GreedyCalendar
+        let err = GreedyScheduler
             .schedule_chain(&m, c0, &mut ivars, &mut dvars)
             .unwrap_err();
         match err {
@@ -405,7 +405,7 @@ mod tests {
         dvars[0] = DecisionVar::assigned(bi(1), tp(0));
 
         let c0 = cs.chain(ChainIndex(0));
-        let err = GreedyCalendar
+        let err = GreedyScheduler
             .schedule_chain_slice(&m, c0, NodeIndex(1), None, &mut ivars, &mut dvars)
             .unwrap_err();
 
@@ -435,7 +435,7 @@ mod tests {
         link_chain(&mut cs, 0, &[0, 1, 2]);
 
         let c0 = cs.chain(ChainIndex(0));
-        GreedyCalendar
+        GreedyScheduler
             .schedule_chain_slice(
                 &m,
                 c0,
@@ -465,7 +465,7 @@ mod tests {
         let start_sentinel = cs.start_of_chain(ChainIndex(0));
         let c0 = cs.chain(ChainIndex(0));
 
-        GreedyCalendar
+        GreedyScheduler
             .schedule_chain_slice(&m, c0, start_sentinel, None, &mut ivars, &mut dvars)
             .unwrap();
 
@@ -485,7 +485,7 @@ mod tests {
         let c0 = cs.chain(ChainIndex(0));
         let start = cs.start_of_chain(ChainIndex(0));
 
-        GreedyCalendar
+        GreedyScheduler
             .schedule_chain_slice(&m, c0, start, None, &mut ivars, &mut dvars)
             .unwrap();
     }
@@ -513,7 +513,7 @@ mod tests {
         cs.apply_delta(delta);
 
         let c0 = cs.chain(ChainIndex(0));
-        let err = GreedyCalendar
+        let err = GreedyScheduler
             .schedule_chain(&m, c0, &mut ivars, &mut dvars)
             .unwrap_err();
 

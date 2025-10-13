@@ -26,7 +26,7 @@ use berth_alloc_model::problem::builder::ProblemBuilder;
 use berth_alloc_model::problem::req::Request;
 use berth_alloc_solver::{
     core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
-    scheduling::{greedy::GreedyCalendar, traits::CalendarScheduler},
+    scheduling::{greedy::GreedyScheduler, traits::Scheduler},
     state::{
         chain_set::{
             base::ChainSet,
@@ -119,8 +119,7 @@ fn default_dvars(m: &SolverModel<'_, i64>) -> Vec<DecisionVar<i64>> {
     vec![DecisionVar::Unassigned; m.flexible_requests_len()]
 }
 
-/// Bench GreedyCalendar.schedule_chain on a single chain (25 nodes).
-fn bench_greedy_calendar(c: &mut Criterion) {
+fn bench_greedy_scheduler(c: &mut Criterion) {
     // --- setup ---
     let num_requests = 25;
     let berth_window = (0, 500);
@@ -134,9 +133,9 @@ fn bench_greedy_calendar(c: &mut Criterion) {
     link_chain(&mut cs, 0, &(0..num_requests).collect::<Vec<_>>());
     let c0 = cs.chain(ChainIndex(0));
 
-    let greedy = GreedyCalendar;
+    let greedy = GreedyScheduler;
 
-    c.bench_function("GreedyCalendar schedule_chain (25 nodes, 1 berth)", |b| {
+    c.bench_function("GreedyScheduler chedule_chain (25 nodes, 1 berth)", |b| {
         b.iter(|| {
             // clone fresh variables per iteration
             let mut ivars = default_ivars(&model);
@@ -156,5 +155,5 @@ fn bench_greedy_calendar(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_greedy_calendar);
+criterion_group!(benches, bench_greedy_scheduler);
 criterion_main!(benches);
