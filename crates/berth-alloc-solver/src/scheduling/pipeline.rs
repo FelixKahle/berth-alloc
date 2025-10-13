@@ -31,6 +31,7 @@ use crate::state::model::SolverModel;
 use num_traits::{CheckedAdd, CheckedSub};
 use std::marker::PhantomData;
 
+#[allow(dead_code)]
 trait PropagatorObject<T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
@@ -40,12 +41,34 @@ where
         model: &SolverModel<'a, T>,
         chain: ChainRef<'_, ChainSetOverlay>,
         interval_vars: &mut [IntervalVar<T>],
+    ) -> Result<(), SchedulingError> {
+        self.propagate_overlay_slice(model, chain, chain.start(), None, interval_vars)
+    }
+
+    fn propagate_overlay_slice<'a>(
+        &self,
+        model: &SolverModel<'a, T>,
+        chain: ChainRef<'_, ChainSetOverlay>,
+        start_inclusive: NodeIndex,
+        end_exclusive: Option<NodeIndex>,
+        interval_vars: &mut [IntervalVar<T>],
     ) -> Result<(), SchedulingError>;
 
     fn propagate_base<'a>(
         &self,
         model: &SolverModel<'a, T>,
         chain: ChainRef<'_, ChainSet>,
+        interval_vars: &mut [IntervalVar<T>],
+    ) -> Result<(), SchedulingError> {
+        self.propagate_base_slice(model, chain, chain.start(), None, interval_vars)
+    }
+
+    fn propagate_base_slice<'a>(
+        &self,
+        model: &SolverModel<'a, T>,
+        chain: ChainRef<'_, ChainSet>,
+        start_inclusive: NodeIndex,
+        end_exclusive: Option<NodeIndex>,
         interval_vars: &mut [IntervalVar<T>],
     ) -> Result<(), SchedulingError>;
 }
@@ -55,24 +78,26 @@ where
     T: Copy + Ord + CheckedAdd + CheckedSub,
     P: Propagator<T>,
 {
-    #[inline]
-    fn propagate_overlay<'a>(
+    fn propagate_overlay_slice<'a>(
         &self,
         model: &SolverModel<'a, T>,
         chain: ChainRef<'_, ChainSetOverlay>,
+        start_inclusive: NodeIndex,
+        end_exclusive: Option<NodeIndex>,
         interval_vars: &mut [IntervalVar<T>],
     ) -> Result<(), SchedulingError> {
-        self.propagate(model, chain, interval_vars)
+        self.propagate_slice(model, chain, start_inclusive, end_exclusive, interval_vars)
     }
 
-    #[inline]
-    fn propagate_base<'a>(
+    fn propagate_base_slice<'a>(
         &self,
         model: &SolverModel<'a, T>,
         chain: ChainRef<'_, ChainSet>,
+        start_inclusive: NodeIndex,
+        end_exclusive: Option<NodeIndex>,
         interval_vars: &mut [IntervalVar<T>],
     ) -> Result<(), SchedulingError> {
-        self.propagate(model, chain, interval_vars)
+        self.propagate_slice(model, chain, start_inclusive, end_exclusive, interval_vars)
     }
 }
 
@@ -130,7 +155,7 @@ where
         dv: &mut [DecisionVar<T>],
     ) -> Result<(), SchedulingError> {
         for p in &self.propagators {
-            p.propagate_base(model, chain, iv)?;
+            p.propagate_base_slice(model, chain, start_inclusive, end_exclusive, iv)?;
         }
         self.placer
             .schedule_chain_slice(model, chain, start_inclusive, end_exclusive, iv, dv)
@@ -159,7 +184,7 @@ where
         dv: &mut [DecisionVar<T>],
     ) -> Result<(), SchedulingError> {
         for p in &self.propagators {
-            p.propagate_overlay(model, chain, iv)?;
+            p.propagate_overlay_slice(model, chain, start_inclusive, end_exclusive, iv)?;
         }
         self.placer
             .schedule_chain_slice(model, chain, start_inclusive, end_exclusive, iv, dv)

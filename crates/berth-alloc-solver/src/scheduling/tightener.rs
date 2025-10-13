@@ -26,7 +26,10 @@ use crate::{
         traits::Propagator,
     },
     state::{
-        chain_set::view::{ChainRef, ChainSetView},
+        chain_set::{
+            index::NodeIndex,
+            view::{ChainRef, ChainSetView},
+        },
         index::{BerthIndex, RequestIndex},
         model::SolverModel,
     },
@@ -56,241 +59,205 @@ pub struct BoundsTightener;
 
 impl<T> Propagator<T> for BoundsTightener
 where
-    T: Copy + Ord + CheckedAdd + CheckedSub,
+    T: Copy + Ord + CheckedAdd + CheckedSub + std::fmt::Debug,
 {
-    fn propagate<'a, C>(
+    fn propagate_slice<'a, C: ChainSetView>(
         &self,
-        solver_model: &SolverModel<'_, T>,
-        chain_view: ChainRef<'_, C>,
-        interval_variables: &mut [IntervalVar<T>],
-    ) -> Result<(), SchedulingError>
-    where
-        C: ChainSetView,
-    {
-        let berth_index = BerthIndex(chain_view.chain_index().get());
-        let berth_calendar = solver_model
-            .calendar_for_berth(berth_index)
-            .ok_or_else(|| {
-                SchedulingError::FeasiblyWindowViolation(FeasiblyWindowViolationError::new(
-                    RequestIndex(chain_view.start().get()),
-                ))
-            })?;
-        let free_intervals = berth_calendar.free_intervals();
+        solver_model: &SolverModel<'a, T>,
+        chain: ChainRef<'_, C>,
+        start_node: NodeIndex,
+        end_node_exclusive: Option<NodeIndex>, // None => chain end
+        iv: &mut [IntervalVar<T>],             // aligned by RequestIndex = node.get()
+    ) -> Result<(), SchedulingError> {
+        let (first_opt, end_excl) = chain.resolve_slice(start_node, end_node_exclusive);
+        let Some(first) = first_opt else {
+            return Ok(());
+        };
 
-        // Forward pass: Propagate constraints forward to tighten Lower Bounds (LBs).
+        let Some(last_inclusive) = chain.prev_real(end_excl) else {
+            return Ok(()); // The slice is empty
+        };
+
+        let b = BerthIndex(chain.chain_index().get());
+        let cal = solver_model.calendar_for_berth(b).ok_or_else(|| {
+            SchedulingError::FeasiblyWindowViolation(FeasiblyWindowViolationError::new(
+                RequestIndex(chain.start().get()),
+            ))
+        })?;
+        let free = cal.free_intervals();
+
+        let mut earliest_finish_of_pred = if let Some(pred) = chain.prev_real(first) {
+            let r = RequestIndex(pred.get());
+            let pt = solver_model
+                .processing_time(r, b)
+                .flatten()
+                .ok_or_else(|| {
+                    SchedulingError::NotAllowedOnBerth(NotAllowedOnBerthError::new(r, b))
+                })?;
+            iv[r.get()].start_time_lower_bound.checked_add(pt)
+        } else {
+            None
+        };
+
+        let mut seg_idx = 0usize;
         {
-            // Start traversal from the first actual request in the chain.
-            let Some(mut current_node_index) = chain_view.real_start() else {
-                return Ok(()); // Chain is empty, nothing to propagate.
-            };
-            let mut loop_guard = interval_variables.len().saturating_add(2);
-
-            // This tracks the earliest time the *previous* request could finish.
-            // For the first request, this is None.
-            let mut earliest_finish_of_predecessor: Option<TimePoint<T>> = None;
-            // A cursor for scanning the calendar's free segments. It only moves forward.
-            let mut calendar_segment_cursor: usize = 0;
-
-            loop {
-                // Defensive guard against malformed (cyclic) chains.
-                if loop_guard == 0 {
+            let mut guard = iv.len().saturating_add(2);
+            let mut n = Some(first);
+            while let Some(cur) = n {
+                if guard == 0 {
                     return Err(SchedulingError::FeasiblyWindowViolation(
-                        FeasiblyWindowViolationError::new(RequestIndex(current_node_index.get())),
+                        FeasiblyWindowViolationError::new(RequestIndex(cur.get())),
                     ));
                 }
-                loop_guard -= 1;
+                guard -= 1;
 
-                let request_index = RequestIndex(current_node_index.get());
-                let request_array_index = request_index.get();
+                if cur == end_excl {
+                    break;
+                } // respect exclusive bound
 
-                // Fetch constraints for the current request.
-                let feasible_window = solver_model.feasible_intervals()[request_array_index];
-                let processing_time = solver_model
-                    .processing_time(request_index, berth_index)
+                let r = RequestIndex(cur.get());
+                let i = r.get();
+                let w = solver_model.feasible_intervals()[i];
+                let pt = solver_model
+                    .processing_time(r, b)
                     .flatten()
                     .ok_or_else(|| {
-                        SchedulingError::NotAllowedOnBerth(NotAllowedOnBerthError::new(
-                            request_index,
-                            berth_index,
-                        ))
+                        SchedulingError::NotAllowedOnBerth(NotAllowedOnBerthError::new(r, b))
                     })?;
 
-                // Determine the earliest this request can start, considering its predecessor.
-                let lower_bound_from_precedence =
-                    earliest_finish_of_predecessor.unwrap_or_else(|| feasible_window.start());
-
-                // Combine all constraints to find the effective time window for this request.
-                let (effective_lower_bound, effective_upper_bound) = start_bounds_lb_pass(
-                    feasible_window,
-                    &interval_variables[request_array_index],
-                    lower_bound_from_precedence,
-                    processing_time,
-                    request_index,
-                )?;
-
-                if effective_lower_bound > effective_upper_bound {
+                let lb_from_pred = earliest_finish_of_pred.unwrap_or_else(|| w.start());
+                let (eff_lb, eff_ub) = start_bounds_lb_pass(w, &iv[i], lb_from_pred, pt, r)?;
+                if eff_lb > eff_ub {
                     return Err(SchedulingError::FeasiblyWindowViolation(
-                        FeasiblyWindowViolationError::new(request_index),
+                        FeasiblyWindowViolationError::new(r),
                     ));
                 }
 
-                // Find the EARLIEST possible placement in the calendar within the effective window.
-                calendar_segment_cursor = advance_to_segment(
-                    free_intervals,
-                    calendar_segment_cursor,
-                    effective_lower_bound,
-                );
-                let (new_lower_bound, new_finish_time) = earliest_fit_in_calendar_full_fit(
-                    free_intervals,
-                    &mut calendar_segment_cursor,
-                    effective_lower_bound,
-                    effective_upper_bound,
-                    processing_time,
-                )
-                .ok_or_else(|| {
-                    SchedulingError::FeasiblyWindowViolation(FeasiblyWindowViolationError::new(
-                        request_index,
-                    ))
-                })?;
+                seg_idx = advance_to_segment(free, seg_idx, eff_lb);
+                let (new_lb, new_finish) =
+                    earliest_fit_in_calendar_full_fit(free, &mut seg_idx, eff_lb, eff_ub, pt)
+                        .ok_or_else(|| {
+                            SchedulingError::FeasiblyWindowViolation(
+                                FeasiblyWindowViolationError::new(r),
+                            )
+                        })?;
 
-                // TIGHTEN the Lower Bound if we found a stricter one.
-                let current_ivar = &mut interval_variables[request_array_index];
-                if new_lower_bound > current_ivar.start_time_lower_bound {
-                    current_ivar.start_time_lower_bound = new_lower_bound;
+                if new_lb > iv[i].start_time_lower_bound {
+                    iv[i].start_time_lower_bound = new_lb;
                 }
+                earliest_finish_of_pred = Some(new_finish);
 
-                // The finish time of this request becomes the earliest start for the next one.
-                earliest_finish_of_predecessor = Some(new_finish_time);
-
-                // Move to the next request in the chain.
-                if let Some(next_node) = chain_view.next_real(current_node_index) {
-                    current_node_index = next_node;
-                } else {
-                    break; // End of chain.
-                }
+                n = chain.next_real(cur);
             }
         }
-        // Backward pass: Propagate constraints backward to tighten Upper Bounds (UBs).
+
+        let mut latest_start_of_succ = chain
+            .first_real_node(end_excl)
+            .map(|s| iv[RequestIndex(s.get()).get()].start_time_upper_bound);
+
+        let mut back_idx: Option<usize> = None;
         {
-            // Start traversal from the last actual request in the chain.
-            let Some(mut current_node_index) = chain_view.real_end() else {
-                return Ok(()); // Chain is empty.
-            };
-            let mut loop_guard = interval_variables.len().saturating_add(2);
-
-            // This tracks the latest start time of the *next* request (the successor).
-            let mut latest_start_time_of_successor: Option<TimePoint<T>> = None;
-            // A cursor for scanning calendar segments. It starts at the end and moves backward.
-            let mut calendar_segment_cursor: Option<usize> = None;
-
-            loop {
-                // Defensive guard against cycles.
-                if loop_guard == 0 {
+            let mut guard = iv.len().saturating_add(2);
+            let mut n = Some(last_inclusive);
+            while let Some(cur) = n {
+                if guard == 0 {
                     return Err(SchedulingError::FeasiblyWindowViolation(
-                        FeasiblyWindowViolationError::new(RequestIndex(current_node_index.get())),
+                        FeasiblyWindowViolationError::new(RequestIndex(cur.get())),
                     ));
                 }
-                loop_guard -= 1;
+                guard -= 1;
 
-                let request_index = RequestIndex(current_node_index.get());
-                let request_array_index = request_index.get();
-
-                // Fetch constraints for the current request.
-                let feasible_window = solver_model.feasible_intervals()[request_array_index];
-                let processing_time = solver_model
-                    .processing_time(request_index, berth_index)
+                let r = RequestIndex(cur.get());
+                let i = r.get();
+                let w = solver_model.feasible_intervals()[i];
+                let pt = solver_model
+                    .processing_time(r, b)
                     .flatten()
                     .ok_or_else(|| {
-                        SchedulingError::NotAllowedOnBerth(NotAllowedOnBerthError::new(
-                            request_index,
-                            berth_index,
-                        ))
+                        SchedulingError::NotAllowedOnBerth(NotAllowedOnBerthError::new(r, b))
                     })?;
 
-                // The finish time of this request is constrained by the start time of its successor.
-                // finish_i <= start_{i+1}  ==>  start_i + pt_i <= start_{i+1}  ==>  start_i <= start_{i+1} - pt_i
-                let precedence_cap_on_start_time: Option<TimePoint<T>> =
-                    if let Some(successor_latest_start) = latest_start_time_of_successor {
-                        successor_latest_start.checked_sub(processing_time)
-                    } else {
-                        None
-                    };
-
-                // Combine all constraints to find the effective time window.
-                let (effective_lower_bound, effective_upper_bound) = start_bounds_ub_pass(
-                    feasible_window,
-                    &interval_variables[request_array_index],
-                    precedence_cap_on_start_time,
-                    processing_time,
-                    request_index,
-                )?;
-
-                if effective_lower_bound > effective_upper_bound {
+                let cap = latest_start_of_succ.and_then(|s| s.checked_sub(pt));
+                let (eff_lb, eff_ub) = start_bounds_ub_pass(w, &iv[i], cap, pt, r)?;
+                if eff_lb > eff_ub {
                     return Err(SchedulingError::FeasiblyWindowViolation(
-                        FeasiblyWindowViolationError::new(request_index),
+                        FeasiblyWindowViolationError::new(r),
                     ));
                 }
 
-                // Find the LATEST possible placement in the calendar within the effective window.
-                // Lazily initialize the backward cursor to start searching from the end of the time window.
-                let initial_segment_index = calendar_segment_cursor.unwrap_or_else(|| {
-                    retreat_to_segment(free_intervals, free_intervals.len(), effective_upper_bound)
-                });
+                let init =
+                    *back_idx.get_or_insert_with(|| retreat_to_segment(free, free.len(), eff_ub));
+                let (new_ub, _finish, used) = latest_fit_in_calendar_full_fit(
+                    free, init, eff_lb, eff_ub, pt,
+                )
+                .ok_or_else(|| {
+                    SchedulingError::FeasiblyWindowViolation(FeasiblyWindowViolationError::new(r))
+                })?;
+                back_idx = Some(used);
 
-                let (new_upper_bound, _finish_time, used_segment_index) =
-                    latest_fit_in_calendar_full_fit(
-                        free_intervals,
-                        initial_segment_index,
-                        effective_lower_bound,
-                        effective_upper_bound,
-                        processing_time,
-                    )
-                    .ok_or_else(|| {
-                        SchedulingError::FeasiblyWindowViolation(FeasiblyWindowViolationError::new(
-                            request_index,
-                        ))
-                    })?;
-
-                // The cursor is now set for the next (previous) iteration.
-                calendar_segment_cursor = Some(used_segment_index);
-
-                // TIGHTEN the Upper Bound if we found a stricter one.
-                let current_ivar = &mut interval_variables[request_array_index];
-                if new_upper_bound < current_ivar.start_time_upper_bound {
-                    current_ivar.start_time_upper_bound = new_upper_bound;
+                if new_ub < iv[i].start_time_upper_bound {
+                    iv[i].start_time_upper_bound = new_ub;
                 }
 
-                // The tightened start time of this request now constrains its predecessor.
-                latest_start_time_of_successor = Some(current_ivar.start_time_upper_bound);
+                latest_start_of_succ = Some(iv[i].start_time_upper_bound);
 
-                // Move to the previous request in the chain.
-                if let Some(previous_node) = chain_view.prev_real(current_node_index) {
-                    current_node_index = previous_node;
-                } else {
-                    break; // Start of chain.
+                // stop when we reach (and process) the first node
+                if cur == first {
+                    break;
                 }
+                n = chain.prev_real(cur);
             }
+        }
 
-            // Final sanity check: ensure no interval has LB > UB.
-            {
-                let mut cur = chain_view.real_start();
-                let mut guard = interval_variables.len();
-
-                while let Some(n) = cur {
-                    if guard == 0 {
-                        break;
-                    } // defensive
-                    guard -= 1;
-
-                    let i = RequestIndex(n.get()).get();
-                    let ivar = &interval_variables[i];
-                    if ivar.start_time_lower_bound > ivar.start_time_upper_bound {
-                        return Err(SchedulingError::FeasiblyWindowViolation(
-                            FeasiblyWindowViolationError::new(RequestIndex(i)),
-                        ));
-                    }
-                    cur = chain_view.next_real(n);
+        // Sanity check: ensure all interval variables in the slice have valid bounds
+        // This catches any edge cases where bounds crossing wasn't detected earlier
+        #[cfg(debug_assertions)]
+        {
+            let mut n = Some(first);
+            let mut guard = iv.len().saturating_add(1); // More defensive guard
+            while let Some(cur) = n {
+                if guard == 0 {
+                    // This should never happen with well-formed chains
+                    debug_assert!(
+                        false,
+                        "Chain traversal exceeded expected length - possible cycle"
+                    );
+                    break;
                 }
+                guard -= 1;
+
+                if cur == end_excl {
+                    break;
+                }
+
+                let i = RequestIndex(cur.get()).get();
+                debug_assert!(
+                    iv[i].start_time_lower_bound <= iv[i].start_time_upper_bound,
+                    "Invalid bounds for request {}: LB={:?} > UB={:?}",
+                    i,
+                    iv[i].start_time_lower_bound,
+                    iv[i].start_time_upper_bound
+                );
+
+                n = chain.next_real(cur);
+            }
+        }
+
+        // In release builds, do a final check only if bounds were actually modified
+        // This catches genuine feasibility issues that might have been missed
+        {
+            let mut n = Some(first);
+            while let Some(cur) = n {
+                if cur == end_excl {
+                    break;
+                }
+                let i = RequestIndex(cur.get()).get();
+                if iv[i].start_time_lower_bound > iv[i].start_time_upper_bound {
+                    return Err(SchedulingError::FeasiblyWindowViolation(
+                        FeasiblyWindowViolationError::new(RequestIndex(i)),
+                    ));
+                }
+                n = chain.next_real(cur);
             }
         }
 
@@ -363,13 +330,27 @@ fn start_bounds_ub_pass<T: Copy + Ord + CheckedSub>(
 #[inline]
 fn advance_to_segment<T: Copy + Ord>(
     free_intervals: &[TimeInterval<T>],
-    mut index: usize,
+    start_index: usize,
     time_point: TimePoint<T>,
 ) -> usize {
-    while index < free_intervals.len() && free_intervals[index].end() <= time_point {
-        index += 1;
+    if start_index >= free_intervals.len() {
+        return free_intervals.len();
     }
-    index
+
+    // For small steps, linear search is faster due to cache locality
+    if start_index + 8 >= free_intervals.len() {
+        let mut index = start_index;
+        while index < free_intervals.len() && free_intervals[index].end() <= time_point {
+            index += 1;
+        }
+        return index;
+    }
+
+    // For larger jumps, use binary search from the start_index
+    start_index
+        + free_intervals[start_index..]
+            .binary_search_by(|interval| interval.end().cmp(&time_point))
+            .unwrap_or_else(|pos| pos)
 }
 
 /// Moves a cursor backward to the last segment that starts before `time_point`.
@@ -386,13 +367,23 @@ fn retreat_to_segment<T: Copy + Ord>(
     if index_hint > free_intervals.len() {
         index_hint = free_intervals.len();
     }
-    // Walk left from the hint until we find a segment that could contain the time point.
+
+    // Start from the last valid index
     let mut i = index_hint.saturating_sub(1);
+
+    // Walk left from the hint until we find a segment that could contain the time point
     loop {
-        if free_intervals[i].start() < time_point {
+        let segment = free_intervals[i];
+        // A segment can contain the time point if it starts before and ends after it
+        if segment.start() <= time_point && time_point <= segment.end() {
+            return i;
+        }
+        // Or if this segment starts before the time point (conservative approach)
+        if segment.start() < time_point {
             return i;
         }
         if i == 0 {
+            // If we've reached the beginning and no segment works, start from 0
             return 0;
         }
         i -= 1;
@@ -558,8 +549,6 @@ mod tests {
         delta.push_rewire(ChainNextRewire::new(NodeIndex(*nodes.last().unwrap()), e));
         cs.apply_delta(delta);
     }
-
-    /* ---------- forward pass sanity stays as before (covered elsewhere) ---------- */
 
     #[test]
     fn test_backward_tightens_ub_to_latest_fit_in_segment() {

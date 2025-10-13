@@ -66,10 +66,24 @@ pub trait Propagator<T: Copy + Ord + CheckedAdd> {
         std::any::type_name::<Self>()
     }
 
-    fn propagate<'a, C: ChainSetView>(
+    fn propagate<'a, C>(
+        &self,
+        m: &SolverModel<'a, T>,
+        chain: ChainRef<'_, C>,
+        iv: &mut [IntervalVar<T>],
+    ) -> Result<(), SchedulingError>
+    where
+        C: ChainSetView,
+    {
+        self.propagate_slice(m, chain, chain.start(), None, iv)
+    }
+
+    fn propagate_slice<'a, C: ChainSetView>(
         &self,
         solver_model: &SolverModel<'a, T>,
         chain: ChainRef<'_, C>,
-        iv: &mut [IntervalVar<T>], // aligned by RequestIndex = node.get()
+        start_node: NodeIndex,
+        end_node_exclusive: Option<NodeIndex>, // None => chain end
+        iv: &mut [IntervalVar<T>],             // aligned by RequestIndex = node.get()
     ) -> Result<(), SchedulingError>;
 }
