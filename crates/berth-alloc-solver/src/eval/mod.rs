@@ -19,7 +19,11 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod arc_evaluator;
+use crate::state::chain_set::index::NodeIndex;
+use berth_alloc_core::prelude::Cost;
+
 pub mod objective;
 pub mod search;
 pub mod wtt;
+
+pub type ArcEvaluator<'a> = dyn Fn(NodeIndex, NodeIndex) -> Option<Cost> + 'a;

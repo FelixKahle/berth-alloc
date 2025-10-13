@@ -327,7 +327,7 @@ fn start_bounds_ub_pass<T: Copy + Ord + CheckedSub>(
 
 /// Advances a cursor `index` through `free_intervals` to the first segment
 /// that could possibly contain `time_point`.
-#[inline]
+#[inline(always)]
 fn advance_to_segment<T: Copy + Ord>(
     free_intervals: &[TimeInterval<T>],
     start_index: usize,
@@ -355,7 +355,7 @@ fn advance_to_segment<T: Copy + Ord>(
 
 /// Moves a cursor backward to the last segment that starts before `time_point`.
 /// This is a conservative starting point for the backward search.
-#[inline]
+#[inline(always)]
 fn retreat_to_segment<T: Copy + Ord>(
     free_intervals: &[TimeInterval<T>],
     mut index_hint: usize,

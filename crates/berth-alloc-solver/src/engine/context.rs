@@ -19,18 +19,22 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use berth_alloc_core::prelude::Cost;
-use num_traits::{CheckedAdd, CheckedSub};
-
 use crate::{
-    eval::{
-        arc_evaluator::ObjectiveArcEvaluator, search::SearchObjective,
-        wtt::WeightedTurnaroundTimeObjective,
-    },
+    engine::operators::OperatorPool,
+    eval::{objective::Objective, search::SearchObjective, wtt::WeightedTurnaroundTimeObjective},
     scheduling::{pipeline::SchedulingPipeline, traits::Scheduler},
     search::filter::{filter_stack::FilterStack, traits::FeasibilityFilter},
-    state::model::SolverModel,
+    state::{
+        chain_set::{
+            index::NodeIndex,
+            view::{ChainRef, ChainSetView},
+        },
+        index::{BerthIndex, RequestIndex},
+        model::SolverModel,
+    },
 };
+use berth_alloc_core::prelude::Cost;
+use num_traits::{CheckedAdd, CheckedSub};
 
 pub struct EngineContext<'model, 'problem, T, S>
 where
@@ -39,6 +43,7 @@ where
 {
     model: &'model SolverModel<'problem, T>,
     pipeline: SchedulingPipeline<T, S>,
+    operators: OperatorPool<T>,
     filters: FilterStack<'model, 'problem, T>,
 }
 
@@ -54,6 +59,7 @@ where
         Self {
             model,
             pipeline: scheduler,
+            operators: OperatorPool::new(),
             filters: FilterStack::new(),
         }
     }
@@ -68,13 +74,20 @@ where
     pub fn model(&self) -> &SolverModel<'problem, T> {
         self.model
     }
+
     #[inline]
     pub fn pipeline(&self) -> &SchedulingPipeline<T, S> {
         &self.pipeline
     }
+
     #[inline]
     pub fn filters(&self) -> &FilterStack<'model, 'problem, T> {
         &self.filters
+    }
+
+    #[inline]
+    pub fn operators(&self) -> &OperatorPool<T> {
+        &self.operators
     }
 }
 
@@ -132,22 +145,76 @@ where
     }
 
     #[inline]
-    pub fn search_arc_evaluator(
+    pub fn make_search_arc_eval<V>(
         &self,
-    ) -> ObjectiveArcEvaluator<'_, T, SearchObjective<WeightedTurnaroundTimeObjective>>
+        chain: ChainRef<'_, V>,
+    ) -> impl Fn(NodeIndex, NodeIndex) -> Option<Cost>
     where
+        V: ChainSetView,
         T: CheckedAdd + CheckedSub + Into<Cost>,
     {
-        ObjectiveArcEvaluator::new(self.search_objective())
+        let model: &SolverModel<'problem, T> = self.engine_context.model();
+        let objective: &SearchObjective<WeightedTurnaroundTimeObjective> = self.search_objective();
+        move |from, to| eval_arc_with_objective::<T, _, V>(model, chain, objective, from, to)
     }
 
     #[inline]
-    pub fn true_arc_evaluator(
+    pub fn make_true_arc_eval<V>(
         &self,
-    ) -> ObjectiveArcEvaluator<'_, T, WeightedTurnaroundTimeObjective>
+        chain: ChainRef<V>,
+    ) -> impl Fn(NodeIndex, NodeIndex) -> Option<Cost>
     where
+        V: ChainSetView,
         T: CheckedAdd + CheckedSub + Into<Cost>,
     {
-        ObjectiveArcEvaluator::new(self.objective())
+        let model: &SolverModel<'problem, T> = self.engine_context.model();
+        let objective: &WeightedTurnaroundTimeObjective = self.objective();
+
+        move |from, to| eval_arc_with_objective::<T, _, V>(model, chain, objective, from, to)
     }
+}
+
+fn eval_arc_with_objective<'problem, T, O, V>(
+    model: &SolverModel<'problem, T>,
+    chain: ChainRef<'_, V>,
+    objective: &O,
+    from: NodeIndex,
+    to: NodeIndex,
+) -> Option<Cost>
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub,
+    O: Objective<T>,
+    V: ChainSetView,
+{
+    let bi = BerthIndex(chain.chain_index().get());
+    if bi.get() >= model.berths_len() {
+        return None;
+    }
+
+    let (cur_opt, end_exclusive) = chain.resolve_slice(from, Some(to));
+    let Some(mut cur) = cur_opt else {
+        return Some(0);
+    };
+
+    let mut acc: Cost = 0;
+    let mut steps_left = model.flexible_requests_len();
+
+    while cur != end_exclusive {
+        if steps_left == 0 {
+            return None;
+        }
+        steps_left -= 1;
+
+        let ri = RequestIndex(cur.get());
+        if ri.get() >= model.flexible_requests_len() {
+            return None;
+        }
+
+        let start_time = model.feasible_intervals()[ri.0].start();
+        let c = objective.assignment_cost(model, ri, bi, start_time)?;
+        acc += c;
+
+        cur = chain.next(cur)?;
+    }
+    Some(acc)
 }

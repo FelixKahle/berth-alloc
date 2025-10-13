@@ -19,60 +19,42 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BerthIndex(pub usize);
+use crate::{
+    eval::ArcEvaluator,
+    state::{chain_set::delta::ChainSetDelta, search_state::SolverSearchState},
+};
+use num_traits::{CheckedAdd, CheckedSub};
 
-impl BerthIndex {
+pub trait NeighborhoodOperator<T>
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub,
+{
     #[inline]
-    pub const fn new(index: usize) -> Self {
-        Self(index)
+    fn name(&self) -> &str {
+        std::any::type_name::<Self>()
     }
 
-    #[inline]
-    pub const fn get(self) -> usize {
-        self.0
-    }
+    fn make_neighboor<'state, 'model, 'problem>(
+        &self,
+        search_state: &'state SolverSearchState<'model, 'problem, T>,
+        arc_evaluator: ArcEvaluator,
+    ) -> Option<ChainSetDelta>;
 }
 
-impl std::fmt::Display for BerthIndex {
+impl<T> std::fmt::Debug for dyn NeighborhoodOperator<T>
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "BerthIndex({})", self.0)
+        self.name().fmt(f)
     }
 }
 
-impl From<usize> for BerthIndex {
-    #[inline]
-    fn from(value: usize) -> Self {
-        Self::new(value)
-    }
-}
-
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RequestIndex(pub usize);
-
-impl RequestIndex {
-    #[inline]
-    pub const fn new(index: usize) -> Self {
-        Self(index)
-    }
-
-    #[inline]
-    pub const fn get(self) -> usize {
-        self.0
-    }
-}
-
-impl std::fmt::Display for RequestIndex {
+impl<T> std::fmt::Display for dyn NeighborhoodOperator<T>
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RequestIndex({})", self.0)
-    }
-}
-
-impl From<usize> for RequestIndex {
-    #[inline]
-    fn from(value: usize) -> Self {
-        Self::new(value)
+        self.name().fmt(f)
     }
 }
