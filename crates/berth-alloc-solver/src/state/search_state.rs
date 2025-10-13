@@ -35,7 +35,7 @@ use berth_alloc_model::{
     prelude::{AssignmentContainer, SolutionRef},
     problem::asg::AssignmentRef,
 };
-use num_traits::{CheckedAdd, CheckedSub, Zero};
+use num_traits::{CheckedAdd, CheckedSub};
 use std::vec;
 
 #[derive(Debug, Clone)]
@@ -65,7 +65,7 @@ pub struct SolverSearchState<'model, 'problem, T: Copy + Ord + CheckedAdd + Chec
 
 impl<'problem, 'model, T> SolverSearchState<'model, 'problem, T>
 where
-    T: Copy + Ord + CheckedAdd + CheckedSub + Zero + Into<Cost> + Send + Sync,
+    T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost>,
 {
     pub fn new(
         model: &'model SolverModel<'problem, T>,
@@ -226,9 +226,9 @@ where
 
     /// Accept an evaluated candidate (already scheduled & scored) and update costs in O(1).
     #[inline]
-    pub fn apply_candidate(&mut self, cand: &NeighborhoodCandidate<T>) {
+    pub fn apply_candidate(&mut self, cand: NeighborhoodCandidate<T>) {
         // 1) mutate chain structure
-        self.chain_set.apply_delta(cand.delta.clone());
+        self.chain_set.apply_delta(cand.delta);
 
         // 2) apply patches
         for p in &cand.interval_var_patch {
@@ -581,7 +581,7 @@ mod tests {
             -5,                   // search delta cost
         );
 
-        state.apply_candidate(&cand1);
+        state.apply_candidate(cand1);
         assert_eq!(
             state.decision_vars()[0].as_assigned().unwrap().berth_index,
             bi(0)
@@ -601,7 +601,7 @@ mod tests {
 
         // A worsening candidate should not replace best
         let cand2 = NeighborhoodCandidate::new(ChainSetDelta::new(), vec![], vec![], 3, 3);
-        state.apply_candidate(&cand2);
+        state.apply_candidate(cand2);
         assert_eq!(state.current_true_cost(), 8);
         assert_eq!(state.best_true_cost(), Some(5)); // best remains 5
     }
@@ -681,12 +681,12 @@ mod tests {
             -3,
             -3,
         );
-        state.apply_candidate(&cand_improve);
+        state.apply_candidate(cand_improve);
         assert_eq!(state.best_true_cost(), Some(7)); // 10 + (-3) = 7
 
         // Make the current state worse to exercise restore
         let cand_worse = NeighborhoodCandidate::new(ChainSetDelta::new(), vec![], vec![], 10, 10);
-        state.apply_candidate(&cand_worse);
+        state.apply_candidate(cand_worse);
         assert_eq!(state.current_true_cost(), 17);
 
         // Restore best snapshot and recompute costs using the objective
@@ -726,7 +726,7 @@ mod tests {
             -3,
             -3,
         );
-        state.apply_candidate(&cand_improve);
+        state.apply_candidate(cand_improve);
         assert_eq!(state.best_true_cost(), Some(7));
 
         // Take best snapshot out; this clears internal best

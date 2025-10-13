@@ -21,9 +21,15 @@
 
 use crate::{
     eval::ArcEvaluator,
-    state::{chain_set::delta::ChainSetDelta, search_state::SolverSearchState},
+    state::{
+        chain_set::{delta::ChainSetDelta, index::NodeIndex},
+        search_state::SolverSearchState,
+    },
 };
 use num_traits::{CheckedAdd, CheckedSub};
+
+/// A function that, given two node indices, returns a vector of neighboring node indices.
+pub type NeighborAccessor = dyn Fn(NodeIndex, NodeIndex) -> Vec<NodeIndex>;
 
 pub trait NeighborhoodOperator<T>
 where
@@ -37,7 +43,7 @@ where
     fn make_neighboor<'state, 'model, 'problem>(
         &self,
         search_state: &'state SolverSearchState<'model, 'problem, T>,
-        arc_evaluator: ArcEvaluator,
+        arc_evaluator: &ArcEvaluator,
     ) -> Option<ChainSetDelta>;
 }
 

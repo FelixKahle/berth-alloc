@@ -23,7 +23,10 @@ use crate::{
     engine::operators::OperatorPool,
     eval::{objective::Objective, search::SearchObjective, wtt::WeightedTurnaroundTimeObjective},
     scheduling::{pipeline::SchedulingPipeline, traits::Scheduler},
-    search::filter::{filter_stack::FilterStack, traits::FeasibilityFilter},
+    search::{
+        filter::{filter_stack::FilterStack, traits::FeasibilityFilter},
+        operator::runner::NeighborhoodCandidate,
+    },
     state::{
         chain_set::{
             index::NodeIndex,
@@ -31,11 +34,13 @@ use crate::{
         },
         index::{BerthIndex, RequestIndex},
         model::SolverModel,
+        search_state::SolverSearchState,
     },
 };
 use berth_alloc_core::prelude::Cost;
 use num_traits::{CheckedAdd, CheckedSub};
 
+#[derive(Debug)]
 pub struct EngineContext<'model, 'problem, T, S>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
@@ -43,7 +48,6 @@ where
 {
     model: &'model SolverModel<'problem, T>,
     pipeline: SchedulingPipeline<T, S>,
-    operators: OperatorPool<T>,
     filters: FilterStack<'model, 'problem, T>,
 }
 
@@ -59,7 +63,6 @@ where
         Self {
             model,
             pipeline: scheduler,
-            operators: OperatorPool::new(),
             filters: FilterStack::new(),
         }
     }
@@ -84,11 +87,6 @@ where
     pub fn filters(&self) -> &FilterStack<'model, 'problem, T> {
         &self.filters
     }
-
-    #[inline]
-    pub fn operators(&self) -> &OperatorPool<T> {
-        &self.operators
-    }
 }
 
 pub struct SearchContext<'engine, 'model, 'problem, T, S>
@@ -97,23 +95,28 @@ where
     S: Scheduler<T>,
 {
     engine_context: &'engine EngineContext<'model, 'problem, T, S>,
+    state: SolverSearchState<'model, 'problem, T>,
     objective: WeightedTurnaroundTimeObjective,
     search_objective: SearchObjective<WeightedTurnaroundTimeObjective>,
+    operators: OperatorPool<T>,
 }
 
 impl<'engine, 'model, 'problem, T, S> SearchContext<'engine, 'model, 'problem, T, S>
 where
-    T: Copy + Ord + CheckedAdd + CheckedSub,
+    T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost>,
     S: Scheduler<T>,
 {
     pub fn new(
         engine_context: &'engine EngineContext<'model, 'problem, T, S>,
+        state: SolverSearchState<'model, 'problem, T>,
         lambda: f64,
     ) -> Self {
         Self {
             engine_context,
             objective: WeightedTurnaroundTimeObjective,
+            state,
             search_objective: SearchObjective::new(WeightedTurnaroundTimeObjective, lambda),
+            operators: OperatorPool::new(),
         }
     }
 
@@ -121,14 +124,17 @@ where
     pub fn engine_context(&self) -> &'engine EngineContext<'model, 'problem, T, S> {
         self.engine_context
     }
+
     #[inline]
     pub fn objective(&self) -> &WeightedTurnaroundTimeObjective {
         &self.objective
     }
+
     #[inline]
     pub fn set_lambda(&mut self, lambda: f64) {
         self.search_objective.set_lambda(lambda);
     }
+
     #[inline]
     pub fn search_objective(&self) -> &SearchObjective<WeightedTurnaroundTimeObjective> {
         &self.search_objective
@@ -142,6 +148,21 @@ where
     #[inline]
     pub fn filters(&self) -> &'engine FilterStack<'model, 'problem, T> {
         self.engine_context.filters()
+    }
+
+    #[inline]
+    pub fn operators(&self) -> &OperatorPool<T> {
+        &self.operators
+    }
+
+    #[inline]
+    pub fn accept_candidate(&mut self, candidate: NeighborhoodCandidate<T>) {
+        self.state.apply_candidate(candidate);
+    }
+
+    #[inline]
+    pub fn state(&self) -> &SolverSearchState<'model, 'problem, T> {
+        &self.state
     }
 
     #[inline]

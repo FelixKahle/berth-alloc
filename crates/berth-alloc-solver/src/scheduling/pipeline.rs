@@ -111,6 +111,19 @@ where
     _phantom: PhantomData<T>,
 }
 
+impl<T, S> std::fmt::Debug for SchedulingPipeline<T, S>
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub,
+    S: Scheduler<T>,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SchedulingPipeline")
+            .field("propagators", &self.propagators.len())
+            .field("placer", &self.placer.name())
+            .finish()
+    }
+}
+
 impl<T, S> SchedulingPipeline<T, S>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,

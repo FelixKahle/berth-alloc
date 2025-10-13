@@ -286,6 +286,43 @@ impl<'a> ChainSetDeltaBuilder<'a> {
     }
 
     #[inline]
+    pub fn two_opt(&mut self, p: NodeIndex, q: NodeIndex) -> &mut Self {
+        let (a, b) = {
+            let ov = self.overlay();
+            let a = ov.next_node(p).expect("2-opt: p has no successor");
+            let b = ov.next_node(q).expect("2-opt: q has no successor");
+            if self.is_sentinel(a) || self.is_sentinel(b) || a == q {
+                return self;
+            }
+            (a, b)
+        };
+
+        let mut path_to_reverse = Vec::new();
+        let mut current = a;
+        loop {
+            path_to_reverse.push(current);
+            if current == q {
+                break;
+            }
+            current = self.succ(current);
+            if path_to_reverse.len() > self.base.num_nodes() {
+                return self;
+            }
+        }
+
+        self.set_next(p, q);
+        let mut last_node_in_reversed_segment = q;
+        while let Some(node) = path_to_reverse.pop() {
+            if node != q {
+                self.set_next(last_node_in_reversed_segment, node);
+                last_node_in_reversed_segment = node;
+            }
+        }
+        self.set_next(a, b);
+        self
+    }
+
+    #[inline]
     pub fn two_opt_star_intra(&mut self, head: NodeIndex, p: NodeIndex, q: NodeIndex) -> &mut Self {
         debug_assert!(self.base.is_head_node(head));
 
@@ -1011,6 +1048,112 @@ mod tests {
         assert_eq!(
             collect(&base, ChainIndex(1)),
             vec![NodeIndex(5), NodeIndex(2), NodeIndex(3)]
+        );
+    }
+
+    #[test]
+    fn test_two_opt_basic_reversal() {
+        // s->1->2->3->4->5->e, with p=1 (a=2), q=4 (b=5) => s->1->4->3->2->5->e
+        let mut base = ChainSet::new(16, 1);
+        link_sequence(
+            &mut base,
+            ChainIndex(0),
+            &[
+                NodeIndex(1),
+                NodeIndex(2),
+                NodeIndex(3),
+                NodeIndex(4),
+                NodeIndex(5),
+            ],
+        );
+
+        let mut b = ChainSetDeltaBuilder::new(&base);
+        b.two_opt(NodeIndex(1), NodeIndex(4));
+        base.apply_delta(b.build());
+
+        assert_eq!(
+            collect(&base, ChainIndex(0)),
+            vec![
+                NodeIndex(1),
+                NodeIndex(4),
+                NodeIndex(3),
+                NodeIndex(2),
+                NodeIndex(5)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_two_opt_noop_when_adjacent() {
+        // s->1->2->3->4->e, with p=1 (a=2), q=2 (b=3) => a==q => no-op
+        let mut base = ChainSet::new(12, 1);
+        link_sequence(
+            &mut base,
+            ChainIndex(0),
+            &[NodeIndex(1), NodeIndex(2), NodeIndex(3), NodeIndex(4)],
+        );
+
+        let snapshot = collect(&base, ChainIndex(0));
+
+        let mut b = ChainSetDeltaBuilder::new(&base);
+        b.two_opt(NodeIndex(1), NodeIndex(2));
+        base.apply_delta(b.build());
+
+        assert_eq!(collect(&base, ChainIndex(0)), snapshot);
+    }
+
+    #[test]
+    fn test_two_opt_noop_when_q_successor_is_tail() {
+        // s->1->2->3->e, with p=1 (a=2), q=3 (b=tail) => b is sentinel => no-op
+        let mut base = ChainSet::new(10, 1);
+        link_sequence(
+            &mut base,
+            ChainIndex(0),
+            &[NodeIndex(1), NodeIndex(2), NodeIndex(3)],
+        );
+
+        let snapshot = collect(&base, ChainIndex(0));
+
+        let mut b = ChainSetDeltaBuilder::new(&base);
+        b.two_opt(NodeIndex(1), NodeIndex(3));
+        base.apply_delta(b.build());
+
+        assert_eq!(collect(&base, ChainIndex(0)), snapshot);
+    }
+
+    #[test]
+    fn test_two_opt_reverse_long_segment() {
+        // s->1->2->3->4->5->6->7->e, with p=1 (a=2), q=6 (b=7) => s->1->6->5->4->3->2->7->e
+        let mut base = ChainSet::new(20, 1);
+        link_sequence(
+            &mut base,
+            ChainIndex(0),
+            &[
+                NodeIndex(1),
+                NodeIndex(2),
+                NodeIndex(3),
+                NodeIndex(4),
+                NodeIndex(5),
+                NodeIndex(6),
+                NodeIndex(7),
+            ],
+        );
+
+        let mut b = ChainSetDeltaBuilder::new(&base);
+        b.two_opt(NodeIndex(1), NodeIndex(6));
+        base.apply_delta(b.build());
+
+        assert_eq!(
+            collect(&base, ChainIndex(0)),
+            vec![
+                NodeIndex(1),
+                NodeIndex(6),
+                NodeIndex(5),
+                NodeIndex(4),
+                NodeIndex(3),
+                NodeIndex(2),
+                NodeIndex(7),
+            ]
         );
     }
 }

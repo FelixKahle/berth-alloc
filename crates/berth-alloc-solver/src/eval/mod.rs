@@ -26,4 +26,13 @@ pub mod objective;
 pub mod search;
 pub mod wtt;
 
+/// A trait object representing a function that evaluates the cost of traversing an arc between two nodes.
+///
+/// # Arguments
+/// * `from` - The starting node index.
+/// * `to` - The exclsuive ending node index.
+///
+/// # Returns
+/// * `Some(Cost)` if the arc is valid and has an associated cost.
+/// * `None` if the arc is invalid or not traversable.
 pub type ArcEvaluator<'a> = dyn Fn(NodeIndex, NodeIndex) -> Option<Cost> + 'a;

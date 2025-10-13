@@ -18,29 +18,3 @@
 // LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct VarPatch<V> {
-    patch: V,
-    index: usize,
-}
-
-impl<V> VarPatch<V> {
-    pub fn new(patch: V, index: usize) -> Self {
-        Self { patch, index }
-    }
-
-    pub fn patch(&self) -> &V {
-        &self.patch
-    }
-
-    pub fn index(&self) -> usize {
-        self.index
-    }
-}
-
-impl<V: std::fmt::Display> std::fmt::Display for VarPatch<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Patch(index: {}, patch: {})", self.index, self.patch)
-    }
-}

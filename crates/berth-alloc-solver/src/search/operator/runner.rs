@@ -433,14 +433,14 @@ mod tests {
         let pipeline = SchedulingPipeline::empty(GreedyScheduler);
         let state = SolverSearchState::new_unassigned(&m, 0, 0);
         let engine = EngineContext::new(&m, pipeline).with_filter(Box::new(AlwaysFalseFilter));
-        let search = SearchContext::new(&engine, 0.0);
+        let search = SearchContext::new(&engine, state, 0.0);
 
         // Any delta: mark the chain, but AlwaysFalseFilter should reject before any scheduling.
         let mut delta = ChainSetDelta::new();
         delta.mark_chain(ChainIndex(0));
 
-        let mut eval = CandidateEvaluator::<i64>::new(&state);
-        let cand = eval.evaluate(&search, &state, delta);
+        let mut eval = CandidateEvaluator::<i64>::new(search.state());
+        let cand = eval.evaluate(&search, search.state(), delta);
         assert!(cand.is_none(), "filter should reject candidate");
     }
 
@@ -460,19 +460,19 @@ mod tests {
         let state = SolverSearchState::new_unassigned(&m, 0, 0);
         let pipeline = SchedulingPipeline::from_propagators([bounds], GreedyScheduler);
         let engine = EngineContext::new(&m, pipeline);
-        let search = SearchContext::new(&engine, 0.0);
+        let search = SearchContext::new(&engine, state, 0.0);
 
         // Overlay a chain 0 with nodes [0,1]
         let mut delta = ChainSetDelta::new();
-        let s = state.chain_set().start_of_chain(ChainIndex(0));
-        let e = state.chain_set().end_of_chain(ChainIndex(0));
+        let s = search.state().chain_set().start_of_chain(ChainIndex(0));
+        let e = search.state().chain_set().end_of_chain(ChainIndex(0));
         delta.push_rewire(ChainNextRewire::new(s, NodeIndex(0)));
         delta.push_rewire(ChainNextRewire::new(NodeIndex(0), NodeIndex(1)));
         delta.push_rewire(ChainNextRewire::new(NodeIndex(1), e));
         delta.mark_chain(ChainIndex(0));
 
-        let mut eval = CandidateEvaluator::<i64>::new(&state);
-        let cand = eval.evaluate(&search, &state, delta);
+        let mut eval = CandidateEvaluator::<i64>::new(search.state());
+        let cand = eval.evaluate(&search, search.state(), delta);
         assert!(
             cand.is_none(),
             "scheduler should fail and evaluator returns None"
@@ -494,20 +494,20 @@ mod tests {
         let pipeline = SchedulingPipeline::empty(GreedyScheduler);
         let engine = EngineContext::new(&m, pipeline);
         // λ = 1.0 (SearchObjective will scale unassignment cost by 2x)
-        let search = SearchContext::new(&engine, 1.0);
+        let search = SearchContext::new(&engine, state, 1.0);
 
         // Overlay a chain 0: [0,1]
         let mut delta = ChainSetDelta::new();
-        let s = state.chain_set().start_of_chain(ChainIndex(0));
-        let e = state.chain_set().end_of_chain(ChainIndex(0));
+        let s = search.state().chain_set().start_of_chain(ChainIndex(0));
+        let e = search.state().chain_set().end_of_chain(ChainIndex(0));
         delta.push_rewire(ChainNextRewire::new(s, NodeIndex(0)));
         delta.push_rewire(ChainNextRewire::new(NodeIndex(0), NodeIndex(1)));
         delta.push_rewire(ChainNextRewire::new(NodeIndex(1), e));
         delta.mark_chain(ChainIndex(0));
 
-        let mut eval = CandidateEvaluator::<i64>::new(&state);
+        let mut eval = CandidateEvaluator::<i64>::new(search.state());
         let cand = eval
-            .evaluate(&search, &state, delta)
+            .evaluate(&search, search.state(), delta)
             .expect("evaluation should succeed");
 
         // DV patches: 2 (both now assigned), IV patches: 0 (GreedyScheduler does not mutate bounds)
