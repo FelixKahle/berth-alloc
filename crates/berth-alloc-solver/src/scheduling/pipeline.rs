@@ -31,7 +31,7 @@ use crate::state::model::SolverModel;
 use num_traits::{CheckedAdd, CheckedSub};
 use std::marker::PhantomData;
 
-pub trait PropagatorObject<T>
+trait PropagatorObject<T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {
@@ -91,10 +91,28 @@ where
     T: Copy + Ord + CheckedAdd + CheckedSub,
     S: Scheduler<T>,
 {
-    /// Legacy constructor if you’ve pre-wrapped into `PropagatorObject`.
-    pub fn new(props: Vec<Box<dyn PropagatorObject<T>>>, placer: S) -> Self {
+    #[inline]
+    pub fn from_propagators<I, P>(props: I, placer: S) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Propagator<T> + 'static,
+    {
+        let propagators: Vec<Box<dyn PropagatorObject<T>>> = props
+            .into_iter()
+            .map(|p| Box::new(p) as Box<dyn PropagatorObject<T>>)
+            .collect();
+
         Self {
-            propagators: props,
+            propagators,
+            placer,
+            _phantom: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn empty(placer: S) -> Self {
+        Self {
+            propagators: Vec::new(),
             placer,
             _phantom: PhantomData,
         }
@@ -299,7 +317,7 @@ mod tests {
         link_chain(&mut cs, 0, &[0, 1, 2]);
         let c0 = cs.chain(ChainIndex(0));
 
-        let pipeline = SchedulingPipeline::new(vec![Box::new(BoundsTightener)], GreedyScheduler);
+        let pipeline = SchedulingPipeline::from_propagators([(BoundsTightener)], GreedyScheduler);
 
         pipeline
             .run_base(&m, c0, &mut ivars, &mut dvars)
@@ -330,7 +348,7 @@ mod tests {
         link_chain(&mut cs, 0, &[0]);
         let c0 = cs.chain(ChainIndex(0));
 
-        let pipeline = SchedulingPipeline::new(vec![Box::new(BoundsTightener)], GreedyScheduler);
+        let pipeline = SchedulingPipeline::from_propagators([(BoundsTightener)], GreedyScheduler);
 
         pipeline
             .run_base(&m, c0, &mut ivars, &mut dvars)

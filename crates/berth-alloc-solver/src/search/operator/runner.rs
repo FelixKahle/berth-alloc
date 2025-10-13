@@ -430,7 +430,7 @@ mod tests {
         let p = build_problem_with_weights(&[vec![(0, 100)]], &[(0, 100)], &[1], &[vec![Some(5)]]);
         let m = SolverModel::from_problem(&p).unwrap();
 
-        let pipeline = SchedulingPipeline::new(vec![], GreedyScheduler);
+        let pipeline = SchedulingPipeline::empty(GreedyScheduler);
         let state = SolverSearchState::new_unassigned(&m, 0, 0);
         let engine = EngineContext::new(&m, pipeline).with_filter(Box::new(AlwaysFalseFilter));
         let search = SearchContext::new(&engine, 0.0);
@@ -458,7 +458,7 @@ mod tests {
         let bounds = BoundsTightener::default();
 
         let state = SolverSearchState::new_unassigned(&m, 0, 0);
-        let pipeline = SchedulingPipeline::new(vec![Box::new(bounds)], GreedyScheduler);
+        let pipeline = SchedulingPipeline::from_propagators([bounds], GreedyScheduler);
         let engine = EngineContext::new(&m, pipeline);
         let search = SearchContext::new(&engine, 0.0);
 
@@ -491,7 +491,7 @@ mod tests {
         let m = SolverModel::from_problem(&p).unwrap();
 
         let state = SolverSearchState::new_unassigned(&m, 0, 0);
-        let pipeline = SchedulingPipeline::new(vec![], GreedyScheduler);
+        let pipeline = SchedulingPipeline::empty(GreedyScheduler);
         let engine = EngineContext::new(&m, pipeline);
         // λ = 1.0 (SearchObjective will scale unassignment cost by 2x)
         let search = SearchContext::new(&engine, 1.0);

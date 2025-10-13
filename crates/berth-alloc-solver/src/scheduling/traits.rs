@@ -70,6 +70,6 @@ pub trait Propagator<T: Copy + Ord + CheckedAdd> {
         &self,
         solver_model: &SolverModel<'a, T>,
         chain: ChainRef<'_, C>,
-        iv: &mut [IntervalVar<T>],
+        iv: &mut [IntervalVar<T>], // aligned by RequestIndex = node.get()
     ) -> Result<(), SchedulingError>;
 }

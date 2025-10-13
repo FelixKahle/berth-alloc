@@ -134,8 +134,8 @@ fn bench_pipeline_scheduler(c: &mut Criterion) {
 
     // explicit propagator to mirror your docs bench
     let tightener = BoundsTightener;
-    let pipeline = berth_alloc_solver::scheduling::pipeline::SchedulingPipeline::new(
-        vec![Box::new(tightener)],
+    let pipeline = berth_alloc_solver::scheduling::pipeline::SchedulingPipeline::from_propagators(
+        [tightener],
         GreedyScheduler,
     );
 
