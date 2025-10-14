@@ -89,6 +89,13 @@ impl<'a> ChainSetDeltaBuilder<'a> {
             return;
         }
 
+        if let Some(ci_tail) = self.base.chain_of_node(tail) {
+            self.delta.mark_chain(ci_tail);
+        }
+        if let Some(ci_succ) = self.base.chain_of_node(succ) {
+            self.delta.mark_chain(ci_succ);
+        }
+
         self.delta.push_rewire(ChainNextRewire::new(tail, succ));
     }
 

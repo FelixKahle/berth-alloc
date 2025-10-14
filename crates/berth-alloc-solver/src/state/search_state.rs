@@ -39,7 +39,8 @@ use num_traits::{CheckedAdd, CheckedSub};
 use std::vec;
 
 #[derive(Debug, Clone)]
-pub struct SearchSnapshot<T: Copy + Ord> {
+pub struct SearchSnapshot<'model, 'problem, T: Copy + Ord> {
+    pub model: &'model SolverModel<'problem, T>,
     pub chain_set: ChainSet,
     pub interval_vars: Vec<IntervalVar<T>>,
     pub decision_vars: Vec<DecisionVar<T>>,
@@ -48,19 +49,13 @@ pub struct SearchSnapshot<T: Copy + Ord> {
 
 pub struct SolverSearchState<'model, 'problem, T: Copy + Ord + CheckedAdd + CheckedSub> {
     model: &'model SolverModel<'problem, T>,
-
-    // working state
     chain_set: ChainSet,
     interval_vars: Vec<IntervalVar<T>>,
     decision_vars: Vec<DecisionVar<T>>,
-
-    // costs for *current* state
     current_true_cost: Cost,
     current_search_cost: Cost,
-
-    // best-so-far (by true objective)
     best_true_cost: Option<Cost>,
-    best: Option<SearchSnapshot<T>>,
+    best: Option<SearchSnapshot<'model, 'problem, T>>,
 }
 
 impl<'problem, 'model, T> SolverSearchState<'model, 'problem, T>
@@ -89,6 +84,7 @@ where
         // Seed best = current
         state.best_true_cost = Some(state.current_true_cost);
         state.best = Some(SearchSnapshot {
+            model,
             chain_set: state.chain_set.clone(),
             interval_vars: state.interval_vars.clone(),
             decision_vars: state.decision_vars.clone(),
@@ -133,12 +129,6 @@ where
             None => true,
             Some(best) => self.current_true_cost < best,
         }
-    }
-
-    #[inline]
-    pub fn take_best(&mut self) -> Option<SearchSnapshot<T>> {
-        self.best_true_cost = self.best.as_ref().map(|s| s.true_cost);
-        self.best.take()
     }
 
     #[inline]
@@ -253,6 +243,7 @@ where
         if better {
             self.best_true_cost = Some(self.current_true_cost);
             self.best = Some(SearchSnapshot {
+                model: self.model,
                 chain_set: self.chain_set.clone(),
                 interval_vars: self.interval_vars.clone(),
                 decision_vars: self.decision_vars.clone(),
@@ -301,9 +292,24 @@ where
     pub fn best_true_cost(&self) -> Option<Cost> {
         self.best_true_cost
     }
-    #[inline]
-    pub fn best_snapshot(&self) -> Option<&SearchSnapshot<T>> {
+
+    pub fn take_best(&mut self) -> Option<SearchSnapshot<'model, 'problem, T>> {
+        self.best_true_cost = self.best.as_ref().map(|s| s.true_cost);
+        self.best.take()
+    }
+
+    pub fn best_snapshot(&self) -> Option<&SearchSnapshot<'model, 'problem, T>> {
         self.best.as_ref()
+    }
+
+    pub fn into_snapshot(self) -> SearchSnapshot<'model, 'problem, T> {
+        SearchSnapshot {
+            model: self.model,
+            chain_set: self.chain_set,
+            interval_vars: self.interval_vars,
+            decision_vars: self.decision_vars,
+            true_cost: self.current_true_cost,
+        }
     }
 }
 
@@ -380,6 +386,74 @@ where
             T,
             AssignmentRef<'problem, 'problem, FlexibleKind, T>,
         > = flex_vec.into_iter().collect();
+        Ok(SolutionRef::new(fixed_container, flexible_container))
+    }
+}
+
+impl<'model, 'problem, T> TryInto<SolutionRef<'problem, T>> for SearchSnapshot<'model, 'problem, T>
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub,
+{
+    type Error = ExportError;
+
+    fn try_into(self) -> Result<SolutionRef<'problem, T>, Self::Error> {
+        let model = self.model;
+        let problem = model.problem();
+        let im = model.index_manager();
+
+        // Collect fixed assignments first
+        let fixed_iter = problem.iter_fixed_assignments().map(|a| a.to_ref());
+        let fixed_container: AssignmentContainer<
+            FixedKind,
+            T,
+            AssignmentRef<'problem, 'problem, FixedKind, T>,
+        > = fixed_iter.collect();
+
+        // Build flexible assignment refs
+        let mut flex_vec: Vec<AssignmentRef<'problem, 'problem, FlexibleKind, T>> =
+            Vec::with_capacity(self.decision_vars.len());
+
+        for (i, dv) in self.decision_vars.into_iter().enumerate() {
+            let ri = RequestIndex(i);
+            match dv {
+                DecisionVar::Unassigned => {
+                    return Err(ExportError::InvalidDecisionVar(ri));
+                }
+                DecisionVar::Assigned(dec) => {
+                    let rid = im.request_id(ri).ok_or(ExportError::MissingRequest(ri))?;
+                    let bid = im
+                        .berth_id(dec.berth_index)
+                        .ok_or(ExportError::MissingBerth(dec.berth_index))?;
+
+                    // Validate berth feasibility (processing time is defined)
+                    match model.processing_time(ri, dec.berth_index) {
+                        Some(Some(_)) => {}
+                        _ => return Err(ExportError::InvalidDecisionVar(ri)),
+                    }
+
+                    let req_ref = problem
+                        .flexible_requests()
+                        .get(rid)
+                        .ok_or(ExportError::MissingRequest(ri))?;
+                    let berth_ref = problem
+                        .berths()
+                        .get(bid)
+                        .ok_or(ExportError::MissingBerth(dec.berth_index))?;
+
+                    let aref =
+                        AssignmentRef::<FlexibleKind, T>::new(req_ref, berth_ref, dec.start_time)
+                            .map_err(|_| ExportError::BadAssignmentRef)?;
+                    flex_vec.push(aref);
+                }
+            }
+        }
+
+        let flexible_container: AssignmentContainer<
+            FlexibleKind,
+            T,
+            AssignmentRef<'problem, 'problem, FlexibleKind, T>,
+        > = flex_vec.into_iter().collect();
+
         Ok(SolutionRef::new(fixed_container, flexible_container))
     }
 }
@@ -789,5 +863,80 @@ mod tests {
         assert_eq!(fa.request_id(), rid(1_000));
         assert_eq!(fa.berth_id(), bid(0));
         assert_eq!(fa.start_time(), tp(10));
+    }
+
+    #[test]
+    fn test_snapshot_try_into_solution_success() {
+        let p = build_problem_with_weights(
+            &[vec![(0, 100)]],
+            &[(0, 50), (10, 60)],
+            &[3, 7],
+            &[vec![Some(5)], vec![Some(6)]],
+        );
+        let m = SolverModel::from_problem(&p).unwrap();
+
+        // Build a fully assigned state
+        let chain_set = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+        let iv = default_ivars(&m);
+        let mut dv = vec![DecisionVar::Unassigned; m.flexible_requests_len()];
+        dv[0] = DecisionVar::assigned(bi(0), tp(0));
+        dv[1] = DecisionVar::assigned(bi(0), tp(10));
+
+        let state = SolverSearchState::new(&m, chain_set, iv, dv, 0, 0);
+        let snap = state.best_snapshot().expect("snapshot seeded");
+        let sol: Result<SolutionRef<'_, i64>, ExportError> = snap.clone().try_into();
+        assert!(sol.is_ok());
+        let sr = sol.unwrap();
+        assert_eq!(sr.flexible_assignments().iter().count(), 2);
+        assert_eq!(
+            sr.fixed_assignments().iter().count(),
+            p.fixed_assignments().iter().count()
+        );
+    }
+
+    #[test]
+    fn test_snapshot_try_into_solution_unassigned_error() {
+        let p = build_problem_with_weights(
+            &[vec![(0, 100)]],
+            &[(0, 50), (10, 60)],
+            &[3, 7],
+            &[vec![Some(5)], vec![Some(6)]],
+        );
+        let m = SolverModel::from_problem(&p).unwrap();
+
+        // One assigned, one unassigned
+        let chain_set = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+        let iv = default_ivars(&m);
+        let mut dv = vec![DecisionVar::Unassigned; m.flexible_requests_len()];
+        dv[0] = DecisionVar::assigned(bi(0), tp(0));
+        dv[1] = DecisionVar::Unassigned;
+
+        let state = SolverSearchState::new(&m, chain_set, iv, dv, 0, 0);
+        let snap = state.best_snapshot().expect("snapshot seeded");
+        let res: Result<SolutionRef<'_, i64>, ExportError> = snap.clone().try_into();
+        match res {
+            Err(ExportError::InvalidDecisionVar(ri_)) => assert_eq!(ri_, ri(1)),
+            other => panic!("expected InvalidDecisionVar, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_snapshot_try_into_solution_missing_berth_error() {
+        let p = build_problem_with_weights(&[vec![(0, 100)]], &[(0, 50)], &[3], &[vec![Some(5)]]);
+        let m = SolverModel::from_problem(&p).unwrap();
+
+        let chain_set = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+        let iv = default_ivars(&m);
+        let mut dv = vec![DecisionVar::Unassigned; m.flexible_requests_len()];
+        // Intentionally use an invalid berth index
+        dv[0] = DecisionVar::assigned(BerthIndex(999), tp(0));
+
+        let state = SolverSearchState::new(&m, chain_set, iv, dv, 0, 0);
+        let snap = state.best_snapshot().expect("snapshot seeded");
+        let res: Result<SolutionRef<'_, i64>, ExportError> = snap.clone().try_into();
+        match res {
+            Err(ExportError::MissingBerth(bi_)) => assert_eq!(bi_, BerthIndex(999)),
+            other => panic!("expected MissingBerth, got {:?}", other),
+        }
     }
 }

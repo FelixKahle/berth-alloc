@@ -178,9 +178,10 @@ where
                 // After checking `predecessor_p` against all possible `predecessor_q`, increment the counter.
                 predecessors_scanned += 1;
                 if let Some(cap) = scan_cap
-                    && predecessors_scanned >= cap.get() {
-                        return None; // Stop searching if the scan cap is reached.
-                    }
+                    && predecessors_scanned >= cap.get()
+                {
+                    return None; // Stop searching if the scan cap is reached.
+                }
 
                 // Advance to the next predecessor in the outer loop.
                 predecessor_p = successor_a;

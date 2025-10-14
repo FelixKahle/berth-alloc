@@ -58,7 +58,7 @@ pub trait Scheduler<T: Copy + Ord + CheckedAdd> {
     ) -> Result<(), SchedulingError>;
 }
 
-pub trait Propagator<T: Copy + Ord + CheckedAdd> {
+pub trait Propagator<T: Copy + Ord + CheckedAdd>: Send + Sync {
     #[inline]
     fn name(&self) -> &str {
         std::any::type_name::<Self>()

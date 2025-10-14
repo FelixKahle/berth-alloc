@@ -64,3 +64,8 @@ where
         self.name().fmt(f)
     }
 }
+
+pub trait NeighborhoodOperatorFactory<T>: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn create(&self) -> Box<dyn NeighborhoodOperator<T>>;
+}

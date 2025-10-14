@@ -201,6 +201,21 @@ where
 
         move |from, to| eval_arc_with_objective::<T, _, V>(model, chain, objective, from, to)
     }
+
+    #[inline]
+    pub fn state_mut(&mut self) -> &mut SolverSearchState<'model, 'problem, T> {
+        &mut self.state
+    }
+
+    #[inline]
+    pub fn into_state(self) -> SolverSearchState<'model, 'problem, T> {
+        self.state
+    }
+
+    #[inline]
+    pub fn operators_mut(&mut self) -> &mut OperatorPool<T> {
+        &mut self.operators
+    }
 }
 
 fn eval_arc_with_objective<'problem, T, O, V>(

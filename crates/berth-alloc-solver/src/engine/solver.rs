@@ -20,7 +20,12 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    engine::{greedy::GreedyOpening, traits::Opening},
+    engine::{
+        context::{EngineContext, SearchContext},
+        greedy::GreedyOpening,
+        search::{SAParams, Search},
+        traits::Opening,
+    },
     model::{
         neighborhood::{ProximityMap, ProximityMapParameter},
         solver_model::SolverModel,
@@ -33,12 +38,12 @@ use crate::{
         operator::traits::NeighborhoodOperator,
         operator_library::swap::SwapSuccessorsFirstImprovement,
     },
-    state::err::SolverModelBuildError,
+    state::{err::SolverModelBuildError, search_state::SearchSnapshot},
 };
 use berth_alloc_core::prelude::Cost;
 use berth_alloc_model::prelude::{Problem, SolutionRef};
 use num_traits::{CheckedAdd, CheckedSub, Zero};
-use std::vec;
+use std::{convert::TryInto, thread};
 
 pub struct EngineParams {
     pub proximity_alpha: f64,
@@ -88,14 +93,188 @@ where
         })
     }
 
+    /// Solve:
+    /// - Build opening solution
+    /// - Run multi-threaded simulated annealing searches
+    /// - Pick best snapshot
+    /// - Convert to SolutionRef
     pub fn solve(&mut self) -> SolutionRef<'problem, T>
     where
-        T: Send + Sync,
+        T: Send + Sync + Zero,
     {
         let opener = GreedyOpening;
-        let _initial_state = opener.build(&self.solver_model);
+        let initial_state = opener.build(&self.solver_model);
 
-        unimplemented!()
+        // If no operators, just export opening.
+        if self.operators.is_empty() {
+            return initial_state
+                .try_into()
+                .expect("opening state should export to solution");
+        }
+
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+
+        let time_per_thread_ms = 400_u64;
+        let lambda = 1.0_f64;
+
+        // Collect snapshots from threads
+        let mut snapshots: Vec<SearchSnapshot<T>> = Vec::with_capacity(num_threads);
+
+        thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(num_threads);
+            for tid in 0..num_threads {
+                let model_ref = &self.solver_model;
+                let prox_ref = &self.proximity_map;
+                let pipe_ref = &self.pipeline;
+                let filters_ref = &self.filter_stack;
+                let operators_len = self.operators.len();
+
+                handles.push(scope.spawn(move || {
+                    // Fresh initial state per thread
+                    let opener = GreedyOpening;
+                    let state = opener.build(model_ref);
+
+                    let engine_context =
+                        EngineContext::new(model_ref, prox_ref, pipe_ref, filters_ref);
+                    let mut search_context = SearchContext::new(&engine_context, state, lambda);
+
+                    // Populate operator pool
+                    for _ in 0..operators_len {
+                        search_context
+                            .operators_mut()
+                            .add_operator(Box::new(SwapSuccessorsFirstImprovement::default()));
+                    }
+
+                    let sa_params = SAParams {
+                        time_limit: std::time::Duration::from_millis(time_per_thread_ms),
+                        t_start: 300.0,
+                        t_end: 1e-3,
+                        seed: 0xABCDEF55_u64 ^ (tid as u64).wrapping_mul(0x9E3779B97F4A7C15),
+                        randomize_ops: 0.75,
+                    };
+
+                    let search = Search::new(search_context);
+                    search.run_sa_time_cap(sa_params) // returns SearchSnapshot<T>
+                }));
+            }
+
+            for h in handles {
+                if let Ok(snap) = h.join() {
+                    snapshots.push(snap);
+                }
+            }
+        });
+
+        // Choose best snapshot by true_cost
+        let best_snapshot_opt = snapshots
+            .into_iter()
+            .min_by(|a, b| a.true_cost.cmp(&b.true_cost));
+
+        let best_snapshot = match best_snapshot_opt {
+            Some(s) => s,
+            None => {
+                // Fallback to opening conversion
+                return initial_state
+                    .try_into()
+                    .expect("initial state export must succeed");
+            }
+        };
+
+        best_snapshot
+            .try_into()
+            .expect("best snapshot state export must succeed")
+    }
+
+    pub fn solve_with_time_budget(
+        &mut self,
+        total_budget: std::time::Duration,
+    ) -> SolutionRef<'problem, T>
+    where
+        T: Send + Sync + Zero,
+    {
+        // Scale existing solve(): we reuse logic but override per-thread ms.
+        // Simple even split: each thread gets total_budget (we keep structure identical, just bump per-thread time).
+        // For a more refined split: divide by number of threads *some factor.
+        let opener = GreedyOpening;
+        let initial_state = opener.build(&self.solver_model);
+
+        if self.operators.is_empty() {
+            return initial_state
+                .try_into()
+                .expect("opening state should export to solution");
+        }
+
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+
+        let per_thread_time = total_budget; // each thread runs full budget (aggressive). Adjust if needed.
+        let lambda = 1.0_f64;
+
+        let mut snapshots: Vec<SearchSnapshot<T>> = Vec::with_capacity(num_threads);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(num_threads);
+            for tid in 0..num_threads {
+                let model_ref = &self.solver_model;
+                let prox_ref = &self.proximity_map;
+                let pipe_ref = &self.pipeline;
+                let filters_ref = &self.filter_stack;
+                let operators_len = self.operators.len();
+
+                handles.push(scope.spawn(move || {
+                    let opener = GreedyOpening;
+                    let state = opener.build(model_ref);
+
+                    let engine_context =
+                        EngineContext::new(model_ref, prox_ref, pipe_ref, filters_ref);
+                    let mut search_context = SearchContext::new(&engine_context, state, lambda);
+
+                    for _ in 0..operators_len {
+                        search_context
+                            .operators_mut()
+                            .add_operator(Box::new(SwapSuccessorsFirstImprovement::default()));
+                    }
+
+                    let sa_params = SAParams {
+                        time_limit: per_thread_time,
+                        t_start: 500.0,
+                        t_end: 1e-3,
+                        seed: 0xBEEF_CA_FE ^ (tid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                        randomize_ops: 0.85,
+                    };
+
+                    let search = Search::new(search_context);
+                    search.run_sa_time_cap(sa_params)
+                }));
+            }
+
+            for h in handles {
+                if let Ok(snap) = h.join() {
+                    snapshots.push(snap);
+                }
+            }
+        });
+
+        let best_snapshot_opt = snapshots
+            .into_iter()
+            .min_by(|a, b| a.true_cost.cmp(&b.true_cost));
+
+        let best_snapshot = match best_snapshot_opt {
+            Some(s) => s,
+            None => {
+                return initial_state
+                    .try_into()
+                    .expect("initial state export must succeed");
+            }
+        };
+
+        best_snapshot
+            .try_into()
+            .expect("snapshot export must succeed")
     }
 
     #[inline]
@@ -127,18 +306,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use berth_alloc_model::problem::loader::ProblemLoader;
+    use berth_alloc_model::{prelude::SolutionView, problem::loader::ProblemLoader};
 
-    // This test might take a bit longer, as it loads and parses all instances
-    // in the `instances/` folder at the workspace root, and creates a SolverEngine
-    // for each of them to ensure the model builds correctly. As the ProximityMap is build in
-    // O(n^2) time, this might take a while for large instances.
     #[test]
     fn test_load_all_instances_from_workspace_root_instances_folder_and_create_engine() {
         use std::fs;
         use std::path::{Path, PathBuf};
 
-        // Find the nearest ancestor that contains an `instances/` directory.
         fn find_instances_dir() -> Option<PathBuf> {
             let mut cur: Option<&Path> = Some(Path::new(env!("CARGO_MANIFEST_DIR")));
             while let Some(p) = cur {
@@ -155,7 +329,6 @@ mod tests {
             "Could not find an `instances/` directory in any ancestor of CARGO_MANIFEST_DIR",
         );
 
-        // Gather all .txt files (ignore subdirs/other files).
         let mut files: Vec<PathBuf> = fs::read_dir(&inst_dir)
             .expect("read_dir(instances) failed")
             .filter_map(|e| e.ok())
@@ -167,7 +340,6 @@ mod tests {
             .collect();
 
         files.sort();
-
         assert!(
             !files.is_empty(),
             "No .txt instance files found in {}",
@@ -182,7 +354,6 @@ mod tests {
                 .from_path(&path)
                 .unwrap_or_else(|e| panic!("Failed to load {}: {e}", path.display()));
 
-            // Sanity checks: there should be at least one berth and one request in real instances.
             assert!(
                 !problem.berths().is_empty(),
                 "No berths parsed in {}",
@@ -194,14 +365,20 @@ mod tests {
                 path.display()
             );
 
-            // Create the solver engine to ensure the model builds correctly.
-            let _ = SolverEngine::new(
+            let mut engine = SolverEngine::new(
                 EngineParams {
                     proximity_alpha: 0.5,
                 },
                 &problem,
             )
             .expect("Failed to create SolverEngine");
+
+            let solution = engine.solve();
+            // Basic sanity: solution flexible assignments count <= requests.
+            assert!(
+                solution.flexible_assignments().iter().count()
+                    <= problem.flexible_requests().iter().count()
+            );
         }
     }
 }

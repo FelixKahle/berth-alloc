@@ -32,7 +32,7 @@ use num_traits::{CheckedAdd, CheckedSub};
 use std::marker::PhantomData;
 
 #[allow(dead_code)]
-trait PropagatorObject<T>
+trait PropagatorObject<T>: Send + Sync
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {

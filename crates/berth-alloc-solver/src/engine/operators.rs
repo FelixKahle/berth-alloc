@@ -32,6 +32,19 @@ pub struct NeighborhoodOperatorStats {
     pub cumulative_cost_delta: Cost, // negative if total improving
 }
 
+impl NeighborhoodOperatorStats {
+    pub fn new() -> Self {
+        let execution_time_ns = Ewma::from_half_life(20.0).expect("valid half life");
+        Self {
+            attempt_count: 0,
+            success_count: 0,
+            accept_count: 0,
+            execution_time_ns,
+            cumulative_cost_delta: 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct OperatorRecord<T>
 where
@@ -52,7 +65,7 @@ where
 impl<T> Default for OperatorPool<T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
- {
+{
     fn default() -> Self {
         Self::new()
     }
@@ -80,5 +93,44 @@ where
 
     pub fn get_operators_mut(&mut self) -> &mut Vec<OperatorRecord<T>> {
         &mut self.operators
+    }
+
+    pub fn add_operator(&mut self, op: Box<dyn NeighborhoodOperator<T>>) {
+        self.operators.push(OperatorRecord {
+            operator: op,
+            stats: NeighborhoodOperatorStats::new(),
+        });
+    }
+
+    #[inline]
+    pub fn record_attempt(&mut self, idx: usize) {
+        if let Some(r) = self.operators.get_mut(idx) {
+            r.stats.attempt_count = r.stats.attempt_count.saturating_add(1);
+        }
+    }
+
+    #[inline]
+    pub fn record_success(&mut self, idx: usize) {
+        if let Some(r) = self.operators.get_mut(idx) {
+            r.stats.success_count = r.stats.success_count.saturating_add(1);
+        }
+    }
+
+    #[inline]
+    pub fn record_accept(&mut self, idx: usize, cost_delta_true: Cost) {
+        if let Some(r) = self.operators.get_mut(idx) {
+            r.stats.accept_count = r.stats.accept_count.saturating_add(1);
+            r.stats.cumulative_cost_delta = r
+                .stats
+                .cumulative_cost_delta
+                .saturating_add(cost_delta_true);
+        }
+    }
+
+    #[inline]
+    pub fn record_exec_time_ns(&mut self, idx: usize, nanos: f64) {
+        if let Some(r) = self.operators.get_mut(idx) {
+            r.stats.execution_time_ns.observe(nanos);
+        }
     }
 }
