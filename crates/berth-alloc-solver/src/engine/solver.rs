@@ -20,6 +20,7 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::{
+    engine::{greedy::GreedyOpening, traits::Opening},
     model::{
         neighborhood::{ProximityMap, ProximityMapParameter},
         solver_model::SolverModel,
@@ -27,11 +28,15 @@ use crate::{
     scheduling::{
         greedy::GreedyScheduler, pipeline::SchedulingPipeline, tightener::BoundsTightener,
     },
-    search::filter::{feasible_berth_filter::FeasibleBerthFilter, filter_stack::FilterStack},
+    search::{
+        filter::{feasible_berth_filter::FeasibleBerthFilter, filter_stack::FilterStack},
+        operator::traits::NeighborhoodOperator,
+        operator_library::swap::SwapSuccessorsFirstImprovement,
+    },
     state::err::SolverModelBuildError,
 };
 use berth_alloc_core::prelude::Cost;
-use berth_alloc_model::prelude::Problem;
+use berth_alloc_model::prelude::{Problem, SolutionRef};
 use num_traits::{CheckedAdd, CheckedSub, Zero};
 use std::vec;
 
@@ -48,6 +53,7 @@ where
     proximity_map: ProximityMap,
     pipeline: SchedulingPipeline<T, GreedyScheduler>,
     filter_stack: FilterStack<T>,
+    operators: Vec<Box<dyn NeighborhoodOperator<T>>>,
 }
 
 impl<'problem, T> SolverEngine<'problem, T>
@@ -59,7 +65,7 @@ where
         problem: &'problem Problem<T>,
     ) -> Result<Self, SolverModelBuildError>
     where
-        T: std::fmt::Debug + Zero,
+        T: std::fmt::Debug + Zero + Send + Sync,
     {
         let solver_model = SolverModel::from_problem(problem)?;
         let proximity_map = ProximityMap::build(
@@ -67,16 +73,29 @@ where
             ProximityMapParameter::new(params.proximity_alpha),
         );
 
-        // Default pipeline and filter stack for now.
+        // Default pipeline, filter stack and operators.
         let pipeline = SchedulingPipeline::from_propagators([BoundsTightener], GreedyScheduler);
         let filter_stack = FilterStack::with_filters(vec![Box::new(FeasibleBerthFilter)]);
+        let operators: Vec<Box<dyn NeighborhoodOperator<T>>> =
+            vec![Box::new(SwapSuccessorsFirstImprovement::default())];
 
         Ok(Self {
             solver_model,
             proximity_map,
             pipeline,
             filter_stack,
+            operators,
         })
+    }
+
+    pub fn solve(&mut self) -> SolutionRef<'problem, T>
+    where
+        T: Send + Sync,
+    {
+        let opener = GreedyOpening;
+        let _initial_state = opener.build(&self.solver_model);
+
+        unimplemented!()
     }
 
     #[inline]
@@ -97,6 +116,11 @@ where
     #[inline]
     pub fn filter_stack(&self) -> &FilterStack<T> {
         &self.filter_stack
+    }
+
+    #[inline]
+    pub fn operators(&self) -> &Vec<Box<dyn NeighborhoodOperator<T>>> {
+        &self.operators
     }
 }
 

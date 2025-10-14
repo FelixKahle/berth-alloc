@@ -395,9 +395,8 @@ mod tests {
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
     use berth_alloc_model::{
         common::FlexibleKind,
-        prelude::{Berth, BerthIdentifier, Problem, RequestIdentifier, SolutionRef},
-        problem::builder::ProblemBuilder,
-        problem::req::Request,
+        prelude::{Berth, BerthIdentifier, Problem, RequestIdentifier, SolutionRef, SolutionView},
+        problem::{asg::AssignmentView, builder::ProblemBuilder, req::Request},
     };
     use std::collections::BTreeMap;
 
@@ -734,5 +733,61 @@ mod tests {
 
         // restore_best_into_current would now return false (no internal best)
         assert!(!state.restore_best_into_current(&WeightOnlyObjective, &WeightOnlyObjective));
+    }
+
+    #[test]
+    fn test_export_solution_includes_fixed_assignments() {
+        use berth_alloc_model::{
+            common::{FixedKind, FlexibleKind},
+            prelude::{Assignment, SolutionRef},
+        };
+
+        // Build a problem with:
+        // - 1 berth [0, 100)
+        // - 1 fixed assignment on that berth (start=10, duration=10 => [10,20))
+        // - 1 flexible request allowed on that berth (we'll assign it arbitrarily)
+        let mut builder = ProblemBuilder::new();
+
+        let b0 = Berth::from_windows(bid(0), [iv(0, 100)]);
+        builder.add_berth(b0.clone());
+
+        // Fixed request data
+        let mut fixed_pt = BTreeMap::new();
+        fixed_pt.insert(bid(0), td(10));
+        let r_fixed = Request::<FixedKind, i64>::new(rid(1_000), iv(0, 100), 0, fixed_pt).unwrap();
+        let a_fixed =
+            Assignment::<FixedKind, i64>::new(r_fixed.clone(), b0.clone(), tp(10)).unwrap();
+        builder.add_fixed(a_fixed);
+
+        // One flexible request allowed on berth 0
+        let mut flex_pt = BTreeMap::new();
+        flex_pt.insert(bid(0), td(5));
+        let r_flex = Request::<FlexibleKind, i64>::new(rid(0), iv(0, 100), 1, flex_pt).unwrap();
+        builder.add_flexible(r_flex);
+
+        let p = builder.build().expect("problem builds with fixed + flex");
+        let m = SolverModel::from_problem(&p).unwrap();
+
+        // Build a trivial assigned state for the single flexible request
+        let chain_set = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+        let ivars = default_ivars(&m);
+        let mut dvars = vec![DecisionVar::Unassigned; m.flexible_requests_len()];
+        dvars[0] = DecisionVar::assigned(bi(0), tp(0));
+
+        let state = SolverSearchState::new(&m, chain_set, ivars, dvars, 0, 0);
+
+        // Export and assert fixed assignments are present as in the problem
+        let sol: SolutionRef<'_, i64> = state.try_into().expect("export should succeed");
+        let fixed: Vec<_> = sol.fixed_assignments().iter().collect();
+        assert_eq!(
+            sol.fixed_assignments().len(),
+            1,
+            "exactly one fixed assignment expected"
+        );
+
+        let fa = fixed[0];
+        assert_eq!(fa.request_id(), rid(1_000));
+        assert_eq!(fa.berth_id(), bid(0));
+        assert_eq!(fa.start_time(), tp(10));
     }
 }
