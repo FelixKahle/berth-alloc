@@ -21,9 +21,9 @@
 
 use crate::{
     eval::objective::Objective,
-    state::{
+    model::{
         index::{BerthIndex, RequestIndex},
-        model::SolverModel,
+        solver_model::SolverModel,
     },
 };
 use berth_alloc_core::prelude::{Cost, TimePoint};

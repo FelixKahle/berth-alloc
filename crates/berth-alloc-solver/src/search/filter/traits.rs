@@ -22,7 +22,7 @@
 use crate::state::{chain_set::delta::ChainSetDelta, search_state::SolverSearchState};
 use num_traits::{CheckedAdd, CheckedSub};
 
-pub trait FeasibilityFilter<'model, 'problem, T>: Send + Sync
+pub trait FeasibilityFilter<T>: Send + Sync
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {
@@ -33,14 +33,14 @@ where
 
     fn complexity(&self) -> usize;
 
-    fn is_feasible(
+    fn is_feasible<'model, 'problem>(
         &self,
         delta: &ChainSetDelta,
         search_state: &SolverSearchState<'model, 'problem, T>,
     ) -> bool;
 }
 
-impl<'model, 'problem, T> PartialEq for dyn FeasibilityFilter<'model, 'problem, T>
+impl<T> PartialEq for dyn FeasibilityFilter<T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {
@@ -49,12 +49,9 @@ where
     }
 }
 
-impl<'model, 'problem, T> Eq for dyn FeasibilityFilter<'model, 'problem, T> where
-    T: Copy + Ord + CheckedAdd + CheckedSub
-{
-}
+impl<T> Eq for dyn FeasibilityFilter<T> where T: Copy + Ord + CheckedAdd + CheckedSub {}
 
-impl<'model, 'problem, T> PartialOrd for dyn FeasibilityFilter<'model, 'problem, T>
+impl<T> PartialOrd for dyn FeasibilityFilter<T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {
@@ -63,7 +60,7 @@ where
     }
 }
 
-impl<'model, 'problem, T> Ord for dyn FeasibilityFilter<'model, 'problem, T>
+impl<T> Ord for dyn FeasibilityFilter<T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {
@@ -72,7 +69,7 @@ where
     }
 }
 
-impl<'model, 'problem, T> std::fmt::Debug for dyn FeasibilityFilter<'model, 'problem, T>
+impl<T> std::fmt::Debug for dyn FeasibilityFilter<T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {
@@ -84,7 +81,7 @@ where
     }
 }
 
-impl<'model, 'problem, T> std::fmt::Display for dyn FeasibilityFilter<'model, 'problem, T>
+impl<T> std::fmt::Display for dyn FeasibilityFilter<T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {

@@ -23,4 +23,5 @@ pub mod context;
 pub mod empty;
 pub mod greedy;
 pub mod operators;
+pub mod solver;
 pub mod traits;

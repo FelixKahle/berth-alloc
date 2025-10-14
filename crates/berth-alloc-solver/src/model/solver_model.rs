@@ -19,15 +19,17 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::state::{
-    berth::{
-        berthocc::BerthOccupancy,
-        calendar::BerthCalendar,
-        traits::{BerthRead, BerthWrite},
+use crate::{
+    model::{
+        berth::{
+            berthocc::BerthOccupancy,
+            calendar::BerthCalendar,
+            traits::{BerthRead, BerthWrite},
+        },
+        index::{BerthIndex, RequestIndex},
+        index_manager::SolverIndexManager,
     },
-    err::{MissingRequestError, SolverModelBuildError},
-    index::{BerthIndex, RequestIndex},
-    index_manager::SolverIndexManager,
+    state::err::{MissingRequestError, SolverModelBuildError},
 };
 use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval};
 use berth_alloc_model::{

@@ -19,7 +19,7 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::state::index::BerthIndex;
+use crate::model::index::BerthIndex;
 use berth_alloc_core::prelude::TimePoint;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

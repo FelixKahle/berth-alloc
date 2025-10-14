@@ -19,10 +19,11 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::state::berth::err::BerthUpdateError;
 use berth_alloc_core::prelude::{TimeDelta, TimeInterval};
 use berth_alloc_model::prelude::Berth;
 use num_traits::{CheckedSub, Zero};
+
+use crate::model::berth::err::BerthUpdateError;
 
 pub trait BerthRead<'b, T: Copy + Ord> {
     fn is_free(&self, interval: TimeInterval<T>) -> bool;

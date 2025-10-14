@@ -26,16 +26,13 @@ use berth_alloc_model::problem::builder::ProblemBuilder;
 use berth_alloc_model::problem::req::Request;
 use berth_alloc_solver::{
     core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
+    model::{index::BerthIndex, solver_model::SolverModel},
     scheduling::{greedy::GreedyScheduler, traits::Scheduler},
-    state::{
-        chain_set::{
-            base::ChainSet,
-            delta::{ChainNextRewire, ChainSetDelta},
-            index::{ChainIndex, NodeIndex},
-            view::ChainSetView,
-        },
-        index::BerthIndex,
-        model::SolverModel,
+    state::chain_set::{
+        base::ChainSet,
+        delta::{ChainNextRewire, ChainSetDelta},
+        index::{ChainIndex, NodeIndex},
+        view::ChainSetView,
     },
 };
 use criterion::{Criterion, criterion_group, criterion_main};

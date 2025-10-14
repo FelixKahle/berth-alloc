@@ -20,8 +20,8 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    engine::traits::Opening,
-    state::{model::SolverModel, search_state::SolverSearchState},
+    engine::traits::Opening, model::solver_model::SolverModel,
+    state::search_state::SolverSearchState,
 };
 use berth_alloc_core::prelude::Cost;
 use num_traits::{CheckedAdd, CheckedSub, Zero};

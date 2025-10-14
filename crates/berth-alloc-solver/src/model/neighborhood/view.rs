@@ -19,20 +19,27 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::model::{
-    index::{BerthIndex, RequestIndex},
-    solver_model::SolverModel,
-};
-use berth_alloc_core::prelude::{Cost, TimePoint};
+use crate::model::neighborhood::{adjacency_mask::AdjacencyMask, neighbor_lists::NeighborLists};
 
-pub trait Objective<T: Copy + Ord> {
-    fn assignment_cost(
-        &self,
-        model: &SolverModel<'_, T>,
-        request_index: RequestIndex,
-        berth_index: BerthIndex,
-        start_time: TimePoint<T>,
-    ) -> Option<Cost>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeighborView {
+    lists: NeighborLists, // preds/succs as Vec<Vec<NodeIndex>>
+    mask: AdjacencyMask,  // bitset membership & fast ops
+}
 
-    fn unassignment_cost(&self, model: &SolverModel<'_, T>, request_index: RequestIndex) -> Cost;
+impl NeighborView {
+    #[inline]
+    pub fn new(lists: NeighborLists, mask: AdjacencyMask) -> Self {
+        Self { lists, mask }
+    }
+
+    #[inline]
+    pub fn lists(&self) -> &NeighborLists {
+        &self.lists
+    }
+
+    #[inline]
+    pub fn mask(&self) -> &AdjacencyMask {
+        &self.mask
+    }
 }

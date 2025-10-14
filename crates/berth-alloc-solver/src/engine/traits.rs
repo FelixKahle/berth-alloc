@@ -19,7 +19,7 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::state::{model::SolverModel, search_state::SolverSearchState};
+use crate::{model::solver_model::SolverModel, state::search_state::SolverSearchState};
 use num_traits::{CheckedAdd, CheckedSub};
 
 pub trait Opening<'model, 'problem, T>: Send + Sync

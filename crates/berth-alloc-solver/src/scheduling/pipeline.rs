@@ -19,6 +19,7 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::core::{decisionvar::DecisionVar, intervalvar::IntervalVar};
+use crate::model::solver_model::SolverModel;
 use crate::scheduling::{
     err::SchedulingError,
     traits::{Propagator, Scheduler},
@@ -27,7 +28,6 @@ use crate::state::chain_set::base::ChainSet;
 use crate::state::chain_set::index::NodeIndex;
 use crate::state::chain_set::overlay::ChainSetOverlay;
 use crate::state::chain_set::view::ChainRef;
-use crate::state::model::SolverModel;
 use num_traits::{CheckedAdd, CheckedSub};
 use std::marker::PhantomData;
 
@@ -227,16 +227,13 @@ where
 mod tests {
     use super::*;
     use crate::core::{decisionvar::DecisionVar, intervalvar::IntervalVar};
+    use crate::model::index::BerthIndex;
     use crate::scheduling::{greedy::GreedyScheduler, tightener::BoundsTightener};
-    use crate::state::{
-        chain_set::{
-            base::ChainSet,
-            delta::{ChainNextRewire, ChainSetDelta},
-            index::{ChainIndex, NodeIndex},
-            view::ChainSetView,
-        },
-        index::BerthIndex,
-        model::SolverModel,
+    use crate::state::chain_set::{
+        base::ChainSet,
+        delta::{ChainNextRewire, ChainSetDelta},
+        index::{ChainIndex, NodeIndex},
+        view::ChainSetView,
     };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
     use berth_alloc_model::common::FlexibleKind;

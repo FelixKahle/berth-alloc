@@ -19,14 +19,13 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use berth_alloc_core::prelude::{TimeInterval, TimePoint};
-use berth_alloc_model::prelude::Berth;
-use rangemap::RangeSet;
-
-use crate::state::berth::{
+use crate::model::berth::{
     err::{BerthUpdateError, NotFreeError, OutsideAvailabilityError},
     traits::{BerthRead, BerthWrite},
 };
+use berth_alloc_core::prelude::{TimeInterval, TimePoint};
+use berth_alloc_model::prelude::Berth;
+use rangemap::RangeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BerthOccupancy<'b, T: Copy + Ord> {

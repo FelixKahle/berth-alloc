@@ -22,18 +22,18 @@
 use crate::{
     engine::operators::OperatorPool,
     eval::{objective::Objective, search::SearchObjective, wtt::WeightedTurnaroundTimeObjective},
-    scheduling::{pipeline::SchedulingPipeline, traits::Scheduler},
-    search::{
-        filter::{filter_stack::FilterStack, traits::FeasibilityFilter},
-        operator::runner::NeighborhoodCandidate,
+    model::{
+        index::{BerthIndex, RequestIndex},
+        neighborhood::ProximityMap,
+        solver_model::SolverModel,
     },
+    scheduling::{pipeline::SchedulingPipeline, traits::Scheduler},
+    search::{filter::filter_stack::FilterStack, operator::runner::NeighborhoodCandidate},
     state::{
         chain_set::{
             index::NodeIndex,
             view::{ChainRef, ChainSetView},
         },
-        index::{BerthIndex, RequestIndex},
-        model::SolverModel,
         search_state::SolverSearchState,
     },
 };
@@ -41,14 +41,15 @@ use berth_alloc_core::prelude::Cost;
 use num_traits::{CheckedAdd, CheckedSub};
 
 #[derive(Debug)]
-pub struct EngineContext<'model, 'problem, T, S>
+pub struct EngineContext<'engine, 'problem, T, S>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
     S: Scheduler<T>,
 {
-    model: &'model SolverModel<'problem, T>,
-    pipeline: SchedulingPipeline<T, S>,
-    filters: FilterStack<'model, 'problem, T>,
+    model: &'engine SolverModel<'problem, T>,
+    proximity_map: &'engine ProximityMap,
+    pipeline: &'engine SchedulingPipeline<T, S>,
+    filters: &'engine FilterStack<T>,
 }
 
 impl<'model, 'problem, T, S> EngineContext<'model, 'problem, T, S>
@@ -58,19 +59,16 @@ where
 {
     pub fn new(
         model: &'model SolverModel<'problem, T>,
-        scheduler: SchedulingPipeline<T, S>,
+        close_model: &'model ProximityMap,
+        scheduler: &'model SchedulingPipeline<T, S>,
+        filters: &'model FilterStack<T>,
     ) -> Self {
         Self {
             model,
+            proximity_map: close_model,
             pipeline: scheduler,
-            filters: FilterStack::new(),
+            filters,
         }
-    }
-
-    #[inline]
-    pub fn with_filter(mut self, f: Box<dyn FeasibilityFilter<'model, 'problem, T>>) -> Self {
-        self.filters.add_filter(f);
-        self
     }
 
     #[inline]
@@ -79,13 +77,18 @@ where
     }
 
     #[inline]
-    pub fn pipeline(&self) -> &SchedulingPipeline<T, S> {
-        &self.pipeline
+    pub fn proximity_map(&self) -> &ProximityMap {
+        self.proximity_map
     }
 
     #[inline]
-    pub fn filters(&self) -> &FilterStack<'model, 'problem, T> {
-        &self.filters
+    pub fn pipeline(&self) -> &SchedulingPipeline<T, S> {
+        self.pipeline
+    }
+
+    #[inline]
+    pub fn filters(&self) -> &'model FilterStack<T> {
+        self.filters
     }
 }
 
@@ -121,6 +124,11 @@ where
     }
 
     #[inline]
+    pub fn model(&self) -> &SolverModel<'problem, T> {
+        self.engine_context.model()
+    }
+
+    #[inline]
     pub fn engine_context(&self) -> &'engine EngineContext<'model, 'problem, T, S> {
         self.engine_context
     }
@@ -146,7 +154,7 @@ where
     }
 
     #[inline]
-    pub fn filters(&self) -> &'engine FilterStack<'model, 'problem, T> {
+    pub fn filters(&self) -> &'engine FilterStack<T> {
         self.engine_context.filters()
     }
 

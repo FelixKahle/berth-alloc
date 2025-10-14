@@ -22,12 +22,12 @@
 use crate::{
     core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
     eval::objective::Objective,
-    search::operator::runner::NeighborhoodCandidate,
-    state::{
-        chain_set::base::ChainSet,
+    model::{
         index::{BerthIndex, RequestIndex},
-        model::SolverModel,
+        solver_model::SolverModel,
     },
+    search::operator::runner::NeighborhoodCandidate,
+    state::chain_set::base::ChainSet,
 };
 use berth_alloc_core::prelude::Cost;
 use berth_alloc_model::{
@@ -390,10 +390,7 @@ mod tests {
     use crate::{
         core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
         search::operator::patch::VarPatch,
-        state::{
-            chain_set::{base::ChainSet, delta::ChainSetDelta, view::ChainSetView},
-            model::SolverModel,
-        },
+        state::chain_set::{base::ChainSet, delta::ChainSetDelta, view::ChainSetView},
     };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
     use berth_alloc_model::{

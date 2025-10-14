@@ -19,20 +19,8 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::model::{
-    index::{BerthIndex, RequestIndex},
-    solver_model::SolverModel,
-};
-use berth_alloc_core::prelude::{Cost, TimePoint};
-
-pub trait Objective<T: Copy + Ord> {
-    fn assignment_cost(
-        &self,
-        model: &SolverModel<'_, T>,
-        request_index: RequestIndex,
-        berth_index: BerthIndex,
-        start_time: TimePoint<T>,
-    ) -> Option<Cost>;
-
-    fn unassignment_cost(&self, model: &SolverModel<'_, T>, request_index: RequestIndex) -> Cost;
-}
+pub mod berth;
+pub mod index;
+pub mod index_manager;
+pub mod neighborhood;
+pub mod solver_model;

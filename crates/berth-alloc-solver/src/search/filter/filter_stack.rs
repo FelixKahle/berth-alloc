@@ -19,14 +19,17 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::search::filter::traits::FeasibilityFilter;
+use crate::{
+    search::filter::traits::FeasibilityFilter,
+    state::{chain_set::delta::ChainSetDelta, search_state::SolverSearchState},
+};
 use num_traits::{CheckedAdd, CheckedSub};
 
-pub struct FilterStack<'model, 'problem, T: Copy + Ord> {
-    filters: Vec<Box<dyn FeasibilityFilter<'model, 'problem, T> + 'model>>,
+pub struct FilterStack<T: Copy + Ord> {
+    filters: Vec<Box<dyn FeasibilityFilter<T>>>,
 }
 
-impl<'model, 'problem, T> Default for FilterStack<'model, 'problem, T>
+impl<T> Default for FilterStack<T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {
@@ -35,7 +38,7 @@ where
     }
 }
 
-impl<'model, 'problem, T: Copy + Ord> std::fmt::Debug for FilterStack<'model, 'problem, T> {
+impl<T: Copy + Ord> std::fmt::Debug for FilterStack<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FilterStack")
             .field("num_filters", &self.filters.len())
@@ -43,7 +46,7 @@ impl<'model, 'problem, T: Copy + Ord> std::fmt::Debug for FilterStack<'model, 'p
     }
 }
 
-impl<'model, 'problem, T> FilterStack<'model, 'problem, T>
+impl<T> FilterStack<T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {
@@ -60,14 +63,17 @@ where
     }
 
     #[inline]
-    pub fn with_filters(
-        filters: Vec<Box<dyn FeasibilityFilter<'model, 'problem, T> + 'model>>,
-    ) -> Self {
+    pub fn with_filters(filters: Vec<Box<dyn FeasibilityFilter<T>>>) -> Self {
         let mut stack = Self { filters };
         stack
             .filters
             .sort_by_key(|f| std::cmp::Reverse(f.complexity()));
         stack
+    }
+
+    #[inline]
+    pub fn empty() -> Self {
+        Self { filters: vec![] }
     }
 
     #[inline]
@@ -81,21 +87,20 @@ where
     }
 
     #[inline]
-    pub fn add_filter(&mut self, filter: Box<dyn FeasibilityFilter<'model, 'problem, T> + 'model>) {
+    pub fn add_filter(&mut self, filter: Box<dyn FeasibilityFilter<T>>) {
         self.filters.push(filter);
         self.filters.sort_by_key(|f| f.complexity());
     }
 }
 
-impl<'model, 'problem, T> FeasibilityFilter<'model, 'problem, T>
-    for FilterStack<'model, 'problem, T>
+impl<T> FeasibilityFilter<T> for FilterStack<T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {
-    fn is_feasible(
+    fn is_feasible<'model, 'problem>(
         &self,
-        delta: &crate::state::chain_set::prelude::ChainSetDelta,
-        search_state: &crate::state::search_state::SolverSearchState<'model, 'problem, T>,
+        delta: &ChainSetDelta,
+        search_state: &SolverSearchState<'model, 'problem, T>,
     ) -> bool {
         for filter in &self.filters {
             if !filter.is_feasible(delta, search_state) {

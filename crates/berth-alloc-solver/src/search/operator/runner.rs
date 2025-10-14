@@ -23,12 +23,11 @@ use crate::{
     core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
     engine::context::SearchContext,
     eval::objective::Objective,
+    model::{index::RequestIndex, solver_model::SolverModel},
     scheduling::traits::Scheduler,
     search::{filter::traits::FeasibilityFilter, operator::patch::VarPatch},
     state::{
         chain_set::{delta::ChainSetDelta, overlay::ChainSetOverlay, view::ChainSetView},
-        index::RequestIndex,
-        model::SolverModel,
         search_state::SolverSearchState,
     },
 };
@@ -314,18 +313,18 @@ mod tests {
     use super::*;
     use crate::{
         engine::context::{EngineContext, SearchContext},
+        model::{
+            index::BerthIndex,
+            neighborhood::{ProximityMap, ProximityMapParameter},
+        },
         scheduling::{
             greedy::GreedyScheduler, pipeline::SchedulingPipeline, tightener::BoundsTightener,
         },
-        search::filter::traits::FeasibilityFilter,
-        state::{
-            chain_set::{
-                delta::{ChainNextRewire, ChainSetDelta},
-                index::{ChainIndex, NodeIndex},
-                view::ChainSetView,
-            },
-            index::BerthIndex,
-            model::SolverModel,
+        search::filter::{filter_stack::FilterStack, traits::FeasibilityFilter},
+        state::chain_set::{
+            delta::{ChainNextRewire, ChainSetDelta},
+            index::{ChainIndex, NodeIndex},
+            view::ChainSetView,
         },
     };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
@@ -408,14 +407,14 @@ mod tests {
     }
 
     struct AlwaysFalseFilter;
-    impl<'model, 'problem, T> FeasibilityFilter<'model, 'problem, T> for AlwaysFalseFilter
+    impl<T> FeasibilityFilter<T> for AlwaysFalseFilter
     where
         T: Copy + Ord + CheckedAdd + CheckedSub,
     {
         fn complexity(&self) -> usize {
             1
         }
-        fn is_feasible(
+        fn is_feasible<'model, 'problem>(
             &self,
             _delta: &ChainSetDelta,
             _search_state: &SolverSearchState<'model, 'problem, T>,
@@ -429,10 +428,11 @@ mod tests {
         // 1 berth, 1 request allowed
         let p = build_problem_with_weights(&[vec![(0, 100)]], &[(0, 100)], &[1], &[vec![Some(5)]]);
         let m = SolverModel::from_problem(&p).unwrap();
-
+        let c = ProximityMap::build(&m, ProximityMapParameter::default());
         let pipeline = SchedulingPipeline::empty(GreedyScheduler);
         let state = SolverSearchState::new_unassigned(&m, 0, 0);
-        let engine = EngineContext::new(&m, pipeline).with_filter(Box::new(AlwaysFalseFilter));
+        let filter_stack = FilterStack::with_filters(vec![Box::new(AlwaysFalseFilter)]);
+        let engine = EngineContext::new(&m, &c, &pipeline, &filter_stack);
         let search = SearchContext::new(&engine, state, 0.0);
 
         // Any delta: mark the chain, but AlwaysFalseFilter should reject before any scheduling.
@@ -454,12 +454,13 @@ mod tests {
             &[vec![Some(7)], vec![Some(7)]],
         );
         let m = SolverModel::from_problem(&p).unwrap();
-
+        let c = ProximityMap::build(&m, ProximityMapParameter::default());
         let bounds = BoundsTightener::default();
 
         let state = SolverSearchState::new_unassigned(&m, 0, 0);
         let pipeline = SchedulingPipeline::from_propagators([bounds], GreedyScheduler);
-        let engine = EngineContext::new(&m, pipeline);
+        let filter_stack = FilterStack::empty();
+        let engine = EngineContext::new(&m, &c, &pipeline, &filter_stack);
         let search = SearchContext::new(&engine, state, 0.0);
 
         // Overlay a chain 0 with nodes [0,1]
@@ -489,10 +490,11 @@ mod tests {
             &[vec![Some(5)], vec![Some(7)]],
         );
         let m = SolverModel::from_problem(&p).unwrap();
-
+        let c = ProximityMap::build(&m, ProximityMapParameter::default());
         let state = SolverSearchState::new_unassigned(&m, 0, 0);
         let pipeline = SchedulingPipeline::empty(GreedyScheduler);
-        let engine = EngineContext::new(&m, pipeline);
+        let filter_stack = FilterStack::empty();
+        let engine = EngineContext::new(&m, &c, &pipeline, &filter_stack);
         // λ = 1.0 (SearchObjective will scale unassignment cost by 2x)
         let search = SearchContext::new(&engine, state, 1.0);
 

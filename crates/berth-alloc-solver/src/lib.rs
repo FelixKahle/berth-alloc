@@ -22,6 +22,7 @@
 pub mod core;
 pub mod engine;
 pub mod eval;
+pub mod model;
 pub mod scheduling;
 pub mod search;
 pub mod state;

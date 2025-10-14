@@ -20,12 +20,12 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::{
+    model::index::{BerthIndex, RequestIndex},
     search::filter::traits::FeasibilityFilter,
     state::{
         chain_set::{
             delta::ChainSetDelta, index::NodeIndex, overlay::ChainSetOverlay, view::ChainSetView,
         },
-        index::{BerthIndex, RequestIndex},
         search_state::SolverSearchState,
     },
 };
@@ -42,9 +42,9 @@ impl FeasibleBerthFilter {
     }
 }
 
-impl<'model, 'problem, T> FeasibilityFilter<'model, 'problem, T> for FeasibleBerthFilter
+impl<T> FeasibilityFilter<T> for FeasibleBerthFilter
 where
-    T: Copy + Ord + CheckedAdd + CheckedSub + Zero + Into<Cost> + Send + Sync,
+    T: Copy + Ord + CheckedAdd + CheckedSub + Zero + Into<Cost>,
 {
     #[inline]
     fn complexity(&self) -> usize {
@@ -52,7 +52,7 @@ where
     }
 
     #[inline]
-    fn is_feasible(
+    fn is_feasible<'model, 'problem>(
         &self,
         delta: &ChainSetDelta,
         search_state: &SolverSearchState<'model, 'problem, T>,

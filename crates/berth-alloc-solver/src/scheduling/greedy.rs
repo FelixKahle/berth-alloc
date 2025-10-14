@@ -20,17 +20,17 @@
 
 use crate::{
     core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
+    model::{
+        index::{BerthIndex, RequestIndex},
+        solver_model::SolverModel,
+    },
     scheduling::{
         err::{FeasiblyWindowViolationError, NotAllowedOnBerthError, SchedulingError},
         traits::Scheduler,
     },
-    state::{
-        chain_set::{
-            index::NodeIndex,
-            view::{ChainRef, ChainSetView},
-        },
-        index::{BerthIndex, RequestIndex},
-        model::SolverModel,
+    state::chain_set::{
+        index::NodeIndex,
+        view::{ChainRef, ChainSetView},
     },
 };
 use num_traits::{CheckedAdd, CheckedSub};
@@ -169,15 +169,11 @@ mod tests {
     use super::*;
     use crate::core::{decisionvar::DecisionVar, intervalvar::IntervalVar};
     use crate::scheduling::traits::Scheduler;
-    use crate::state::{
-        chain_set::{
-            base::ChainSet,
-            delta::{ChainNextRewire, ChainSetDelta},
-            index::{ChainIndex, NodeIndex},
-            view::ChainSetView,
-        },
-        index::{BerthIndex, RequestIndex},
-        model::SolverModel,
+    use crate::state::chain_set::{
+        base::ChainSet,
+        delta::{ChainNextRewire, ChainSetDelta},
+        index::{ChainIndex, NodeIndex},
+        view::ChainSetView,
     };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
     use berth_alloc_model::common::FlexibleKind;

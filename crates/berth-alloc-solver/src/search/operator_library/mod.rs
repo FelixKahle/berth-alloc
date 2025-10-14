@@ -21,4 +21,3 @@
 
 pub mod relocate;
 pub mod swap;
-pub mod two_opt;

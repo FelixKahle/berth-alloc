@@ -21,13 +21,11 @@
 
 use crate::{
     core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
+    model::solver_model::SolverModel,
     scheduling::err::SchedulingError,
-    state::{
-        chain_set::{
-            index::NodeIndex,
-            view::{ChainRef, ChainSetView},
-        },
-        model::SolverModel,
+    state::chain_set::{
+        index::NodeIndex,
+        view::{ChainRef, ChainSetView},
     },
 };
 use num_traits::CheckedAdd;
