@@ -102,6 +102,14 @@ where
         });
     }
 
+    pub fn clear(&mut self) {
+        self.operators.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.operators.len()
+    }
+
     #[inline]
     pub fn record_attempt(&mut self, idx: usize) {
         if let Some(r) = self.operators.get_mut(idx) {

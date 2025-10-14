@@ -20,6 +20,7 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::{
+    core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
     search::filter::traits::FeasibilityFilter,
     state::{chain_set::delta::ChainSetDelta, search_state::SolverSearchState},
 };
@@ -101,9 +102,12 @@ where
         &self,
         delta: &ChainSetDelta,
         search_state: &SolverSearchState<'model, 'problem, T>,
+        iv: &[IntervalVar<T>],
+        dv: &[DecisionVar<T>],
+        touched: &[usize],
     ) -> bool {
         for filter in &self.filters {
-            if !filter.is_feasible(delta, search_state) {
+            if !filter.is_feasible(delta, search_state, iv, dv, touched) {
                 return false;
             }
         }

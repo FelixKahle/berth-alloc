@@ -19,7 +19,10 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::state::{chain_set::delta::ChainSetDelta, search_state::SolverSearchState};
+use crate::{
+    core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
+    state::{chain_set::delta::ChainSetDelta, search_state::SolverSearchState},
+};
 use num_traits::{CheckedAdd, CheckedSub};
 
 pub trait FeasibilityFilter<T>: Send + Sync
@@ -37,6 +40,9 @@ where
         &self,
         delta: &ChainSetDelta,
         search_state: &SolverSearchState<'model, 'problem, T>,
+        iv: &[IntervalVar<T>],
+        dv: &[DecisionVar<T>],
+        touched: &[usize],
     ) -> bool;
 }
 

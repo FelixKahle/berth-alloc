@@ -22,6 +22,7 @@
 use crate::state::chain_set::index::NodeIndex;
 use berth_alloc_core::prelude::Cost;
 
+pub mod arc;
 pub mod objective;
 pub mod search;
 pub mod wtt;

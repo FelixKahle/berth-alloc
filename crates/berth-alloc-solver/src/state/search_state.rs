@@ -36,7 +36,6 @@ use berth_alloc_model::{
     problem::asg::AssignmentRef,
 };
 use num_traits::{CheckedAdd, CheckedSub};
-use std::vec;
 
 #[derive(Debug, Clone)]
 pub struct SearchSnapshot<'model, 'problem, T: Copy + Ord> {
@@ -54,8 +53,6 @@ pub struct SolverSearchState<'model, 'problem, T: Copy + Ord + CheckedAdd + Chec
     decision_vars: Vec<DecisionVar<T>>,
     current_true_cost: Cost,
     current_search_cost: Cost,
-    best_true_cost: Option<Cost>,
-    best: Option<SearchSnapshot<'model, 'problem, T>>,
 }
 
 impl<'problem, 'model, T> SolverSearchState<'model, 'problem, T>
@@ -70,91 +67,13 @@ where
         initial_true_cost: Cost,
         initial_search_cost: Cost,
     ) -> Self {
-        let mut state = Self {
+        Self {
             model,
             chain_set,
             interval_vars,
             decision_vars,
             current_true_cost: initial_true_cost,
             current_search_cost: initial_search_cost,
-            best_true_cost: None,
-            best: None,
-        };
-
-        // Seed best = current
-        state.best_true_cost = Some(state.current_true_cost);
-        state.best = Some(SearchSnapshot {
-            model,
-            chain_set: state.chain_set.clone(),
-            interval_vars: state.interval_vars.clone(),
-            decision_vars: state.decision_vars.clone(),
-            true_cost: state.current_true_cost,
-        });
-
-        state
-    }
-
-    /// Construct a fresh state with all requests Unassigned.
-    /// `initial_true_cost` and `initial_search_cost` are computed by the opening/engine.
-    #[allow(dead_code)]
-    #[inline]
-    pub(crate) fn new_unassigned(
-        model: &'model SolverModel<'problem, T>,
-        initial_true_cost: Cost,
-        initial_search_cost: Cost,
-    ) -> Self {
-        let num_chains = model.berths_len();
-        let num_nodes = model.flexible_requests_len();
-
-        let interval_vars = model
-            .feasible_intervals()
-            .iter()
-            .map(|w| IntervalVar::new(w.start(), w.end()))
-            .collect::<Vec<_>>();
-        let decision_vars = vec![DecisionVar::Unassigned; num_nodes];
-        let chain_set = ChainSet::new(num_nodes, num_chains);
-        Self::new(
-            model,
-            chain_set,
-            interval_vars,
-            decision_vars,
-            initial_true_cost,
-            initial_search_cost,
-        )
-    }
-
-    #[inline]
-    pub fn is_improved_true(&self) -> bool {
-        match self.best_true_cost {
-            None => true,
-            Some(best) => self.current_true_cost < best,
-        }
-    }
-
-    #[inline]
-    pub fn restore_best_into_current<TrueObjective, SearchObjective>(
-        &mut self,
-        obj_true: &TrueObjective,
-        obj_search: &SearchObjective,
-    ) -> bool
-    where
-        TrueObjective: Objective<T>,
-        SearchObjective: Objective<T>,
-    {
-        if let Some(best) = &self.best {
-            self.chain_set = best.chain_set.clone();
-            self.interval_vars = best.interval_vars.clone();
-            self.decision_vars = best.decision_vars.clone();
-            self.current_true_cost = best.true_cost;
-
-            let (true_acc, search_acc) =
-                Self::compute_total_costs(self.model, obj_true, obj_search, &self.decision_vars);
-            self.current_true_cost = true_acc;
-            self.current_search_cost = search_acc;
-
-            true
-        } else {
-            false
         }
     }
 
@@ -198,7 +117,6 @@ where
         (true_acc, search_acc)
     }
 
-    /// Recompute `current_true_cost` and `current_search_cost` exactly (e.g., after λ change).
     #[inline]
     pub fn recompute_costs<TrueObjective, SearchObjective>(
         &mut self,
@@ -217,39 +135,17 @@ where
     /// Accept an evaluated candidate (already scheduled & scored) and update costs in O(1).
     #[inline]
     pub fn apply_candidate(&mut self, cand: NeighborhoodCandidate<T>) {
-        // 1) mutate chain structure
         self.chain_set.apply_delta(cand.delta);
-
-        // 2) apply patches
         for p in &cand.interval_var_patch {
             self.interval_vars[p.index()] = *p.patch();
         }
         for p in &cand.decision_vars_patch {
             self.decision_vars[p.index()] = *p.patch();
         }
-
-        // 3) update running costs
         self.current_true_cost = self.current_true_cost.saturating_add(cand.true_delta_cost);
         self.current_search_cost = self
             .current_search_cost
             .saturating_add(cand.search_delta_cost);
-
-        // 4) track best-by-true-objective
-        let better = self
-            .best_true_cost
-            .map(|b| self.current_true_cost < b)
-            .unwrap_or(true);
-
-        if better {
-            self.best_true_cost = Some(self.current_true_cost);
-            self.best = Some(SearchSnapshot {
-                model: self.model,
-                chain_set: self.chain_set.clone(),
-                interval_vars: self.interval_vars.clone(),
-                decision_vars: self.decision_vars.clone(),
-                true_cost: self.current_true_cost,
-            });
-        }
     }
 
     #[inline]
@@ -288,20 +184,19 @@ where
     pub fn current_search_cost(&self) -> Cost {
         self.current_search_cost
     }
+
     #[inline]
-    pub fn best_true_cost(&self) -> Option<Cost> {
-        self.best_true_cost
+    pub fn snapshot(&self) -> SearchSnapshot<'model, 'problem, T> {
+        SearchSnapshot {
+            model: self.model,
+            chain_set: self.chain_set.clone(),
+            interval_vars: self.interval_vars.clone(),
+            decision_vars: self.decision_vars.clone(),
+            true_cost: self.current_true_cost,
+        }
     }
 
-    pub fn take_best(&mut self) -> Option<SearchSnapshot<'model, 'problem, T>> {
-        self.best_true_cost = self.best.as_ref().map(|s| s.true_cost);
-        self.best.take()
-    }
-
-    pub fn best_snapshot(&self) -> Option<&SearchSnapshot<'model, 'problem, T>> {
-        self.best.as_ref()
-    }
-
+    #[inline]
     pub fn into_snapshot(self) -> SearchSnapshot<'model, 'problem, T> {
         SearchSnapshot {
             model: self.model,
@@ -463,8 +358,7 @@ mod tests {
     use super::*;
     use crate::{
         core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
-        search::operator::patch::VarPatch,
-        state::chain_set::{base::ChainSet, delta::ChainSetDelta, view::ChainSetView},
+        state::chain_set::base::ChainSet,
     };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
     use berth_alloc_model::{
@@ -567,31 +461,6 @@ mod tests {
     }
 
     #[test]
-    fn test_new_unassigned_seeds_best_and_dimensions() {
-        // 1 berth, 2 requests with weights 3 and 7
-        let p = build_problem_with_weights(
-            &[vec![(0, 100)]],
-            &[(0, 50), (10, 60)],
-            &[3, 7],
-            &[vec![Some(5)], vec![Some(6)]],
-        );
-        let m = SolverModel::from_problem(&p).unwrap();
-
-        let state = SolverSearchState::new_unassigned(&m, 0, 0);
-
-        // Best is seeded and matches current
-        assert_eq!(state.best_true_cost(), Some(0));
-        let best = state.best_snapshot().expect("best snapshot must exist");
-        assert_eq!(best.true_cost, 0);
-
-        // Dimensions of chain set and variables
-        assert_eq!(state.chain_set().num_chains(), m.berths_len());
-        assert_eq!(state.chain_set().num_nodes(), m.flexible_requests_len());
-        assert_eq!(state.interval_vars().len(), m.flexible_requests_len());
-        assert_eq!(state.decision_vars().len(), m.flexible_requests_len());
-    }
-
-    #[test]
     fn test_compute_and_recompute_costs_with_weight_objective() {
         let p = build_problem_with_weights(
             &[vec![(0, 100)]],
@@ -623,57 +492,6 @@ mod tests {
         state.recompute_costs(&WeightOnlyObjective, &WeightOnlyObjective);
         assert_eq!(state.current_true_cost(), 3);
         assert_eq!(state.current_search_cost(), 3);
-    }
-
-    #[test]
-    fn test_apply_candidate_updates_state_and_best_tracking() {
-        let p = build_problem_with_weights(
-            &[vec![(0, 100)]],
-            &[(0, 50), (10, 60)],
-            &[3, 7],
-            &[vec![Some(5)], vec![Some(6)]],
-        );
-        let m = SolverModel::from_problem(&p).unwrap();
-
-        let chain_set = ChainSet::new(m.flexible_requests_len(), m.berths_len());
-        let iv = default_ivars(&m);
-        let dv = vec![DecisionVar::Unassigned; m.flexible_requests_len()];
-
-        let mut state = SolverSearchState::new(&m, chain_set, iv, dv, 10, 10);
-
-        // Candidate that assigns request 0 and improves cost by 5 (delta = -5)
-        // Note: we assume Cost supports negative deltas (as is typical for signed Cost).
-        let cand1 = NeighborhoodCandidate::new(
-            ChainSetDelta::new(), // no structural change
-            vec![],               // no interval var changes
-            vec![VarPatch::new(DecisionVar::assigned(bi(0), tp(5)), 0)], // assign r0
-            -5,                   // true delta cost
-            -5,                   // search delta cost
-        );
-
-        state.apply_candidate(cand1);
-        assert_eq!(
-            state.decision_vars()[0].as_assigned().unwrap().berth_index,
-            bi(0)
-        );
-        assert_eq!(state.current_true_cost(), 5);
-        assert_eq!(state.current_search_cost(), 5);
-
-        // Best should now reflect the improved state
-        let best = state
-            .best_snapshot()
-            .expect("best snapshot exists after improvement");
-        assert_eq!(best.true_cost, 5);
-        assert_eq!(
-            best.decision_vars[0].as_assigned().unwrap().berth_index,
-            bi(0)
-        );
-
-        // A worsening candidate should not replace best
-        let cand2 = NeighborhoodCandidate::new(ChainSetDelta::new(), vec![], vec![], 3, 3);
-        state.apply_candidate(cand2);
-        assert_eq!(state.current_true_cost(), 8);
-        assert_eq!(state.best_true_cost(), Some(5)); // best remains 5
     }
 
     #[test]
@@ -721,92 +539,6 @@ mod tests {
             ExportError::MissingBerth(bi_) => assert_eq!(bi_, BerthIndex(999)),
             x => panic!("expected MissingBerth, got {:?}", x),
         }
-    }
-
-    #[test]
-    fn test_restore_best_into_current() {
-        // Problem: 1 berth, 2 requests (weights 3 and 7)
-        let p = build_problem_with_weights(
-            &[vec![(0, 100)]],
-            &[(0, 50), (10, 60)],
-            &[3, 7],
-            &[vec![Some(5)], vec![Some(6)]],
-        );
-        let m = SolverModel::from_problem(&p).unwrap();
-
-        let chain_set = ChainSet::new(m.flexible_requests_len(), m.berths_len());
-        let iv = default_ivars(&m);
-        let dv = vec![DecisionVar::Unassigned; m.flexible_requests_len()];
-
-        // Start at cost 10 (arbitrary), then apply an improvement that assigns r0
-        // and reduces cost by exactly -3 (the weight of r0 in our objective).
-        let mut state = SolverSearchState::new(&m, chain_set, iv, dv, 10, 10);
-        let cand_improve = NeighborhoodCandidate::new(
-            ChainSetDelta::new(),
-            vec![],
-            vec![VarPatch::new(
-                DecisionVar::assigned(BerthIndex(0), tp(1)),
-                0,
-            )],
-            -3,
-            -3,
-        );
-        state.apply_candidate(cand_improve);
-        assert_eq!(state.best_true_cost(), Some(7)); // 10 + (-3) = 7
-
-        // Make the current state worse to exercise restore
-        let cand_worse = NeighborhoodCandidate::new(ChainSetDelta::new(), vec![], vec![], 10, 10);
-        state.apply_candidate(cand_worse);
-        assert_eq!(state.current_true_cost(), 17);
-
-        // Restore best snapshot and recompute costs using the objective
-        let restored = state.restore_best_into_current(&WeightOnlyObjective, &WeightOnlyObjective);
-        assert!(restored);
-
-        // After restore, DV has r0 assigned and r1 unassigned => true/search cost 7
-        assert_eq!(state.current_true_cost(), 7);
-        assert_eq!(state.current_search_cost(), 7);
-        assert!(state.decision_vars()[0].is_assigned());
-        assert!(matches!(state.decision_vars()[1], DecisionVar::Unassigned));
-    }
-
-    #[test]
-    fn test_take_best_returns_and_clears_best() {
-        let p = build_problem_with_weights(
-            &[vec![(0, 100)]],
-            &[(0, 50), (10, 60)],
-            &[3, 7],
-            &[vec![Some(5)], vec![Some(6)]],
-        );
-        let m = SolverModel::from_problem(&p).unwrap();
-
-        let chain_set = ChainSet::new(m.flexible_requests_len(), m.berths_len());
-        let iv = default_ivars(&m);
-        let dv = vec![DecisionVar::Unassigned; m.flexible_requests_len()];
-        let mut state = SolverSearchState::new(&m, chain_set, iv, dv, 10, 10);
-
-        // Improve cost by -3 by assigning r0
-        let cand_improve = NeighborhoodCandidate::new(
-            ChainSetDelta::new(),
-            vec![],
-            vec![VarPatch::new(
-                DecisionVar::assigned(BerthIndex(0), tp(1)),
-                0,
-            )],
-            -3,
-            -3,
-        );
-        state.apply_candidate(cand_improve);
-        assert_eq!(state.best_true_cost(), Some(7));
-
-        // Take best snapshot out; this clears internal best
-        let snap = state.take_best().expect("should take best");
-        assert_eq!(snap.true_cost, 7);
-        assert!(state.best_snapshot().is_none());
-        assert_eq!(state.best_true_cost(), Some(7));
-
-        // restore_best_into_current would now return false (no internal best)
-        assert!(!state.restore_best_into_current(&WeightOnlyObjective, &WeightOnlyObjective));
     }
 
     #[test]
@@ -863,80 +595,5 @@ mod tests {
         assert_eq!(fa.request_id(), rid(1_000));
         assert_eq!(fa.berth_id(), bid(0));
         assert_eq!(fa.start_time(), tp(10));
-    }
-
-    #[test]
-    fn test_snapshot_try_into_solution_success() {
-        let p = build_problem_with_weights(
-            &[vec![(0, 100)]],
-            &[(0, 50), (10, 60)],
-            &[3, 7],
-            &[vec![Some(5)], vec![Some(6)]],
-        );
-        let m = SolverModel::from_problem(&p).unwrap();
-
-        // Build a fully assigned state
-        let chain_set = ChainSet::new(m.flexible_requests_len(), m.berths_len());
-        let iv = default_ivars(&m);
-        let mut dv = vec![DecisionVar::Unassigned; m.flexible_requests_len()];
-        dv[0] = DecisionVar::assigned(bi(0), tp(0));
-        dv[1] = DecisionVar::assigned(bi(0), tp(10));
-
-        let state = SolverSearchState::new(&m, chain_set, iv, dv, 0, 0);
-        let snap = state.best_snapshot().expect("snapshot seeded");
-        let sol: Result<SolutionRef<'_, i64>, ExportError> = snap.clone().try_into();
-        assert!(sol.is_ok());
-        let sr = sol.unwrap();
-        assert_eq!(sr.flexible_assignments().iter().count(), 2);
-        assert_eq!(
-            sr.fixed_assignments().iter().count(),
-            p.fixed_assignments().iter().count()
-        );
-    }
-
-    #[test]
-    fn test_snapshot_try_into_solution_unassigned_error() {
-        let p = build_problem_with_weights(
-            &[vec![(0, 100)]],
-            &[(0, 50), (10, 60)],
-            &[3, 7],
-            &[vec![Some(5)], vec![Some(6)]],
-        );
-        let m = SolverModel::from_problem(&p).unwrap();
-
-        // One assigned, one unassigned
-        let chain_set = ChainSet::new(m.flexible_requests_len(), m.berths_len());
-        let iv = default_ivars(&m);
-        let mut dv = vec![DecisionVar::Unassigned; m.flexible_requests_len()];
-        dv[0] = DecisionVar::assigned(bi(0), tp(0));
-        dv[1] = DecisionVar::Unassigned;
-
-        let state = SolverSearchState::new(&m, chain_set, iv, dv, 0, 0);
-        let snap = state.best_snapshot().expect("snapshot seeded");
-        let res: Result<SolutionRef<'_, i64>, ExportError> = snap.clone().try_into();
-        match res {
-            Err(ExportError::InvalidDecisionVar(ri_)) => assert_eq!(ri_, ri(1)),
-            other => panic!("expected InvalidDecisionVar, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_snapshot_try_into_solution_missing_berth_error() {
-        let p = build_problem_with_weights(&[vec![(0, 100)]], &[(0, 50)], &[3], &[vec![Some(5)]]);
-        let m = SolverModel::from_problem(&p).unwrap();
-
-        let chain_set = ChainSet::new(m.flexible_requests_len(), m.berths_len());
-        let iv = default_ivars(&m);
-        let mut dv = vec![DecisionVar::Unassigned; m.flexible_requests_len()];
-        // Intentionally use an invalid berth index
-        dv[0] = DecisionVar::assigned(BerthIndex(999), tp(0));
-
-        let state = SolverSearchState::new(&m, chain_set, iv, dv, 0, 0);
-        let snap = state.best_snapshot().expect("snapshot seeded");
-        let res: Result<SolutionRef<'_, i64>, ExportError> = snap.clone().try_into();
-        match res {
-            Err(ExportError::MissingBerth(bi_)) => assert_eq!(bi_, BerthIndex(999)),
-            other => panic!("expected MissingBerth, got {:?}", other),
-        }
     }
 }

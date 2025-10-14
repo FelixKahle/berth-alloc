@@ -36,13 +36,17 @@ use crate::{
     search::{
         filter::{feasible_berth_filter::FeasibleBerthFilter, filter_stack::FilterStack},
         operator::traits::NeighborhoodOperator,
-        operator_library::swap::SwapSuccessorsFirstImprovement,
+        operator_library::{
+            intra_chain_two_opt::IntraChainTwoOptFirstImprovement,
+            relocate::Relocate1FirstImprovement,
+            swap::{FirstAdjacentSwapAnywhere, SwapSuccessorsFirstImprovement},
+        },
     },
     state::{err::SolverModelBuildError, search_state::SearchSnapshot},
 };
 use berth_alloc_core::prelude::Cost;
 use berth_alloc_model::prelude::{Problem, SolutionRef};
-use num_traits::{CheckedAdd, CheckedSub, Zero};
+use num_traits::{CheckedAdd, CheckedSub, SaturatingSub, Zero};
 use std::{convert::TryInto, thread};
 
 pub struct EngineParams {
@@ -100,7 +104,7 @@ where
     /// - Convert to SolutionRef
     pub fn solve(&mut self) -> SolutionRef<'problem, T>
     where
-        T: Send + Sync + Zero,
+        T: Send + Sync + Zero + SaturatingSub,
     {
         let opener = GreedyOpening;
         let initial_state = opener.build(&self.solver_model);
@@ -193,7 +197,7 @@ where
         total_budget: std::time::Duration,
     ) -> SolutionRef<'problem, T>
     where
-        T: Send + Sync + Zero,
+        T: Send + Sync + Zero + SaturatingSub,
     {
         // Scale existing solve(): we reuse logic but override per-thread ms.
         // Simple even split: each thread gets total_budget (we keep structure identical, just bump per-thread time).
@@ -223,7 +227,6 @@ where
                 let prox_ref = &self.proximity_map;
                 let pipe_ref = &self.pipeline;
                 let filters_ref = &self.filter_stack;
-                let operators_len = self.operators.len();
 
                 handles.push(scope.spawn(move || {
                     let opener = GreedyOpening;
@@ -233,11 +236,18 @@ where
                         EngineContext::new(model_ref, prox_ref, pipe_ref, filters_ref);
                     let mut search_context = SearchContext::new(&engine_context, state, lambda);
 
-                    for _ in 0..operators_len {
-                        search_context
-                            .operators_mut()
-                            .add_operator(Box::new(SwapSuccessorsFirstImprovement::default()));
-                    }
+                    search_context
+                        .operators_mut()
+                        .add_operator(Box::new(SwapSuccessorsFirstImprovement::default()));
+                    search_context
+                        .operators_mut()
+                        .add_operator(Box::new(IntraChainTwoOptFirstImprovement::default()));
+                    search_context
+                        .operators_mut()
+                        .add_operator(Box::new(Relocate1FirstImprovement::default()));
+                    search_context
+                        .operators_mut()
+                        .add_operator(Box::new(FirstAdjacentSwapAnywhere));
 
                     let sa_params = SAParams {
                         time_limit: per_thread_time,
@@ -262,6 +272,11 @@ where
         let best_snapshot_opt = snapshots
             .into_iter()
             .min_by(|a, b| a.true_cost.cmp(&b.true_cost));
+
+        println!(
+            "Best snapshot found with cost: {:?}",
+            best_snapshot_opt.as_ref().map(|s| s.true_cost)
+        );
 
         let best_snapshot = match best_snapshot_opt {
             Some(s) => s,

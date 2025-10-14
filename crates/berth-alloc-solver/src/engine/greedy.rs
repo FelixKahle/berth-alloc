@@ -19,9 +19,6 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval, TimePoint};
-use num_traits::{CheckedAdd, CheckedSub};
-
 use crate::{
     core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
     engine::traits::Opening,
@@ -38,13 +35,15 @@ use crate::{
         search_state::SolverSearchState,
     },
 };
+use berth_alloc_core::prelude::{Cost, TimeDelta, TimePoint};
+use num_traits::{CheckedAdd, CheckedSub, SaturatingSub, Zero};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct GreedyOpening;
 
 impl<'model, 'problem, T> Opening<'model, 'problem, T> for GreedyOpening
 where
-    T: Copy + Ord + CheckedAdd + CheckedSub + Send + Sync + Into<Cost>,
+    T: Copy + Ord + CheckedAdd + CheckedSub + Send + Sync + Into<Cost> + Zero + SaturatingSub,
 {
     fn build(
         &self,
@@ -53,17 +52,19 @@ where
         let r_len = model.flexible_requests_len();
         let b_len = model.berths_len();
 
-        // 1) Interval vars mirror feasible windows
         let interval_vars: Vec<IntervalVar<T>> = model
             .feasible_intervals()
             .iter()
             .map(|w| IntervalVar::new(w.start(), w.end()))
             .collect();
 
-        // 2) Start with everything unassigned
         let mut decision_vars = vec![DecisionVar::Unassigned; r_len];
 
-        // 3) Greedy: earliest start first, try shortest processing time berth
+        // --- NEW: Simplified per-berth state ---
+        // The cursor is the only state we need. It tracks the end time of the last-placed job.
+        let mut cursors: Vec<TimePoint<T>> = vec![TimePoint::zero(); b_len];
+
+        // --- Same greedy order ---
         let mut order: Vec<usize> = (0..r_len).collect();
         order.sort_by_key(|&i| model.feasible_intervals()[i].start());
 
@@ -71,29 +72,39 @@ where
             let ri = RequestIndex(i);
             let req_tw = model.feasible_intervals()[i];
 
-            // feasible (berth, duration)
+            // Find best berth (shortest duration)
             let mut options: Vec<(BerthIndex, TimeDelta<T>)> = (0..b_len)
                 .filter_map(|b| {
                     let bi = BerthIndex(b);
-                    match model.processing_time(ri, bi) {
-                        Some(Some(dt)) => Some((bi, dt)),
-                        _ => None,
-                    }
+                    model.processing_time(ri, bi).flatten().map(|dt| (bi, dt))
                 })
                 .collect();
             options.sort_by_key(|&(_, dt)| dt);
 
-            // try to place
+            // Try to place on the best option
             for (bi, dur) in options {
-                if let Some(start) = earliest_fit_in_calendar(model, bi, req_tw, dur) {
-                    decision_vars[i] = DecisionVar::assigned(bi, start);
-                    break;
+                // The candidate start time is the later of the request's own start time
+                // and the current end-time cursor of the berth.
+                let candidate_start = max_tp(req_tw.start(), cursors[bi.get()]);
+
+                // Now, find the actual earliest placement time, respecting the fixed calendar.
+                if let Some(assigned_start) =
+                    find_earliest_fit_in_berth_calendar(model, bi, candidate_start, dur)
+                {
+                    // Check if this placement is still valid for the request's time window.
+                    if assigned_start <= req_tw.end().saturating_sub(dur) {
+                        // Success! Assign and update the cursor.
+                        decision_vars[i] = DecisionVar::assigned(bi, assigned_start);
+                        cursors[bi.get()] =
+                            assigned_start.checked_add(dur).expect("end time must fit");
+                        break; // Move to the next request
+                    }
                 }
             }
         }
 
-        // 4) Build chains directly from the assignments
-        let mut per_berth: Vec<Vec<(NodeIndex, _ /*TimePoint<T>*/)>> = vec![Vec::new(); b_len];
+        // 4) build chains from assigned starts (already non-overlapping per berth)
+        let mut per_berth: Vec<Vec<(NodeIndex, TimePoint<T>)>> = vec![Vec::new(); b_len];
         for (i, dv) in decision_vars.iter().enumerate() {
             if let DecisionVar::Assigned(a) = dv {
                 per_berth[a.berth_index.get()].push((NodeIndex(i), a.start_time));
@@ -104,11 +115,9 @@ where
         }
 
         let mut chain_set = ChainSet::new(r_len, b_len);
-        for (b, _) in per_berth.iter().enumerate().take(b_len) {
+        for b in 0..b_len {
             let start = chain_set.start_of_chain(ChainIndex(b));
             let end = chain_set.end_of_chain(ChainIndex(b));
-
-            // link: start -> n0 -> n1 -> ... -> end
             let mut tail = start;
             for (ni, _) in per_berth[b].iter().copied() {
                 chain_set.set_next(tail, ni);
@@ -117,63 +126,55 @@ where
             chain_set.set_next(tail, end);
         }
 
-        // 5) Seed state (engine will recompute costs)
+        // 5) seed state (engine recomputes costs)
         SolverSearchState::new(model, chain_set, interval_vars, decision_vars, 0, 0)
     }
 }
 
-/// Finds the earliest feasible start time inside a berth’s calendar that also respects the request TW.
-/// Returns None if it can’t fit anywhere.
-fn earliest_fit_in_calendar<T>(
+fn find_earliest_fit_in_berth_calendar<T>(
     model: &SolverModel<'_, T>,
     berth: BerthIndex,
-    req_tw: TimeInterval<T>,
+    candidate_start: TimePoint<T>,
     dur: TimeDelta<T>,
 ) -> Option<TimePoint<T>>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {
-    let cal = model.calendar_for_berth(berth)?;
-    for slot in cal.free_intervals() {
-        if let Some(start) = earliest_fit_in_slot(req_tw, *slot, dur) {
-            return Some(start);
+    let calendar = model.calendar_for_berth(berth)?;
+
+    // Find the first free slot that could possibly contain our job
+    for free_slot in calendar.free_intervals() {
+        // If the free slot ends before our candidate can even start, skip it.
+        if free_slot.end() < candidate_start {
+            continue;
+        }
+
+        // The actual start time is the later of our candidate time and the beginning of the free slot.
+        let start = max_tp(candidate_start, free_slot.start());
+
+        // Check if the duration fits within this slot from our calculated start time.
+        if let Some(end) = start.checked_add(dur) {
+            if end <= free_slot.end() {
+                // It fits! This is the earliest possible placement.
+                return Some(start);
+            }
         }
     }
+
+    // Scanned all free slots and couldn't find a fit.
     None
-}
-
-/// Earliest fit inside a single free slot intersected with request TW.
-/// Returns None if duration doesn’t fit.
-fn earliest_fit_in_slot<T>(
-    req_tw: TimeInterval<T>,
-    free: TimeInterval<T>,
-    dur: TimeDelta<T>,
-) -> Option<TimePoint<T>>
-where
-    T: Copy + Ord + CheckedAdd + CheckedSub,
-{
-    // Intersection [lo, hi)
-    let lo = max_tp(req_tw.start(), free.start());
-    let hi = min_tp(req_tw.end(), free.end());
-
-    // Latest feasible start = hi - dur
-    let latest = hi.checked_sub(dur)?;
-    if lo <= latest { Some(lo) } else { None }
 }
 
 #[inline]
 fn max_tp<T: Copy + Ord>(a: TimePoint<T>, b: TimePoint<T>) -> TimePoint<T> {
     if a >= b { a } else { b }
 }
-#[inline]
-fn min_tp<T: Copy + Ord>(a: TimePoint<T>, b: TimePoint<T>) -> TimePoint<T> {
-    if a <= b { a } else { b }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::traits::Opening;
+    use berth_alloc_core::prelude::TimeInterval;
     use berth_alloc_model::{
         common::{FixedKind, FlexibleKind},
         prelude::{Assignment, Berth, BerthIdentifier, Problem, RequestIdentifier},

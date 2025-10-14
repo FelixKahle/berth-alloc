@@ -37,7 +37,7 @@ use crate::{
         search_state::SolverSearchState,
     },
 };
-use berth_alloc_core::prelude::Cost;
+use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval, TimePoint};
 use num_traits::{CheckedAdd, CheckedSub};
 
 #[derive(Debug)]
@@ -111,14 +111,17 @@ where
 {
     pub fn new(
         engine_context: &'engine EngineContext<'model, 'problem, T, S>,
-        state: SolverSearchState<'model, 'problem, T>,
+        mut state: SolverSearchState<'model, 'problem, T>,
         lambda: f64,
     ) -> Self {
+        let weighted_objective = WeightedTurnaroundTimeObjective;
+        let search_objective = SearchObjective::new(weighted_objective.clone(), lambda);
+        state.recompute_costs(&weighted_objective, &search_objective);
         Self {
             engine_context,
-            objective: WeightedTurnaroundTimeObjective,
+            objective: weighted_objective,
             state,
-            search_objective: SearchObjective::new(WeightedTurnaroundTimeObjective, lambda),
+            search_objective: search_objective,
             operators: OperatorPool::new(),
         }
     }
@@ -126,6 +129,11 @@ where
     #[inline]
     pub fn model(&self) -> &SolverModel<'problem, T> {
         self.engine_context.model()
+    }
+
+    #[inline]
+    pub fn proximity_map(&self) -> &ProximityMap {
+        self.engine_context.proximity_map()
     }
 
     #[inline]
@@ -226,7 +234,7 @@ fn eval_arc_with_objective<'problem, T, O, V>(
     to: NodeIndex,
 ) -> Option<Cost>
 where
-    T: Copy + Ord + CheckedAdd + CheckedSub,
+    T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost>,
     O: Objective<T>,
     V: ChainSetView,
 {
@@ -235,11 +243,54 @@ where
         return None;
     }
 
+    // Resolve the half-open slice [from, to)
     let (cur_opt, end_exclusive) = chain.resolve_slice(from, Some(to));
     let Some(mut cur) = cur_opt else {
         return Some(0);
     };
 
+    // ----- 1) Compute berth-local cursor at `from` by scheduling from chain START up to `from`
+    // If from is START, cursor stays None (means “use each request’s own TW start”)
+    let mut cursor: Option<_> = None;
+    if chain.start() != from {
+        // schedule from first real node to `from` (exclusive) to get predecessor finish time
+        let mut n = {
+            // first real node after START; if empty chain, slice cost is 0
+            let first_opt = chain.next(chain.start());
+            if first_opt.is_none() {
+                return Some(0);
+            }
+            first_opt.unwrap()
+        };
+        let mut t_opt: Option<_> = None;
+        let mut steps_left = model.flexible_requests_len();
+
+        while n != from {
+            if steps_left == 0 {
+                return None;
+            }
+            steps_left -= 1;
+
+            let ri = RequestIndex(n.get());
+            let req_tw = model.feasible_intervals()[ri.get()];
+            let dur = match model.processing_time(ri, bi) {
+                Some(Some(d)) => d,
+                _ => return None,
+            };
+
+            let base = t_opt.unwrap_or(req_tw.start());
+            let start = earliest_fit_after_in_calendar(model, bi, req_tw, dur, base)?;
+            t_opt = Some(start.checked_add(dur)?);
+
+            n = match chain.next(n) {
+                Some(x) => x,
+                None => break,
+            };
+        }
+        cursor = t_opt;
+    }
+
+    // ----- 2) Schedule the evaluated slice [from, to) and accumulate objective cost
     let mut acc: Cost = 0;
     let mut steps_left = model.flexible_requests_len();
 
@@ -250,15 +301,54 @@ where
         steps_left -= 1;
 
         let ri = RequestIndex(cur.get());
-        if ri.get() >= model.flexible_requests_len() {
-            return None;
-        }
+        let req_tw = model.feasible_intervals()[ri.get()];
+        let dur = match model.processing_time(ri, bi) {
+            Some(Some(d)) => d,
+            _ => return None,
+        };
 
-        let start_time = model.feasible_intervals()[ri.0].start();
-        let c = objective.assignment_cost(model, ri, bi, start_time)?;
-        acc += c;
+        let base = cursor.unwrap_or(req_tw.start());
+        let start = earliest_fit_after_in_calendar(model, bi, req_tw, dur, base)?;
+        acc = acc.saturating_add(objective.assignment_cost(model, ri, bi, start)?);
+        cursor = Some(start.checked_add(dur)?);
 
-        cur = chain.next(cur)?;
+        cur = match chain.next(cur) {
+            Some(x) => x,
+            None => break,
+        };
     }
     Some(acc)
+}
+
+fn earliest_fit_after_in_calendar<T>(
+    model: &SolverModel<'_, T>,
+    berth: BerthIndex,
+    req_tw: TimeInterval<T>,
+    dur: TimeDelta<T>,
+    cursor: TimePoint<T>,
+) -> Option<TimePoint<T>>
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub,
+{
+    let cal = model.calendar_for_berth(berth)?;
+    for slot in cal.free_intervals() {
+        // intersection of [req.start, req.end) ∩ [slot.start, slot.end) ∩ [cursor, +∞)
+        let lo = max_tp(max_tp(req_tw.start(), slot.start()), cursor);
+        let hi = min_tp(req_tw.end(), slot.end());
+        let latest = hi.checked_sub(dur)?;
+        if lo <= latest {
+            return Some(lo);
+        }
+    }
+    None
+}
+
+#[inline]
+fn max_tp<T: Copy + Ord>(a: TimePoint<T>, b: TimePoint<T>) -> TimePoint<T> {
+    if a >= b { a } else { b }
+}
+
+#[inline]
+fn min_tp<T: Copy + Ord>(a: TimePoint<T>, b: TimePoint<T>) -> TimePoint<T> {
+    if a <= b { a } else { b }
 }

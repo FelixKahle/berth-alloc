@@ -20,6 +20,7 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::{
+    core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
     model::index::{BerthIndex, RequestIndex},
     search::filter::traits::FeasibilityFilter,
     state::{
@@ -56,27 +57,35 @@ where
         &self,
         delta: &ChainSetDelta,
         search_state: &SolverSearchState<'model, 'problem, T>,
+        _iv: &[IntervalVar<T>],
+        dv: &[DecisionVar<T>],
+        touched: &[usize],
     ) -> bool {
-        let affected = delta.affected_chains();
-        if affected.is_empty() {
-            return true;
-        }
-
-        let chain_set = search_state.chain_set();
+        let cs = search_state.chain_set();
         let model = search_state.model();
-        let overlay = ChainSetOverlay::new(chain_set, delta);
-        for &ci in affected {
-            let bi = BerthIndex(ci.get()); // BerthIndex == ChainIndex
-            let chain = overlay.chain(ci);
+        let overlay = ChainSetOverlay::new(cs, delta);
 
-            let ok = chain
-                .iter()
-                .filter(|&n| !overlay.is_sentinel_node(n))
-                .map(|n: NodeIndex| RequestIndex(n.get()))
-                .all(|ri| matches!(model.processing_time(ri, bi), Some(Some(_))));
+        for &req_idx in touched {
+            let ri = RequestIndex(req_idx);
 
-            if !ok {
+            // Find which chain the node sits on *after* applying delta (use overlay).
+            // NodeIndex == RequestIndex in your setup.
+            let n = NodeIndex(ri.get());
+            let Some(ci) = overlay.chain_of_node(n).or_else(|| cs.chain_of_node(n)) else {
+                // If it’s not on any chain, skip (or return false if that should be illegal)
+                continue;
+            };
+            let bi = BerthIndex(ci.get());
+
+            // 1) Request must be processable on this chain’s berth
+            if !matches!(model.processing_time(ri, bi), Some(Some(_))) {
                 return false;
+            }
+
+            // 2) And DV must target that berth (since DV carries berth index)
+            match dv[ri.get()] {
+                DecisionVar::Assigned(dec) if dec.berth_index == bi => {}
+                _ => return false,
             }
         }
         true

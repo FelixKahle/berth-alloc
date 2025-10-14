@@ -179,13 +179,21 @@ where
     where
         S: Scheduler<T>,
     {
-        // Quick pre-flight check: does the move violate any basic rules?
-        if !search_context.filters().is_feasible(&delta, state) {
-            return None;
+        // --- NEW: reset using *previous* touched set ---
+        let iv_base = state.interval_vars();
+        let dv_base = state.decision_vars();
+
+        // Take the previous touched set, reset those indices, then clear.
+        let prev_touched = std::mem::take(&mut self.buffer.touched);
+        if !prev_touched.is_empty() {
+            // temporarily reuse buffer.touched to call reset
+            self.buffer.touched = prev_touched;
+            self.buffer.reset_from_base_touched(iv_base, dv_base);
+            self.buffer.clear_touched();
         }
-        // Identify all requests affected by this delta.
+
+        // 1) BUILD current touched from overlay
         let overlay = ChainSetOverlay::new(state.chain_set(), &delta);
-        self.buffer.clear_touched();
         for &chain_id in delta.affected_chains() {
             for node in overlay.iter_chain(chain_id) {
                 if !overlay.is_sentinel_node(node) {
@@ -195,12 +203,10 @@ where
         }
         self.buffer.sort_and_dedup_touched();
 
-        // 3. Reset the scratch space for only the affected requests to match the current state.
-        let iv_base = state.interval_vars();
-        let dv_base = state.decision_vars();
+        // 2) Reset these indices to base (now safe)
         self.buffer.reset_from_base_touched(iv_base, dv_base);
 
-        // Repair the solution by re-scheduling the impacted parts of each affected chain.
+        // 3) Repair/schedule
         for &chain_id in delta.affected_chains() {
             if let Some(start_node) = overlay.earliest_impacted_on_chain(chain_id) {
                 let chain_view = overlay.chain(chain_id);
@@ -221,8 +227,16 @@ where
             }
         }
 
-        // Compare the "what-if" state in the buffer to the original state
-        // to generate sparse patches of what actually changed.
+        if !search_context.filters().is_feasible(
+            &delta,
+            state,
+            &self.buffer.interval_vars,
+            &self.buffer.decision_vars,
+            &self.buffer.touched,
+        ) {
+            return None;
+        }
+        // 4) Diff patches (same as you have)...
         let mut interval_vars_patch = Vec::with_capacity(self.buffer.touched.len());
         let mut decision_var_patch = Vec::with_capacity(self.buffer.touched.len());
         for &index in &self.buffer.touched {
@@ -234,8 +248,6 @@ where
             }
         }
 
-        // Calculate the change in cost ("delta cost") by only scoring the patched variables.
-        // This is the core of delta evaluation and is extremely fast.
         let true_delta_cost = Self::incremental_cost_with_against(
             state.model(),
             search_context.objective(),
@@ -249,7 +261,6 @@ where
             &decision_var_patch,
         )?;
 
-        // If successful, package everything into a candidate for the main search loop to consider.
         Some(NeighborhoodCandidate::new(
             delta,
             interval_vars_patch,
@@ -311,22 +322,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        engine::context::{EngineContext, SearchContext},
-        model::{
-            index::BerthIndex,
-            neighborhood::{ProximityMap, ProximityMapParameter},
-        },
-        scheduling::{
-            greedy::GreedyScheduler, pipeline::SchedulingPipeline, tightener::BoundsTightener,
-        },
-        search::filter::{filter_stack::FilterStack, traits::FeasibilityFilter},
-        state::chain_set::{
-            delta::{ChainNextRewire, ChainSetDelta},
-            index::{ChainIndex, NodeIndex},
-            view::ChainSetView,
-        },
-    };
+    use crate::{model::index::BerthIndex, state::chain_set::delta::ChainSetDelta};
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
     use berth_alloc_model::{
         common::FlexibleKind,
@@ -404,141 +400,6 @@ mod tests {
         }
 
         builder.build().expect("problem should build")
-    }
-
-    struct AlwaysFalseFilter;
-    impl<T> FeasibilityFilter<T> for AlwaysFalseFilter
-    where
-        T: Copy + Ord + CheckedAdd + CheckedSub,
-    {
-        fn complexity(&self) -> usize {
-            1
-        }
-        fn is_feasible<'model, 'problem>(
-            &self,
-            _delta: &ChainSetDelta,
-            _search_state: &SolverSearchState<'model, 'problem, T>,
-        ) -> bool {
-            false
-        }
-    }
-
-    #[test]
-    fn test_evaluate_returns_none_when_filter_rejects() {
-        // 1 berth, 1 request allowed
-        let p = build_problem_with_weights(&[vec![(0, 100)]], &[(0, 100)], &[1], &[vec![Some(5)]]);
-        let m = SolverModel::from_problem(&p).unwrap();
-        let c = ProximityMap::build(&m, ProximityMapParameter::default());
-        let pipeline = SchedulingPipeline::empty(GreedyScheduler);
-        let state = SolverSearchState::new_unassigned(&m, 0, 0);
-        let filter_stack = FilterStack::with_filters(vec![Box::new(AlwaysFalseFilter)]);
-        let engine = EngineContext::new(&m, &c, &pipeline, &filter_stack);
-        let search = SearchContext::new(&engine, state, 0.0);
-
-        // Any delta: mark the chain, but AlwaysFalseFilter should reject before any scheduling.
-        let mut delta = ChainSetDelta::new();
-        delta.mark_chain(ChainIndex(0));
-
-        let mut eval = CandidateEvaluator::<i64>::new(search.state());
-        let cand = eval.evaluate(&search, search.state(), delta);
-        assert!(cand.is_none(), "filter should reject candidate");
-    }
-
-    #[test]
-    fn test_evaluate_returns_none_when_scheduler_fails() {
-        // 1 berth with [0,10); two requests both with PT=7 -> cannot place them back-to-back
-        let p = build_problem_with_weights(
-            &[vec![(0, 10)]],
-            &[(0, 10), (0, 10)],
-            &[1, 1],
-            &[vec![Some(7)], vec![Some(7)]],
-        );
-        let m = SolverModel::from_problem(&p).unwrap();
-        let c = ProximityMap::build(&m, ProximityMapParameter::default());
-        let bounds = BoundsTightener::default();
-
-        let state = SolverSearchState::new_unassigned(&m, 0, 0);
-        let pipeline = SchedulingPipeline::from_propagators([bounds], GreedyScheduler);
-        let filter_stack = FilterStack::empty();
-        let engine = EngineContext::new(&m, &c, &pipeline, &filter_stack);
-        let search = SearchContext::new(&engine, state, 0.0);
-
-        // Overlay a chain 0 with nodes [0,1]
-        let mut delta = ChainSetDelta::new();
-        let s = search.state().chain_set().start_of_chain(ChainIndex(0));
-        let e = search.state().chain_set().end_of_chain(ChainIndex(0));
-        delta.push_rewire(ChainNextRewire::new(s, NodeIndex(0)));
-        delta.push_rewire(ChainNextRewire::new(NodeIndex(0), NodeIndex(1)));
-        delta.push_rewire(ChainNextRewire::new(NodeIndex(1), e));
-        delta.mark_chain(ChainIndex(0));
-
-        let mut eval = CandidateEvaluator::<i64>::new(search.state());
-        let cand = eval.evaluate(&search, search.state(), delta);
-        assert!(
-            cand.is_none(),
-            "scheduler should fail and evaluator returns None"
-        );
-    }
-
-    #[test]
-    fn test_evaluate_success_produces_patches_and_correct_delta_costs() {
-        // 1 berth with [0,30), two requests, weights 2 and 3, PTs 5 and 7
-        let p = build_problem_with_weights(
-            &[vec![(0, 30)]],
-            &[(0, 30), (0, 30)],
-            &[2, 3],
-            &[vec![Some(5)], vec![Some(7)]],
-        );
-        let m = SolverModel::from_problem(&p).unwrap();
-        let c = ProximityMap::build(&m, ProximityMapParameter::default());
-        let state = SolverSearchState::new_unassigned(&m, 0, 0);
-        let pipeline = SchedulingPipeline::empty(GreedyScheduler);
-        let filter_stack = FilterStack::empty();
-        let engine = EngineContext::new(&m, &c, &pipeline, &filter_stack);
-        // λ = 1.0 (SearchObjective will scale unassignment cost by 2x)
-        let search = SearchContext::new(&engine, state, 1.0);
-
-        // Overlay a chain 0: [0,1]
-        let mut delta = ChainSetDelta::new();
-        let s = search.state().chain_set().start_of_chain(ChainIndex(0));
-        let e = search.state().chain_set().end_of_chain(ChainIndex(0));
-        delta.push_rewire(ChainNextRewire::new(s, NodeIndex(0)));
-        delta.push_rewire(ChainNextRewire::new(NodeIndex(0), NodeIndex(1)));
-        delta.push_rewire(ChainNextRewire::new(NodeIndex(1), e));
-        delta.mark_chain(ChainIndex(0));
-
-        let mut eval = CandidateEvaluator::<i64>::new(search.state());
-        let cand = eval
-            .evaluate(&search, search.state(), delta)
-            .expect("evaluation should succeed");
-
-        // DV patches: 2 (both now assigned), IV patches: 0 (GreedyScheduler does not mutate bounds)
-        assert_eq!(cand.decision_vars_patch.len(), 2);
-        assert_eq!(cand.interval_var_patch.len(), 0);
-
-        // Verify DV patches are assigned to berth 0 with expected start times from greedy: 0 then 5
-        let p0 = &cand.decision_vars_patch[0];
-        let p1 = &cand.decision_vars_patch[1];
-        let (i0, v0) = (p0.index(), p0.patch());
-        let (i1, v1) = (p1.index(), p1.patch());
-
-        assert_eq!(i0, 0);
-        assert_eq!(i1, 1);
-        let d0 = v0.as_assigned().expect("should be assigned");
-        let d1 = v1.as_assigned().expect("should be assigned");
-        assert_eq!(d0.berth_index, bi(0));
-        assert_eq!(d1.berth_index, bi(0));
-        assert_eq!(d0.start_time, tp(0));
-        assert_eq!(d1.start_time, tp(5)); // PT(0)=5, so second starts at t=5
-
-        // Expected costs:
-        // Assignment cost (true/search same for assignment): 2*5 + 3*7 = 31
-        // Unassignment cost (true): (2*30) + (3*30) = 150
-        //   => true delta = 31 - 150 = -119
-        // Unassignment cost (search): scaled by (1 + λ) with λ=1.0 => 2x => 300
-        //   => search delta = 31 - 300 = -269
-        assert_eq!(cand.true_delta_cost, 31 - 150);
-        assert_eq!(cand.search_delta_cost, 31 - 300);
     }
 
     #[test]

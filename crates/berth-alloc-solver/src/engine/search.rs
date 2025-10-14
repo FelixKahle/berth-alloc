@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use crate::{
     engine::context::SearchContext,
+    model::solver_model::SolverModel,
     scheduling::traits::Scheduler,
     search::operator::runner::CandidateEvaluator,
     state::{
@@ -32,7 +33,7 @@ use crate::{
             index::{ChainIndex, NodeIndex},
             view::{ChainRef, ChainSetView},
         },
-        search_state::{SearchSnapshot, SolverSearchState},
+        search_state::SearchSnapshot,
     },
 };
 use berth_alloc_core::prelude::Cost;
@@ -66,6 +67,7 @@ where
     S: Scheduler<T>,
 {
     context: SearchContext<'engine, 'model, 'problem, T, S>,
+    best_snapshot: SearchSnapshot<'model, 'problem, T>,
 }
 
 impl<'engine, 'model, 'problem, T, S> Search<'engine, 'model, 'problem, T, S>
@@ -74,7 +76,11 @@ where
     S: Scheduler<T>,
 {
     pub fn new(context: SearchContext<'engine, 'model, 'problem, T, S>) -> Self {
-        Self { context }
+        let best_snapshot = context.state().snapshot();
+        Self {
+            context,
+            best_snapshot,
+        }
     }
 
     pub fn run_sa_time_cap(mut self, params: SAParams) -> SearchSnapshot<'model, 'problem, T> {
@@ -85,7 +91,7 @@ where
 
         let op_count = self.context.operators().get_operators().len();
         if op_count == 0 {
-            return best_or_fallback_snapshot(self.context.state());
+            return self.best_snapshot;
         }
         let mut rr = 0usize;
         let mut evaluator = CandidateEvaluator::<T>::new(self.context.state());
@@ -116,6 +122,8 @@ where
             let op_exec_start = Instant::now();
 
             let delta_opt = {
+                // Build a global ArcEvaluator that resolves the chain per (from,to)
+                // and delegates to SearchContext::make_search_arc_eval(...)
                 let arc_eval = self.make_global_arc_evaluator();
                 let op = &self.context.operators().get_operators()[op_idx].operator;
                 op.make_neighboor(self.context.state(), &arc_eval)
@@ -133,18 +141,36 @@ where
             }
 
             let delta = delta_opt.unwrap();
-
             if let Some(cand) = evaluator.evaluate(&self.context, self.context.state(), delta) {
                 let d_search = cost_to_f64(cand.search_delta_cost);
                 let accept =
                     d_search <= 0.0 || (temp > 0.0 && rng_f64(&mut rng) < (-d_search / temp).exp());
+                let true_delta = cand.true_delta_cost;
                 if accept {
-                    self.context.accept_candidate(cand.clone());
-                    // Track acceptance + true delta cost
                     self.context
                         .operators_mut()
-                        .record_accept(op_idx, cand.true_delta_cost);
+                        .record_accept(op_idx, true_delta);
+                    self.context.accept_candidate(cand);
+
+                    if self.context.state().current_true_cost() < self.best_snapshot.true_cost {
+                        self.best_snapshot = self.context.state().snapshot();
+                        println!(
+                            "New best solution found with cost: {}",
+                            self.best_snapshot.true_cost
+                        );
+                    }
                 }
+
+                println!(
+                    "Operator {} produced candidate with d_search {:.2}, d_true {}, temp {:.3} => {}",
+                    op_idx,
+                    d_search,
+                    true_delta,
+                    temp,
+                    if accept { "ACCEPTED" } else { "rejected" }
+                );
+            } else {
+                println!("Operator {} produced infeasible candidate", op_idx,);
             }
 
             let elapsed_ns = op_exec_start.elapsed().as_nanos() as f64;
@@ -153,8 +179,7 @@ where
                 .record_exec_time_ns(op_idx, elapsed_ns);
         }
 
-        let mut state: SolverSearchState<'model, 'problem, T> = self.context.into_state();
-        state.take_best().unwrap_or_else(|| state.into_snapshot())
+        self.best_snapshot
     }
 
     #[inline]
@@ -183,8 +208,22 @@ where
                     return local(from, to);
                 }
             }
+            println!("None...");
             None
         }
+    }
+
+    #[inline]
+    pub fn make_search_arc_eval<V>(
+        &self,
+        chain: ChainRef<'_, V>,
+    ) -> impl Fn(NodeIndex, NodeIndex) -> Option<Cost>
+    where
+        V: ChainSetView,
+        T: CheckedAdd + CheckedSub + Into<Cost>,
+    {
+        let model: &SolverModel<'problem, T> = self.context.model();
+        crate::eval::arc::make_simple_chain_arc_evaluator::<T, V>(model, chain)
     }
 }
 
@@ -229,36 +268,5 @@ fn rng_range_usize(rng: &mut ChaCha8Rng, n: usize) -> usize {
         0
     } else {
         (rng.next_u64() as usize) % n
-    }
-}
-
-#[inline]
-fn best_or_fallback_snapshot<
-    'model,
-    'problem,
-    T: Copy + Ord + CheckedAdd + CheckedSub + Zero + Send + Sync + Into<Cost>,
->(
-    state: &SolverSearchState<'model, 'problem, T>,
-) -> SearchSnapshot<'model, 'problem, T> {
-    if let Some(best) = state.best_snapshot() {
-        return best.clone();
-    }
-    make_snapshot_from_state(&state)
-}
-
-#[inline]
-fn make_snapshot_from_state<
-    'model,
-    'problem,
-    T: Copy + Ord + CheckedAdd + CheckedSub + Zero + Send + Sync + Into<Cost>,
->(
-    state: &SolverSearchState<'model, 'problem, T>,
-) -> SearchSnapshot<'model, 'problem, T> {
-    SearchSnapshot {
-        model: state.model(),
-        chain_set: state.chain_set().clone(),
-        interval_vars: state.interval_vars().to_vec(),
-        decision_vars: state.decision_vars().to_vec(),
-        true_cost: state.current_true_cost(),
     }
 }

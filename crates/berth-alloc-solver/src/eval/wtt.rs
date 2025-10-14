@@ -40,13 +40,16 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost>> Objective<T>
         model: &SolverModel<'_, T>,
         request_index: RequestIndex,
         berth_index: BerthIndex,
-        _start_time: TimePoint<T>,
+        start_time: TimePoint<T>,
     ) -> Option<Cost> {
+        let arrival_time = model.feasible_intervals()[request_index.get()].start();
+        let waiting_time = start_time - arrival_time;
         let processing_time = model
             .processing_time(request_index, berth_index)
             .flatten()?;
+        let total_time = waiting_time + processing_time;
         let weight = model.weights()[request_index.get()];
-        Some(weight.saturating_mul(processing_time.value().into()))
+        Some(weight.saturating_mul(total_time.value().into()))
     }
 
     fn unassignment_cost(
