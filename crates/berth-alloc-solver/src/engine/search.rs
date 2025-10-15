@@ -25,6 +25,11 @@ use std::time::{Duration, Instant};
 
 use crate::{
     engine::context::SearchContext,
+    eval::objective::Objective,
+    model::{
+        index::{BerthIndex, RequestIndex},
+        solver_model::SolverModel,
+    },
     scheduling::traits::Scheduler,
     search::operator::runner::CandidateEvaluator,
     state::{
@@ -35,7 +40,7 @@ use crate::{
         search_state::SearchSnapshot,
     },
 };
-use berth_alloc_core::prelude::Cost;
+use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval, TimePoint};
 use rand_chacha::ChaCha8Rng;
 
 /// SA parameters (time-capped).
@@ -146,11 +151,6 @@ where
                     d_search <= 0.0 || (temp > 0.0 && rng_f64(&mut rng) < (-d_search / temp).exp());
                 let true_delta = cand.true_delta_cost;
 
-                println!(
-                    "Found delta: true={true_delta} search={}",
-                    cand.search_delta_cost
-                );
-
                 if accept {
                     //println!("Accept");
                     self.context
@@ -184,9 +184,12 @@ where
     }
 
     fn make_global_arc_evaluator(&self) -> impl Fn(NodeIndex, NodeIndex) -> Option<Cost> + '_ {
-        move |from: NodeIndex, to: NodeIndex| {
+        move |u: NodeIndex, v: NodeIndex| {
             let cs = self.context.state().chain_set();
+            let model = self.context.model();
+            let search_obj = self.context.search_objective();
 
+            // pick chain: prefer u's chain, else v's, else match sentinels
             let chain_of = |n: NodeIndex| -> Option<ChainIndex> {
                 if let Some(ci) = cs.chain_of_node(n) {
                     return Some(ci);
@@ -200,13 +203,94 @@ where
                 None
             };
 
-            // Prefer the chain of `from`, otherwise try `to`.
-            let ci = chain_of(from).or_else(|| chain_of(to))?;
+            let ci = chain_of(u).or_else(|| chain_of(v))?;
             let cr = ChainRef::new(cs, ci);
-            let local = self.context.make_search_arc_eval(cr);
-            local(from, to)
+            let bi = BerthIndex(cr.chain_index().get());
+
+            // If v is a sentinel, no assignment cost for an arc into it.
+            if cr.is_sentinel_node(v) {
+                return Some(0);
+            }
+
+            // 1) compute cursor = finish time up to and including `u`
+            let mut cursor: Option<_> = None;
+            if u != cr.start() {
+                // start from first real node
+                let mut n = cr.first_real_node(cr.start())?;
+                let mut t_opt: Option<_> = None;
+                let mut steps_left = model.flexible_requests_len();
+
+                loop {
+                    if steps_left == 0 {
+                        return None;
+                    }
+                    steps_left -= 1;
+
+                    // n must be a real request node (your NodeIndex == RequestIndex)
+                    let ri = RequestIndex(n.get());
+                    let req_tw = model.feasible_intervals()[ri.get()];
+                    let dur = match model.processing_time(ri, bi) {
+                        Some(Some(d)) => d,
+                        _ => return None,
+                    };
+
+                    let base = t_opt.unwrap_or(req_tw.start());
+                    let start = earliest_fit_after_in_calendar(model, bi, req_tw, dur, base)?;
+                    t_opt = Some(start.checked_add(dur)?);
+
+                    if n == u {
+                        break;
+                    }
+                    n = cr.next_real(n)?;
+                }
+                cursor = t_opt;
+            }
+
+            // 2) schedule only `v` using that cursor and return objective cost
+            let ri_v = RequestIndex(v.get());
+            let req_tw_v = model.feasible_intervals()[ri_v.get()];
+            let dur_v = match model.processing_time(ri_v, bi) {
+                Some(Some(d)) => d,
+                _ => return None,
+            };
+            let base_v = cursor.unwrap_or(req_tw_v.start());
+            let start_v = earliest_fit_after_in_calendar(model, bi, req_tw_v, dur_v, base_v)?;
+            search_obj.assignment_cost(model, ri_v, bi, start_v)
         }
     }
+}
+
+fn earliest_fit_after_in_calendar<T>(
+    model: &SolverModel<'_, T>,
+    berth: BerthIndex,
+    req_tw: TimeInterval<T>,
+    dur: TimeDelta<T>,
+    cursor: TimePoint<T>,
+) -> Option<TimePoint<T>>
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub,
+{
+    let cal = model.calendar_for_berth(berth)?;
+    for slot in cal.free_intervals() {
+        // intersection of [req.start, req.end) ∩ [slot.start, slot.end) ∩ [cursor, +∞)
+        let lo = max_tp(max_tp(req_tw.start(), slot.start()), cursor);
+        let hi = min_tp(req_tw.end(), slot.end());
+        let latest = hi.checked_sub(dur)?;
+        if lo <= latest {
+            return Some(lo);
+        }
+    }
+    None
+}
+
+#[inline]
+fn max_tp<T: Copy + Ord>(a: TimePoint<T>, b: TimePoint<T>) -> TimePoint<T> {
+    if a >= b { a } else { b }
+}
+
+#[inline]
+fn min_tp<T: Copy + Ord>(a: TimePoint<T>, b: TimePoint<T>) -> TimePoint<T> {
+    if a <= b { a } else { b }
 }
 
 #[inline]

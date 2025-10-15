@@ -227,6 +227,7 @@ where
     }
 }
 
+#[inline]
 fn eval_arc_with_objective<'problem, T, O, V>(
     model: &SolverModel<'problem, T>,
     chain: ChainRef<'_, V>,
@@ -244,25 +245,22 @@ where
         return None;
     }
 
-    // Resolve the half-open slice [from, to)
+    // Resolve [from, to) against this chain, skipping sentinels if needed.
     let (cur_opt, end_exclusive) = chain.resolve_slice(from, Some(to));
     let Some(mut cur) = cur_opt else {
-        return Some(0);
+        return Some(0); // empty slice
     };
 
-    // ----- 1) Compute berth-local cursor at `from` by scheduling from chain START up to `from`
-    // If from is START, cursor stays None (means “use each request’s own TW start”)
+    // ---------- 1) Build cursor by scheduling START..from (exclusive)
+    // If `from` is the sentinel START, this stays None (use each req TW start).
     let mut cursor: Option<_> = None;
     if chain.start() != from {
-        // schedule from first real node to `from` (exclusive) to get predecessor finish time
-        let mut n = {
-            // first real node after START; if empty chain, slice cost is 0
-            let first_opt = chain.next(chain.start());
-            if first_opt.is_none() {
-                return Some(0);
-            }
-            first_opt.unwrap()
+        // First real node after START
+        let mut n = match chain.first_real_node(chain.start()) {
+            Some(x) => x,
+            None => return Some(0), // empty chain
         };
+
         let mut t_opt: Option<_> = None;
         let mut steps_left = model.flexible_requests_len();
 
@@ -272,7 +270,13 @@ where
             }
             steps_left -= 1;
 
-            let ri = RequestIndex(n.get());
+            // Only request nodes are valid for model indexing.
+            let ridx = n.get();
+            if ridx >= model.flexible_requests_len() {
+                return None; // not a request node (sentinel or foreign)
+            }
+            let ri = RequestIndex(ridx);
+
             let req_tw = model.feasible_intervals()[ri.get()];
             let dur = match model.processing_time(ri, bi) {
                 Some(Some(d)) => d,
@@ -283,7 +287,8 @@ where
             let start = earliest_fit_after_in_calendar(model, bi, req_tw, dur, base)?;
             t_opt = Some(start.checked_add(dur)?);
 
-            n = match chain.next(n) {
+            // advance to next real node
+            n = match chain.next_real(n) {
                 Some(x) => x,
                 None => break,
             };
@@ -291,7 +296,7 @@ where
         cursor = t_opt;
     }
 
-    // ----- 2) Schedule the evaluated slice [from, to) and accumulate objective cost
+    // ---------- 2) Schedule [from, to) and accumulate objective
     let mut acc: Cost = 0;
     let mut steps_left = model.flexible_requests_len();
 
@@ -301,7 +306,13 @@ where
         }
         steps_left -= 1;
 
-        let ri = RequestIndex(cur.get());
+        // Guard: current must be a request node
+        let ridx = cur.get();
+        if ridx >= model.flexible_requests_len() {
+            return None;
+        }
+        let ri = RequestIndex(ridx);
+
         let req_tw = model.feasible_intervals()[ri.get()];
         let dur = match model.processing_time(ri, bi) {
             Some(Some(d)) => d,
@@ -313,11 +324,12 @@ where
         acc = acc.saturating_add(objective.assignment_cost(model, ri, bi, start)?);
         cursor = Some(start.checked_add(dur)?);
 
-        cur = match chain.next(cur) {
+        cur = match chain.next_real(cur) {
             Some(x) => x,
             None => break,
         };
     }
+
     Some(acc)
 }
 

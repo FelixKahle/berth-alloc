@@ -33,13 +33,18 @@ use crate::{
     scheduling::{
         greedy::GreedyScheduler, pipeline::SchedulingPipeline, tightener::BoundsTightener,
     },
-    search::filter::{feasible_berth_filter::FeasibleBerthFilter, filter_stack::FilterStack},
-    state::{err::SolverModelBuildError, search_state::SearchSnapshot},
+    search::{
+        filter::{feasible_berth_filter::FeasibleBerthFilter, filter_stack::FilterStack},
+        operator_lib::relocate::RelocateNeighborsBestImprovement,
+    },
+    state::{
+        chain_set::index::NodeIndex, err::SolverModelBuildError, search_state::SearchSnapshot,
+    },
 };
 use berth_alloc_core::prelude::Cost;
 use berth_alloc_model::prelude::{Problem, SolutionRef};
 use num_traits::{CheckedAdd, CheckedSub, SaturatingSub, Zero};
-use std::convert::TryInto;
+use std::{convert::TryInto, num::NonZeroUsize};
 
 pub struct EngineParams {
     pub proximity_alpha: f64,
@@ -101,10 +106,10 @@ where
         let num_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
-            .min(1) // TODO: Remove
+            //.min(1) // TODO: Remove
             .max(1);
 
-        let per_thread_time = total_budget; // each thread runs full budget (aggressive). Adjust if needed.
+        let per_thread_time = total_budget;
         let lambda = 1.0_f64;
 
         let mut snapshots: Vec<SearchSnapshot<T>> = Vec::with_capacity(num_threads);
@@ -122,7 +127,34 @@ where
 
                     let engine_context =
                         EngineContext::new(model_ref, prox_ref, pipe_ref, filters_ref);
-                    let search_context = SearchContext::new(&engine_context, state, lambda);
+                    let mut search_context = SearchContext::new(&engine_context, state, lambda);
+
+                    let get_outgoing = {
+                        let lists = prox_ref.any_feasibleish().lists(); // &'engine _
+                        Box::new(move |node: NodeIndex, _start: NodeIndex| {
+                            lists.outgoing_for(node).unwrap_or(&[])
+                        })
+                    };
+
+                    let get_incoming = {
+                        let lists = prox_ref.any_feasibleish().lists();
+                        Box::new(move |node: NodeIndex, _start: NodeIndex| {
+                            lists.incoming_for(node).unwrap_or(&[])
+                        })
+                    };
+
+                    search_context.operators_mut().add_operator(Box::new(
+                        RelocateNeighborsBestImprovement::new(
+                            false,
+                            Box::new(|| {
+                                // None = unlimited; or e.g. Some(NonZeroUsize::new(50_000).unwrap())
+                                Some(NonZeroUsize::new(50_000).unwrap())
+                            }),
+                            Some(get_outgoing),
+                            Some(get_incoming),
+                            None,
+                        ),
+                    ));
 
                     let sa_params = SAParams {
                         time_limit: per_thread_time,
