@@ -46,6 +46,7 @@ pub struct SearchSnapshot<'model, 'problem, T: Copy + Ord> {
     pub true_cost: Cost,
 }
 
+#[derive(Debug, Clone)]
 pub struct SolverSearchState<'model, 'problem, T: Copy + Ord + CheckedAdd + CheckedSub> {
     model: &'model SolverModel<'problem, T>,
     chain_set: ChainSet,

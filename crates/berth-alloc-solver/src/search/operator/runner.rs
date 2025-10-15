@@ -179,6 +179,10 @@ where
     where
         S: Scheduler<T>,
     {
+        if !search_context.filters().is_feasible(&delta, state) {
+            return None;
+        }
+
         // --- NEW: reset using *previous* touched set ---
         let iv_base = state.interval_vars();
         let dv_base = state.decision_vars();
@@ -227,15 +231,6 @@ where
             }
         }
 
-        if !search_context.filters().is_feasible(
-            &delta,
-            state,
-            &self.buffer.interval_vars,
-            &self.buffer.decision_vars,
-            &self.buffer.touched,
-        ) {
-            return None;
-        }
         // 4) Diff patches (same as you have)...
         let mut interval_vars_patch = Vec::with_capacity(self.buffer.touched.len());
         let mut decision_var_patch = Vec::with_capacity(self.buffer.touched.len());

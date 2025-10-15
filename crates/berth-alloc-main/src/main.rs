@@ -42,7 +42,7 @@ fn find_instances_dir() -> Option<PathBuf> {
 
 fn main() {
     // Each instance gets 20 seconds
-    let budget_per_instance = Duration::from_secs(20);
+    let budget_per_instance = Duration::from_secs(3);
 
     let instances_dir =
         find_instances_dir().expect("Could not locate `instances/` directory in ancestors.");

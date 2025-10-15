@@ -43,13 +43,14 @@ use std::num::NonZeroUsize;
 /// Hooks:
 /// - `get_cap`: early stop
 /// - `get_destinations`: for a given node x, propose destination predecessors (Vec<NodeIndex>)
-pub struct Relocate1FirstImprovement {
+pub struct Relocate1FirstImprovement<T> {
     pub same_chain_only: bool,
     pub get_cap: Box<dyn Fn() -> Option<NonZeroUsize> + Send + Sync>,
     pub get_destinations: Box<dyn Fn(NodeIndex, &ChainSet) -> Vec<NodeIndex> + Send + Sync>,
+    _phantom: std::marker::PhantomData<T>,
 }
 
-impl Default for Relocate1FirstImprovement {
+impl<T> Default for Relocate1FirstImprovement<T> {
     fn default() -> Self {
         Self {
             same_chain_only: true,
@@ -74,21 +75,20 @@ impl Default for Relocate1FirstImprovement {
                 }
                 v
             }),
+            _phantom: std::marker::PhantomData,
         }
     }
 }
 
-impl<T> NeighborhoodOperator<T> for Relocate1FirstImprovement
+impl<T> NeighborhoodOperator<T> for Relocate1FirstImprovement<T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Zero + Send + Sync + Into<Cost>,
 {
     fn make_neighboor<'state, 'model, 'problem>(
         &self,
         search_state: &'state SolverSearchState<'model, 'problem, T>,
-        _arc_eval: &ArcEvaluator, // unused on purpose
+        _arc_eval: &ArcEvaluator,
     ) -> Option<ChainSetDelta> {
-        // println!("Called Relocate1FirstImprovement");
-
         let cs: &ChainSet = search_state.chain_set();
         let cap = (self.get_cap)();
         let mut scanned = 0usize;

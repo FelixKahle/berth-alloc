@@ -34,9 +34,19 @@ use berth_alloc_core::prelude::Cost;
 use num_traits::{CheckedAdd, CheckedSub, Zero};
 use std::num::NonZeroUsize;
 
-pub struct FirstAdjacentSwapAnywhere;
+pub struct FirstAdjacentSwapAnywhere<T> {
+    _phantom: std::marker::PhantomData<T>,
+}
 
-impl<T> NeighborhoodOperator<T> for FirstAdjacentSwapAnywhere
+impl<T> Default for FirstAdjacentSwapAnywhere<T> {
+    fn default() -> Self {
+        Self {
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> NeighborhoodOperator<T> for FirstAdjacentSwapAnywhere<T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost>,
 {
@@ -73,22 +83,24 @@ where
 ///
 /// It is a "first improvement" strategy, meaning it terminates and returns the first
 /// improving move it finds, rather than searching the entire neighborhood for the best move.
-pub struct SwapSuccessorsFirstImprovement {
+pub struct SwapSuccessorsFirstImprovement<T> {
     /// A closure that dynamically provides an optional scan cap for predecessors.
     /// `None` means no limit.
     pub get_cap: Box<dyn Fn() -> Option<NonZeroUsize>>,
+    _phantom: std::marker::PhantomData<T>,
 }
 
-impl Default for SwapSuccessorsFirstImprovement {
+impl<T> Default for SwapSuccessorsFirstImprovement<T> {
     /// By default, creates an operator with no scan cap.
     fn default() -> Self {
         Self {
             get_cap: Box::new(|| None), // Default closure returns None, indicating no cap.
+            _phantom: std::marker::PhantomData,
         }
     }
 }
 
-impl<T> NeighborhoodOperator<T> for SwapSuccessorsFirstImprovement
+impl<T> NeighborhoodOperator<T> for SwapSuccessorsFirstImprovement<T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Zero + Into<Cost> + Send + Sync,
 {

@@ -92,6 +92,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct SearchContext<'engine, 'model, 'problem, T, S>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,

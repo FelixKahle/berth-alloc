@@ -66,45 +66,37 @@ where
             Some(resolved_end_node_exclusive)
         };
 
-        // Seed the berth cursor E:
-        // - If a real predecessor is already assigned on the *same* berth, start after it finishes.
-        // - Otherwise, trust the first node's L and start from there.
-        let mut earliest_time_cursor =
-            if let Some(pred_node) = chain_view.prev_real(first_actual_node) {
-                let pred_req = RequestIndex(pred_node.get());
-                match decision_variables.get(pred_req.get()) {
-                    Some(DecisionVar::Assigned(pred_dec)) => {
-                        if pred_dec.berth_index != berth_index {
-                            return Err(SchedulingError::NotAllowedOnBerth(
-                                NotAllowedOnBerthError::new(pred_req, berth_index),
-                            ));
-                        }
-                        let pt = solver_model
-                            .processing_time(pred_req, berth_index)
-                            .flatten()
-                            .ok_or_else(|| {
-                                SchedulingError::NotAllowedOnBerth(NotAllowedOnBerthError::new(
-                                    pred_req,
-                                    berth_index,
-                                ))
-                            })?;
-                        pred_dec.start_time.checked_add(pt).ok_or_else(|| {
-                            SchedulingError::FeasiblyWindowViolation(
-                                FeasiblyWindowViolationError::new(pred_req),
-                            )
-                        })?
-                    }
-                    _ => {
-                        // No committed predecessor on this chain; trust the first node's L.
-                        let first_idx = RequestIndex(first_actual_node.get());
-                        interval_variables[first_idx.get()].start_time_lower_bound
-                    }
+        let mut earliest_time_cursor = if let Some(pred_node) =
+            chain_view.prev_real(first_actual_node)
+        {
+            let pred_req = RequestIndex(pred_node.get());
+            match decision_variables.get(pred_req.get()) {
+                Some(DecisionVar::Assigned(pred_dec)) if pred_dec.berth_index == berth_index => {
+                    let pt = solver_model
+                        .processing_time(pred_req, berth_index)
+                        .flatten()
+                        .ok_or_else(|| {
+                            SchedulingError::NotAllowedOnBerth(NotAllowedOnBerthError::new(
+                                pred_req,
+                                berth_index,
+                            ))
+                        })?;
+                    pred_dec.start_time.checked_add(pt).ok_or_else(|| {
+                        SchedulingError::FeasiblyWindowViolation(FeasiblyWindowViolationError::new(
+                            pred_req,
+                        ))
+                    })?
                 }
-            } else {
-                // Head of chain: trust the first node's L.
-                let first_idx = RequestIndex(first_actual_node.get());
-                interval_variables[first_idx.get()].start_time_lower_bound
-            };
+                _ => {
+                    // ignore stale/mismatched predecessor DV; seed from current LB
+                    let first_idx = RequestIndex(first_actual_node.get());
+                    interval_variables[first_idx.get()].start_time_lower_bound
+                }
+            }
+        } else {
+            let first_idx = RequestIndex(first_actual_node.get());
+            interval_variables[first_idx.get()].start_time_lower_bound
+        };
 
         // Greedy left-justified pass over the slice.
         let mut loop_guard = solver_model.flexible_requests_len();
@@ -169,6 +161,7 @@ mod tests {
     use super::*;
     use crate::core::{decisionvar::DecisionVar, intervalvar::IntervalVar};
     use crate::scheduling::traits::Scheduler;
+    use crate::state::chain_set::overlay::ChainSetOverlay;
     use crate::state::chain_set::{
         base::ChainSet,
         delta::{ChainNextRewire, ChainSetDelta},
@@ -382,8 +375,8 @@ mod tests {
     }
 
     #[test]
-    fn test_slice_prev_assignment_on_different_berth_is_error() {
-        // two berths; prev real assigned on berth1; scheduling chain on berth0 should error
+    fn test_slice_prev_assignment_on_different_berth_is_ignored_and_succeeds() {
+        // two berths; predecessor (R0) assigned on berth1; we schedule slice on chain0 (berth0)
         let p = build_problem(
             &[vec![(0, 100)], vec![(0, 100)]],
             &[(0, 100), (0, 100)],
@@ -397,21 +390,18 @@ mod tests {
         let mut cs = ChainSet::new(m.flexible_requests_len(), m.berths_len());
         link_chain(&mut cs, 0, &[0, 1]); // chain 0 ↔ berth 0
 
-        // prev (R0) assigned to berth1 (mismatch)
+        // predecessor (R0) assigned to berth1 (mismatch) — should be ignored now
         dvars[0] = DecisionVar::assigned(bi(1), tp(0));
 
         let c0 = cs.chain(ChainIndex(0));
-        let err = GreedyScheduler
+        GreedyScheduler
             .schedule_chain_slice(&m, c0, NodeIndex(1), None, &mut ivars, &mut dvars)
-            .unwrap_err();
+            .unwrap();
 
-        match err {
-            SchedulingError::NotAllowedOnBerth(e) => {
-                assert_eq!(e.request(), ri(0));
-                assert_eq!(e.berth(), bi(0));
-            }
-            x => panic!("expected NotAllowedOnBerth, got {:?}", x),
-        }
+        // R1 gets assigned on berth0 at its current LB (0 by default here)
+        let d1 = dvars[1].as_assigned().unwrap();
+        assert_eq!(d1.berth_index, bi(0));
+        assert_eq!(d1.start_time, ivars[1].start_time_lower_bound);
     }
 
     #[test]
@@ -517,5 +507,73 @@ mod tests {
             SchedulingError::FeasiblyWindowViolation(_) => {} // guard tripped
             x => panic!("expected FWV due to loop guard, got {:?}", x),
         }
+    }
+
+    #[test]
+    fn test_overlay_inter_berth_move_schedules_on_target_chain() {
+        // Two berths, all requests allowed on both.
+        // c0 (berth0): start -> 0 -> 1 -> end  with PT [3,3]
+        // c1 (berth1): start -> 2 -> 3 -> end  with PT [4,5]
+        let p = build_problem(
+            &[vec![(0, 200)], vec![(0, 200)]],
+            &[(0, 200), (0, 200), (0, 200), (0, 200)],
+            &[
+                vec![Some(3), Some(3)],
+                vec![Some(3), Some(3)],
+                vec![Some(4), Some(4)],
+                vec![Some(5), Some(5)],
+            ],
+        );
+        let m = SolverModel::from_problem(&p).unwrap();
+        let mut ivars = default_ivars(&m);
+        let mut dvars = default_dvars(&m);
+
+        // base chains
+        let mut cs = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+        link_chain(&mut cs, 0, &[0, 1]);
+        link_chain(&mut cs, 1, &[2, 3]);
+
+        // overlay: move node 2 to the front of chain0:
+        //   c0: start->2->0->1->end   ;   c1: start->3->end
+        let c0s = cs.start_of_chain(ChainIndex(0));
+        let c0e = cs.end_of_chain(ChainIndex(0));
+        let c1s = cs.start_of_chain(ChainIndex(1));
+        let c1e = cs.end_of_chain(ChainIndex(1));
+
+        let mut delta = ChainSetDelta::new();
+        // chain0
+        delta.push_rewire(ChainNextRewire::new(c0s, NodeIndex(2)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(2), NodeIndex(0)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(0), NodeIndex(1)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(1), c0e));
+        // chain1
+        delta.push_rewire(ChainNextRewire::new(c1s, NodeIndex(3)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(3), c1e));
+
+        let overlay = ChainSetOverlay::new(&cs, &delta);
+        let oc0 = overlay.chain(ChainIndex(0));
+        let oc1 = overlay.chain(ChainIndex(1));
+
+        // Schedule both overlay chains
+        GreedyScheduler
+            .schedule_chain(&m, oc0, &mut ivars, &mut dvars)
+            .unwrap();
+        GreedyScheduler
+            .schedule_chain(&m, oc1, &mut ivars, &mut dvars)
+            .unwrap();
+
+        // On chain0 (berth0): s2=0, s0=4, s1=7
+        let d2 = dvars[2].as_assigned().unwrap();
+        let d0 = dvars[0].as_assigned().unwrap();
+        let d1 = dvars[1].as_assigned().unwrap();
+        assert_eq!(d2.berth_index, bi(0));
+        assert_eq!(d2.start_time, tp(0));
+        assert_eq!(d0.start_time, tp(4)); // after pt2=4
+        assert_eq!(d1.start_time, tp(7)); // after pt2+pt0 = 4+3
+
+        // On chain1 (berth1): single job 3 at 0
+        let d3 = dvars[3].as_assigned().unwrap();
+        assert_eq!(d3.berth_index, bi(1));
+        assert_eq!(d3.start_time, tp(0));
     }
 }

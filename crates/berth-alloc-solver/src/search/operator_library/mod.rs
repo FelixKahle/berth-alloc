@@ -20,5 +20,6 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 pub mod intra_chain_two_opt;
+pub mod random;
 pub mod relocate;
 pub mod swap;

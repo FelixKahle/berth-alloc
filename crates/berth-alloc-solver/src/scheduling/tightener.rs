@@ -461,6 +461,7 @@ mod tests {
         base::ChainSet,
         delta::{ChainNextRewire, ChainSetDelta},
         index::{ChainIndex, NodeIndex},
+        overlay::ChainSetOverlay,
         view::ChainSetView,
     };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
@@ -684,5 +685,316 @@ mod tests {
         // The backward pass will tighten the upper bound to 50.
         assert_eq!(ivars[0].start_time_lower_bound, tp(45));
         assert_eq!(ivars[0].start_time_upper_bound, tp(50));
+    }
+
+    #[test]
+    fn test_overlay_swap_changes_precedence_lb() {
+        // calendar: [0,100); pt0=5, pt1=7
+        // base chain: start -> 0 -> 1 -> end
+        // overlay delta: swap to start -> 1 -> 0 -> end
+        // expect: LB(1)=0; LB(0)=LB(1)+pt1=7
+        let p = build_problem(
+            &[vec![(0, 100)]],
+            &[(0, 100), (0, 100)],
+            &[vec![Some(5)], vec![Some(7)]],
+        );
+        let m = SolverModel::from_problem(&p).unwrap();
+
+        let mut ivars = default_ivars(&m);
+
+        // base chain
+        let mut cs = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+        link_chain(&mut cs, 0, &[0, 1]);
+
+        // build overlay delta:  swap 0 and 1
+        // base arcs: start->0, 0->1, 1->end
+        // new arcs:  start->1, 1->0, 0->end
+        let start = cs.start_of_chain(ChainIndex(0));
+        let end = cs.end_of_chain(ChainIndex(0));
+        let mut delta = ChainSetDelta::new();
+        delta.push_rewire(ChainNextRewire::new(start, NodeIndex(1)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(1), NodeIndex(0)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(0), end));
+
+        let overlay = ChainSetOverlay::new(&cs, &delta);
+        let c0 = overlay.chain(ChainIndex(0));
+
+        BoundsTightener.propagate(&m, c0, &mut ivars).unwrap();
+
+        // request 1 first at t=0; request 0 must start at ≥7
+        assert_eq!(ivars[1].start_time_lower_bound, tp(0));
+        assert_eq!(ivars[0].start_time_lower_bound, tp(7));
+    }
+
+    #[test]
+    fn test_overlay_relocate_tail_to_front_updates_all_lbs() {
+        // three jobs: pt = [3, 5, 4]
+        // base: start -> 0 -> 1 -> 2 -> end
+        // overlay: start -> 2 -> 0 -> 1 -> end
+        // expect: LB(2)=0; LB(0)=0+4=4; LB(1)=4+3=7
+        let p = build_problem(
+            &[vec![(0, 100)]],
+            &[(0, 100), (0, 100), (0, 100)],
+            &[vec![Some(3)], vec![Some(5)], vec![Some(4)]],
+        );
+        let m = SolverModel::from_problem(&p).unwrap();
+        let mut ivars = default_ivars(&m);
+
+        let mut cs = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+        link_chain(&mut cs, 0, &[0, 1, 2]);
+
+        let start = cs.start_of_chain(ChainIndex(0));
+        let end = cs.end_of_chain(ChainIndex(0));
+
+        // rewire to: start->2->0->1->end
+        let mut delta = ChainSetDelta::new();
+        delta.push_rewire(ChainNextRewire::new(start, NodeIndex(2)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(2), NodeIndex(0)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(0), NodeIndex(1)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(1), end));
+
+        let overlay = ChainSetOverlay::new(&cs, &delta);
+        let c0 = overlay.chain(ChainIndex(0));
+
+        BoundsTightener.propagate(&m, c0, &mut ivars).unwrap();
+
+        assert_eq!(ivars[2].start_time_lower_bound, tp(0)); // first
+        assert_eq!(ivars[0].start_time_lower_bound, tp(4)); // after pt2=4
+        assert_eq!(ivars[1].start_time_lower_bound, tp(7)); // after pt2+pt0 = 4+3
+    }
+
+    #[test]
+    fn test_overlay_respects_end_exclusive_slice() {
+        // base: start->0->1->2->end; pt = [5,5,5]
+        // overlay: swap 1 and 2  => start->0->2->1->end
+        // propagate only slice [start, node(2))  (i.e., up to, but not including node 2)
+        // expect: only job 0 gets tightened; job 2 & 1 untouched by slice
+        let p = build_problem(
+            &[vec![(0, 100)]],
+            &[(0, 100), (0, 100), (0, 100)],
+            &[vec![Some(5)], vec![Some(5)], vec![Some(5)]],
+        );
+        let m = SolverModel::from_problem(&p).unwrap();
+        let mut ivars = default_ivars(&m);
+
+        let mut cs = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+        link_chain(&mut cs, 0, &[0, 1, 2]);
+
+        // overlay: start->0->2->1->end
+        let start = cs.start_of_chain(ChainIndex(0));
+        let end = cs.end_of_chain(ChainIndex(0));
+
+        let mut delta = ChainSetDelta::new();
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(0), NodeIndex(2)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(2), NodeIndex(1)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(1), end));
+
+        let overlay = ChainSetOverlay::new(&cs, &delta);
+        let c0 = overlay.chain(ChainIndex(0));
+
+        // capture original UBs/LBs for later compare
+        let before = ivars.clone();
+
+        // propagate only up to (but excluding) node 2
+        BoundsTightener
+            .propagate_slice(&m, c0, start, Some(NodeIndex(2)), &mut ivars)
+            .unwrap();
+
+        // only request 0 should have changed (LB tightened to 0); others identical
+        assert_eq!(ivars[0].start_time_lower_bound, tp(0));
+        assert_eq!(ivars[1], before[1]);
+        assert_eq!(ivars[2], before[2]);
+    }
+
+    #[test]
+    fn test_overlay_intra_chain_two_opt_reverse_middle_segment() {
+        // cal: [0, 200), pt = [3, 4, 5, 6]
+        // base: start -> 0 -> 1 -> 2 -> 3 -> end
+        // two-opt reversal of (1..=2): start -> 0 -> 2 -> 1 -> 3 -> end
+        // LBs should be: s0=0, s2=3, s1=3+5=8, s3=8+4=12
+        let p = build_problem(
+            &[vec![(0, 200)]],
+            &[(0, 200), (0, 200), (0, 200), (0, 200)],
+            &[vec![Some(3)], vec![Some(4)], vec![Some(5)], vec![Some(6)]],
+        );
+        let m = SolverModel::from_problem(&p).unwrap();
+        let mut ivars = default_ivars(&m);
+
+        let mut cs = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+        link_chain(&mut cs, 0, &[0, 1, 2, 3]);
+
+        // rewire for reversed middle segment (1..=2)
+        let start = cs.start_of_chain(ChainIndex(0));
+        let end = cs.end_of_chain(ChainIndex(0));
+        let mut delta = ChainSetDelta::new();
+        delta.push_rewire(ChainNextRewire::new(start, NodeIndex(0)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(0), NodeIndex(2)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(2), NodeIndex(1)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(1), NodeIndex(3)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(3), end));
+
+        let overlay = ChainSetOverlay::new(&cs, &delta);
+        let c0 = overlay.chain(ChainIndex(0));
+
+        BoundsTightener.propagate(&m, c0, &mut ivars).unwrap();
+
+        assert_eq!(ivars[0].start_time_lower_bound, tp(0));
+        assert_eq!(ivars[2].start_time_lower_bound, tp(3)); // after pt0=3
+        assert_eq!(ivars[1].start_time_lower_bound, tp(8)); // after pt0+pt2=3+5
+        assert_eq!(ivars[3].start_time_lower_bound, tp(12)); // after ... + pt1=4
+    }
+
+    #[test]
+    fn test_overlay_intra_chain_partial_slice_middle_segment_only() {
+        // base: start -> 0 -> 1 -> 2 -> 3 -> end, pt=[2,3,4,5]
+        // overlay: move 2 before 1: start -> 0 -> 2 -> 1 -> 3 -> end
+        // propagate slice starting at node(2) up to (but excluding) node(3)
+        // expect: LBs for 2 and (via backward) 1 adjust; 0 and 3 unchanged.
+        let p = build_problem(
+            &[vec![(0, 200)]],
+            &[(0, 200), (0, 200), (0, 200), (0, 200)],
+            &[vec![Some(2)], vec![Some(3)], vec![Some(4)], vec![Some(5)]],
+        );
+        let m = SolverModel::from_problem(&p).unwrap();
+        let mut ivars = default_ivars(&m);
+        let before = ivars.clone();
+
+        let mut cs = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+        link_chain(&mut cs, 0, &[0, 1, 2, 3]);
+
+        let end = cs.end_of_chain(ChainIndex(0));
+        let mut delta = ChainSetDelta::new();
+        // start->0 stays; rewire 0->2->1->3->end
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(0), NodeIndex(2)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(2), NodeIndex(1)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(1), NodeIndex(3)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(3), end));
+
+        let overlay = ChainSetOverlay::new(&cs, &delta);
+        let c0 = overlay.chain(ChainIndex(0));
+
+        // slice: [node(2), node(3)) — only node 2 affected forward; UB of 1 may adjust backward
+        BoundsTightener
+            .propagate_slice(&m, c0, NodeIndex(2), Some(NodeIndex(3)), &mut ivars)
+            .unwrap();
+
+        // 0 untouched
+        assert_eq!(ivars[0], before[0]);
+        // 3 untouched (end exclusive)
+        assert_eq!(ivars[3], before[3]);
+
+        // 2 becomes directly after 0 ⇒ s2 >= pt0 = 2
+        assert_eq!(ivars[2].start_time_lower_bound, tp(2));
+
+        // 1 is successor of 2 now; forward slice stopped at 3, but backward phase
+        // within the slice keeps 1 consistent relative to 2’s UB/LB bounds.
+        // We at least assert lower bound didn’t go below 2 (conservative check).
+        assert!(ivars[1].start_time_lower_bound >= tp(2));
+    }
+
+    #[test]
+    fn test_overlay_inter_chain_relocate_head_of_chain1_to_front_of_chain0() {
+        // two berths, same calendar. allow all requests on both berths.
+        // chain0: start -> 0 -> 1 -> end   (pt0=3, pt1=3)
+        // chain1: start -> 2 -> 3 -> end   (pt2=4, pt3=5)
+        // overlay: move node 2 to front of chain0:
+        //   c0: start -> 2 -> 0 -> 1 -> end
+        //   c1: start -> 3 -> end
+        let p = build_problem(
+            &[vec![(0, 200)], vec![(0, 200)]],
+            &[(0, 200), (0, 200), (0, 200), (0, 200)],
+            &[
+                vec![Some(3), Some(3)],
+                vec![Some(3), Some(3)],
+                vec![Some(4), Some(4)],
+                vec![Some(5), Some(5)],
+            ],
+        );
+        let m = SolverModel::from_problem(&p).unwrap();
+        let mut ivars = default_ivars(&m);
+
+        // Build base chains explicitly mapped by node id:
+        let mut cs = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+        link_chain(&mut cs, 0, &[0, 1]);
+        link_chain(&mut cs, 1, &[2, 3]);
+
+        // delta: cut 2 from c1 and insert after c0's start
+        let c0s = cs.start_of_chain(ChainIndex(0));
+        let c0e = cs.end_of_chain(ChainIndex(0));
+        let c1s = cs.start_of_chain(ChainIndex(1));
+        let c1e = cs.end_of_chain(ChainIndex(1));
+
+        let mut delta = ChainSetDelta::new();
+        // c0: start->2->0->1->end
+        delta.push_rewire(ChainNextRewire::new(c0s, NodeIndex(2)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(2), NodeIndex(0)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(0), NodeIndex(1)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(1), c0e));
+        // c1: start->3->end
+        delta.push_rewire(ChainNextRewire::new(c1s, NodeIndex(3)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(3), c1e));
+
+        let overlay = ChainSetOverlay::new(&cs, &delta);
+        let oc0 = overlay.chain(ChainIndex(0));
+        let oc1 = overlay.chain(ChainIndex(1));
+
+        // propagate both overlay chains
+        BoundsTightener.propagate(&m, oc0, &mut ivars).unwrap();
+        BoundsTightener.propagate(&m, oc1, &mut ivars).unwrap();
+
+        // On chain0 (berth0): s2=0, s0=4, s1=7
+        assert_eq!(ivars[2].start_time_lower_bound, tp(0));
+        assert_eq!(ivars[0].start_time_lower_bound, tp(4));
+        assert_eq!(ivars[1].start_time_lower_bound, tp(7));
+
+        // On chain1 (berth1): single job 3 at 0
+        assert_eq!(ivars[3].start_time_lower_bound, tp(0));
+    }
+
+    #[test]
+    fn test_overlay_inter_chain_illegal_move_raises_not_allowed() {
+        // two berths; req2 allowed ONLY on berth1; move it into chain0 (berth0) -> error
+        let p = build_problem(
+            &[vec![(0, 100)], vec![(0, 100)]],
+            &[(0, 100), (0, 100), (0, 100)],
+            &[
+                vec![Some(3), Some(3)], // req0
+                vec![Some(3), Some(3)], // req1
+                vec![None, Some(4)],    // req2 only on berth1
+            ],
+        );
+        let m = SolverModel::from_problem(&p).unwrap();
+        let mut ivars = default_ivars(&m);
+
+        let mut cs = ChainSet::new(m.flexible_requests_len(), m.berths_len());
+        link_chain(&mut cs, 0, &[0, 1]);
+        link_chain(&mut cs, 1, &[2]);
+
+        let c0s = cs.start_of_chain(ChainIndex(0));
+        let c0e = cs.end_of_chain(ChainIndex(0));
+        let c1s = cs.start_of_chain(ChainIndex(1));
+        let c1e = cs.end_of_chain(ChainIndex(1));
+
+        // Try to insert req2 (only on berth1) into chain0 (berth0)
+        let mut delta = ChainSetDelta::new();
+        // c0: start -> 2 -> 0 -> 1 -> end
+        delta.push_rewire(ChainNextRewire::new(c0s, NodeIndex(2)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(2), NodeIndex(0)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(0), NodeIndex(1)));
+        delta.push_rewire(ChainNextRewire::new(NodeIndex(1), c0e));
+        // c1 becomes empty (start->end)
+        delta.push_rewire(ChainNextRewire::new(c1s, c1e));
+
+        let overlay = ChainSetOverlay::new(&cs, &delta);
+        let oc0 = overlay.chain(ChainIndex(0));
+
+        let err = BoundsTightener.propagate(&m, oc0, &mut ivars).unwrap_err();
+        match err {
+            SchedulingError::NotAllowedOnBerth(e) => {
+                assert_eq!(e.request(), ri(2));
+                assert_eq!(e.berth(), bi(0)); // illegal berth
+            }
+            x => panic!("expected NotAllowedOnBerth, got {:?}", x),
+        }
     }
 }

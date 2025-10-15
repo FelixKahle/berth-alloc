@@ -61,6 +61,7 @@ impl Default for SAParams {
     }
 }
 
+#[derive(Debug)]
 pub struct Search<'engine, 'model, 'problem, T, S>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
@@ -147,6 +148,7 @@ where
                     d_search <= 0.0 || (temp > 0.0 && rng_f64(&mut rng) < (-d_search / temp).exp());
                 let true_delta = cand.true_delta_cost;
                 if accept {
+                    println!("Accept");
                     self.context
                         .operators_mut()
                         .record_accept(op_idx, true_delta);
@@ -154,23 +156,8 @@ where
 
                     if self.context.state().current_true_cost() < self.best_snapshot.true_cost {
                         self.best_snapshot = self.context.state().snapshot();
-                        println!(
-                            "New best solution found with cost: {}",
-                            self.best_snapshot.true_cost
-                        );
                     }
                 }
-
-                println!(
-                    "Operator {} produced candidate with d_search {:.2}, d_true {}, temp {:.3} => {}",
-                    op_idx,
-                    d_search,
-                    true_delta,
-                    temp,
-                    if accept { "ACCEPTED" } else { "rejected" }
-                );
-            } else {
-                println!("Operator {} produced infeasible candidate", op_idx,);
             }
 
             let elapsed_ns = op_exec_start.elapsed().as_nanos() as f64;
@@ -208,7 +195,6 @@ where
                     return local(from, to);
                 }
             }
-            println!("None...");
             None
         }
     }

@@ -35,9 +35,9 @@ use crate::{
     },
     search::{
         filter::{feasible_berth_filter::FeasibleBerthFilter, filter_stack::FilterStack},
-        operator::traits::NeighborhoodOperator,
         operator_library::{
             intra_chain_two_opt::IntraChainTwoOptFirstImprovement,
+            random::RandomSwapAnywhere,
             relocate::Relocate1FirstImprovement,
             swap::{FirstAdjacentSwapAnywhere, SwapSuccessorsFirstImprovement},
         },
@@ -47,7 +47,7 @@ use crate::{
 use berth_alloc_core::prelude::Cost;
 use berth_alloc_model::prelude::{Problem, SolutionRef};
 use num_traits::{CheckedAdd, CheckedSub, SaturatingSub, Zero};
-use std::{convert::TryInto, thread};
+use std::convert::TryInto;
 
 pub struct EngineParams {
     pub proximity_alpha: f64,
@@ -62,12 +62,11 @@ where
     proximity_map: ProximityMap,
     pipeline: SchedulingPipeline<T, GreedyScheduler>,
     filter_stack: FilterStack<T>,
-    operators: Vec<Box<dyn NeighborhoodOperator<T>>>,
 }
 
 impl<'problem, T> SolverEngine<'problem, T>
 where
-    T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost>,
+    T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + 'static,
 {
     pub fn new(
         params: EngineParams,
@@ -85,111 +84,13 @@ where
         // Default pipeline, filter stack and operators.
         let pipeline = SchedulingPipeline::from_propagators([BoundsTightener], GreedyScheduler);
         let filter_stack = FilterStack::with_filters(vec![Box::new(FeasibleBerthFilter)]);
-        let operators: Vec<Box<dyn NeighborhoodOperator<T>>> =
-            vec![Box::new(SwapSuccessorsFirstImprovement::default())];
 
         Ok(Self {
             solver_model,
             proximity_map,
             pipeline,
             filter_stack,
-            operators,
         })
-    }
-
-    /// Solve:
-    /// - Build opening solution
-    /// - Run multi-threaded simulated annealing searches
-    /// - Pick best snapshot
-    /// - Convert to SolutionRef
-    pub fn solve(&mut self) -> SolutionRef<'problem, T>
-    where
-        T: Send + Sync + Zero + SaturatingSub,
-    {
-        let opener = GreedyOpening;
-        let initial_state = opener.build(&self.solver_model);
-
-        // If no operators, just export opening.
-        if self.operators.is_empty() {
-            return initial_state
-                .try_into()
-                .expect("opening state should export to solution");
-        }
-
-        let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .max(1);
-
-        let time_per_thread_ms = 400_u64;
-        let lambda = 1.0_f64;
-
-        // Collect snapshots from threads
-        let mut snapshots: Vec<SearchSnapshot<T>> = Vec::with_capacity(num_threads);
-
-        thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(num_threads);
-            for tid in 0..num_threads {
-                let model_ref = &self.solver_model;
-                let prox_ref = &self.proximity_map;
-                let pipe_ref = &self.pipeline;
-                let filters_ref = &self.filter_stack;
-                let operators_len = self.operators.len();
-
-                handles.push(scope.spawn(move || {
-                    // Fresh initial state per thread
-                    let opener = GreedyOpening;
-                    let state = opener.build(model_ref);
-
-                    let engine_context =
-                        EngineContext::new(model_ref, prox_ref, pipe_ref, filters_ref);
-                    let mut search_context = SearchContext::new(&engine_context, state, lambda);
-
-                    // Populate operator pool
-                    for _ in 0..operators_len {
-                        search_context
-                            .operators_mut()
-                            .add_operator(Box::new(SwapSuccessorsFirstImprovement::default()));
-                    }
-
-                    let sa_params = SAParams {
-                        time_limit: std::time::Duration::from_millis(time_per_thread_ms),
-                        t_start: 300.0,
-                        t_end: 1e-3,
-                        seed: 0xABCDEF55_u64 ^ (tid as u64).wrapping_mul(0x9E3779B97F4A7C15),
-                        randomize_ops: 0.75,
-                    };
-
-                    let search = Search::new(search_context);
-                    search.run_sa_time_cap(sa_params) // returns SearchSnapshot<T>
-                }));
-            }
-
-            for h in handles {
-                if let Ok(snap) = h.join() {
-                    snapshots.push(snap);
-                }
-            }
-        });
-
-        // Choose best snapshot by true_cost
-        let best_snapshot_opt = snapshots
-            .into_iter()
-            .min_by(|a, b| a.true_cost.cmp(&b.true_cost));
-
-        let best_snapshot = match best_snapshot_opt {
-            Some(s) => s,
-            None => {
-                // Fallback to opening conversion
-                return initial_state
-                    .try_into()
-                    .expect("initial state export must succeed");
-            }
-        };
-
-        best_snapshot
-            .try_into()
-            .expect("best snapshot state export must succeed")
     }
 
     pub fn solve_with_time_budget(
@@ -205,15 +106,10 @@ where
         let opener = GreedyOpening;
         let initial_state = opener.build(&self.solver_model);
 
-        if self.operators.is_empty() {
-            return initial_state
-                .try_into()
-                .expect("opening state should export to solution");
-        }
-
         let num_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
+            .min(1) // TODO: Remove
             .max(1);
 
         let per_thread_time = total_budget; // each thread runs full budget (aggressive). Adjust if needed.
@@ -247,7 +143,10 @@ where
                         .add_operator(Box::new(Relocate1FirstImprovement::default()));
                     search_context
                         .operators_mut()
-                        .add_operator(Box::new(FirstAdjacentSwapAnywhere));
+                        .add_operator(Box::new(RandomSwapAnywhere::new(10)));
+                    search_context
+                        .operators_mut()
+                        .add_operator(Box::new(FirstAdjacentSwapAnywhere::default()));
 
                     let sa_params = SAParams {
                         time_limit: per_thread_time,
@@ -272,11 +171,6 @@ where
         let best_snapshot_opt = snapshots
             .into_iter()
             .min_by(|a, b| a.true_cost.cmp(&b.true_cost));
-
-        println!(
-            "Best snapshot found with cost: {:?}",
-            best_snapshot_opt.as_ref().map(|s| s.true_cost)
-        );
 
         let best_snapshot = match best_snapshot_opt {
             Some(s) => s,
@@ -311,15 +205,12 @@ where
     pub fn filter_stack(&self) -> &FilterStack<T> {
         &self.filter_stack
     }
-
-    #[inline]
-    pub fn operators(&self) -> &Vec<Box<dyn NeighborhoodOperator<T>>> {
-        &self.operators
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use berth_alloc_model::{prelude::SolutionView, problem::loader::ProblemLoader};
 
@@ -388,7 +279,7 @@ mod tests {
             )
             .expect("Failed to create SolverEngine");
 
-            let solution = engine.solve();
+            let solution = engine.solve_with_time_budget(Duration::from_secs(1));
             // Basic sanity: solution flexible assignments count <= requests.
             assert!(
                 solution.flexible_assignments().iter().count()
