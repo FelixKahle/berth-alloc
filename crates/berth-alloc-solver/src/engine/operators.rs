@@ -45,33 +45,22 @@ impl NeighborhoodOperatorStats {
     }
 }
 
-#[derive(Debug)]
-pub struct OperatorRecord<T>
+pub struct OperatorRecord<'a, T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {
-    pub operator: Box<dyn NeighborhoodOperator<T>>,
+    pub operator: Box<dyn NeighborhoodOperator<T> + 'a>,
     pub stats: NeighborhoodOperatorStats,
 }
 
-#[derive(Debug)]
-pub struct OperatorPool<T>
+pub struct OperatorPool<'a, T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {
-    operators: Vec<OperatorRecord<T>>,
+    operators: Vec<OperatorRecord<'a, T>>,
 }
 
-impl<T> Default for OperatorPool<T>
-where
-    T: Copy + Ord + CheckedAdd + CheckedSub,
-{
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<T> OperatorPool<T>
+impl<'a, T> OperatorPool<'a, T>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {
@@ -87,15 +76,15 @@ where
         }
     }
 
-    pub fn get_operators(&self) -> &Vec<OperatorRecord<T>> {
+    pub fn get_operators(&self) -> &Vec<OperatorRecord<'a, T>> {
         &self.operators
     }
 
-    pub fn get_operators_mut(&mut self) -> &mut Vec<OperatorRecord<T>> {
+    pub fn get_operators_mut(&mut self) -> &mut Vec<OperatorRecord<'a, T>> {
         &mut self.operators
     }
 
-    pub fn add_operator(&mut self, op: Box<dyn NeighborhoodOperator<T>>) {
+    pub fn add_operator(&mut self, op: Box<dyn NeighborhoodOperator<T> + 'a>) {
         self.operators.push(OperatorRecord {
             operator: op,
             stats: NeighborhoodOperatorStats::new(),

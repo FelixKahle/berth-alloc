@@ -25,7 +25,6 @@ use std::time::{Duration, Instant};
 
 use crate::{
     engine::context::SearchContext,
-    model::solver_model::SolverModel,
     scheduling::traits::Scheduler,
     search::operator::runner::CandidateEvaluator,
     state::{
@@ -61,7 +60,6 @@ impl Default for SAParams {
     }
 }
 
-#[derive(Debug)]
 pub struct Search<'engine, 'model, 'problem, T, S>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
@@ -147,8 +145,14 @@ where
                 let accept =
                     d_search <= 0.0 || (temp > 0.0 && rng_f64(&mut rng) < (-d_search / temp).exp());
                 let true_delta = cand.true_delta_cost;
+
+                println!(
+                    "Found delta: true={true_delta} search={}",
+                    cand.search_delta_cost
+                );
+
                 if accept {
-                    println!("Accept");
+                    //println!("Accept");
                     self.context
                         .operators_mut()
                         .record_accept(op_idx, true_delta);
@@ -182,34 +186,26 @@ where
     fn make_global_arc_evaluator(&self) -> impl Fn(NodeIndex, NodeIndex) -> Option<Cost> + '_ {
         move |from: NodeIndex, to: NodeIndex| {
             let cs = self.context.state().chain_set();
-            if let Some(ci) = cs.chain_of_node(from) {
-                let cr = ChainRef::new(cs, ci);
-                let local = self.context.make_search_arc_eval(cr);
-                return local(from, to);
-            }
-            for i in 0..cs.num_chains() {
-                let ci = ChainIndex(i);
-                if cs.start_of_chain(ci) == from || cs.end_of_chain(ci) == from {
-                    let cr = ChainRef::new(cs, ci);
-                    let local = self.context.make_search_arc_eval(cr);
-                    return local(from, to);
-                }
-            }
-            None
-        }
-    }
 
-    #[inline]
-    pub fn make_search_arc_eval<V>(
-        &self,
-        chain: ChainRef<'_, V>,
-    ) -> impl Fn(NodeIndex, NodeIndex) -> Option<Cost>
-    where
-        V: ChainSetView,
-        T: CheckedAdd + CheckedSub + Into<Cost>,
-    {
-        let model: &SolverModel<'problem, T> = self.context.model();
-        crate::eval::arc::make_simple_chain_arc_evaluator::<T, V>(model, chain)
+            let chain_of = |n: NodeIndex| -> Option<ChainIndex> {
+                if let Some(ci) = cs.chain_of_node(n) {
+                    return Some(ci);
+                }
+                for i in 0..cs.num_chains() {
+                    let ci = ChainIndex(i);
+                    if cs.start_of_chain(ci) == n || cs.end_of_chain(ci) == n {
+                        return Some(ci);
+                    }
+                }
+                None
+            };
+
+            // Prefer the chain of `from`, otherwise try `to`.
+            let ci = chain_of(from).or_else(|| chain_of(to))?;
+            let cr = ChainRef::new(cs, ci);
+            let local = self.context.make_search_arc_eval(cr);
+            local(from, to)
+        }
     }
 }
 

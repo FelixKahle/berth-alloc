@@ -92,7 +92,6 @@ where
     }
 }
 
-#[derive(Debug)]
 pub struct SearchContext<'engine, 'model, 'problem, T, S>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
@@ -102,7 +101,7 @@ where
     state: SolverSearchState<'model, 'problem, T>,
     objective: WeightedTurnaroundTimeObjective,
     search_objective: SearchObjective<WeightedTurnaroundTimeObjective>,
-    operators: OperatorPool<T>,
+    operators: OperatorPool<'engine, T>,
 }
 
 impl<'engine, 'model, 'problem, T, S> SearchContext<'engine, 'model, 'problem, T, S>
@@ -118,6 +117,9 @@ where
         let weighted_objective = WeightedTurnaroundTimeObjective;
         let search_objective = SearchObjective::new(weighted_objective.clone(), lambda);
         state.recompute_costs(&weighted_objective, &search_objective);
+
+        println!("Initial Cost: {}", state.current_true_cost());
+
         Self {
             engine_context,
             objective: weighted_objective,
@@ -167,9 +169,12 @@ where
         self.engine_context.filters()
     }
 
-    #[inline]
-    pub fn operators(&self) -> &OperatorPool<T> {
+    pub fn operators(&self) -> &OperatorPool<'engine, T> {
         &self.operators
+    }
+
+    pub fn operators_mut(&mut self) -> &mut OperatorPool<'engine, T> {
+        &mut self.operators
     }
 
     #[inline]
@@ -219,11 +224,6 @@ where
     #[inline]
     pub fn into_state(self) -> SolverSearchState<'model, 'problem, T> {
         self.state
-    }
-
-    #[inline]
-    pub fn operators_mut(&mut self) -> &mut OperatorPool<T> {
-        &mut self.operators
     }
 }
 

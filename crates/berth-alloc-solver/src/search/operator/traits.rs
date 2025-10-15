@@ -28,8 +28,7 @@ use crate::{
 };
 use num_traits::{CheckedAdd, CheckedSub};
 
-/// A function that, given two node indices, returns a vector of neighboring node indices.
-pub type NeighborAccessor = dyn Fn(NodeIndex, NodeIndex) -> Vec<NodeIndex>;
+pub type NeighborAccessorFn<'a> = dyn Fn(NodeIndex, NodeIndex) -> &'a [NodeIndex];
 
 pub trait NeighborhoodOperator<T>
 where

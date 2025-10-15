@@ -42,7 +42,7 @@ fn find_instances_dir() -> Option<PathBuf> {
 
 fn main() {
     // Each instance gets 20 seconds
-    let budget_per_instance = Duration::from_secs(3);
+    let budget_per_instance = Duration::from_secs(60);
 
     let instances_dir =
         find_instances_dir().expect("Could not locate `instances/` directory in ancestors.");
@@ -118,16 +118,5 @@ fn main() {
         );
 
         // Print all assignments
-        for asg in solution.flexible_assignments().iter() {
-            let rid = asg.request().id();
-            let bid = asg.berth().id();
-            let start = asg.start_time();
-            let end = asg.end_time();
-            let cost = asg.cost();
-            println!(
-                "  [Flexible]    Request {} -> Berth {} | Time: {}..{} | Cost: {}",
-                rid, bid, start, end, cost
-            );
-        }
     }
 }

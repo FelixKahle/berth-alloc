@@ -33,15 +33,7 @@ use crate::{
     scheduling::{
         greedy::GreedyScheduler, pipeline::SchedulingPipeline, tightener::BoundsTightener,
     },
-    search::{
-        filter::{feasible_berth_filter::FeasibleBerthFilter, filter_stack::FilterStack},
-        operator_library::{
-            intra_chain_two_opt::IntraChainTwoOptFirstImprovement,
-            random::RandomSwapAnywhere,
-            relocate::Relocate1FirstImprovement,
-            swap::{FirstAdjacentSwapAnywhere, SwapSuccessorsFirstImprovement},
-        },
-    },
+    search::filter::{feasible_berth_filter::FeasibleBerthFilter, filter_stack::FilterStack},
     state::{err::SolverModelBuildError, search_state::SearchSnapshot},
 };
 use berth_alloc_core::prelude::Cost;
@@ -130,23 +122,7 @@ where
 
                     let engine_context =
                         EngineContext::new(model_ref, prox_ref, pipe_ref, filters_ref);
-                    let mut search_context = SearchContext::new(&engine_context, state, lambda);
-
-                    search_context
-                        .operators_mut()
-                        .add_operator(Box::new(SwapSuccessorsFirstImprovement::default()));
-                    search_context
-                        .operators_mut()
-                        .add_operator(Box::new(IntraChainTwoOptFirstImprovement::default()));
-                    search_context
-                        .operators_mut()
-                        .add_operator(Box::new(Relocate1FirstImprovement::default()));
-                    search_context
-                        .operators_mut()
-                        .add_operator(Box::new(RandomSwapAnywhere::new(10)));
-                    search_context
-                        .operators_mut()
-                        .add_operator(Box::new(FirstAdjacentSwapAnywhere::default()));
+                    let search_context = SearchContext::new(&engine_context, state, lambda);
 
                     let sa_params = SAParams {
                         time_limit: per_thread_time,
