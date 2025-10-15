@@ -19,10 +19,7 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use berth_alloc_model::{
-    prelude::SolutionView,
-    problem::{asg::AssignmentView, loader::ProblemLoader, req::RequestView},
-};
+use berth_alloc_model::{prelude::SolutionView, problem::loader::ProblemLoader};
 use berth_alloc_solver::engine::solver::{EngineParams, SolverEngine};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -116,7 +113,5 @@ fn main() {
             solution.flexible_assignments().iter().count(),
             total_cost
         );
-
-        // Print all assignments
     }
 }
