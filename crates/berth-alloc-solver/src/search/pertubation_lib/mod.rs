@@ -19,6 +19,7 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod patch;
-pub mod runner;
-pub mod traits;
+pub mod greedy;
+pub mod insertion;
+pub mod nuke;
+pub mod walk;

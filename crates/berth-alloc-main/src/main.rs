@@ -19,9 +19,12 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+use berth_alloc_model::problem::asg::AssignmentView;
+use berth_alloc_model::problem::req::RequestView;
 use berth_alloc_model::{prelude::SolutionView, problem::loader::ProblemLoader};
 use berth_alloc_solver::engine::solver::{EngineParams, SolverEngine};
 use std::path::{Path, PathBuf};
+use std::process::exit;
 use std::time::Duration;
 
 fn find_instances_dir() -> Option<PathBuf> {
@@ -113,5 +116,19 @@ fn main() {
             solution.flexible_assignments().iter().count(),
             total_cost
         );
+
+        for asg in solution.flexible_assignments().iter() {
+            let rid = asg.request().id();
+            let bid = asg.berth().id();
+            let start = asg.start_time();
+            let end = asg.end_time();
+            let cost = asg.cost();
+            println!(
+                "  [Flexible]    Request {} -> Berth {} | Time: {}..{} | Cost: {}",
+                rid, bid, start, end, cost
+            );
+        }
+
+        exit(0);
     }
 }

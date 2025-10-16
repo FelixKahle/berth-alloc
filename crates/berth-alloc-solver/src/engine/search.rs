@@ -1,23 +1,5 @@
 // Copyright (c) 2025 Felix Kahle.
-//
-// Permission is hereby granted, free of charge, to any person obtaining
-// a copy of this software and associated documentation files (the
-// "Software"), to deal in the Software without restriction, including
-// without limitation the rights to use, copy, modify, merge, publish,
-// distribute, sublicense, and/or sell copies of the Software, and to
-// permit persons to whom the Software is furnished to do so, subject to
-// the following conditions:
-//
-// The above copyright notice and this permission notice shall be
-// included in all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
-// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
-// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+// MIT License (see header above)
 
 use num_traits::{CheckedAdd, CheckedSub, Zero};
 use rand::{RngCore, SeedableRng};
@@ -31,7 +13,7 @@ use crate::{
         solver_model::SolverModel,
     },
     scheduling::traits::Scheduler,
-    search::operator::runner::CandidateEvaluator,
+    search::candidate_evaluator::CandidateEvaluator,
     state::{
         chain_set::{
             index::{ChainIndex, NodeIndex},
@@ -43,7 +25,7 @@ use crate::{
 use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval, TimePoint};
 use rand_chacha::ChaCha8Rng;
 
-/// SA parameters (time-capped).
+/// SA parameters (time-capped) + a simple stagnation kick.
 #[derive(Debug, Clone)]
 pub struct SAParams {
     pub time_limit: Duration,
@@ -51,6 +33,8 @@ pub struct SAParams {
     pub t_end: f64,
     pub seed: u64,
     pub randomize_ops: f32,
+    /// If we haven't strictly improved for this many iterations, apply a random perturbation.
+    pub stagnation_iters: usize,
 }
 
 impl Default for SAParams {
@@ -61,6 +45,7 @@ impl Default for SAParams {
             t_end: 1e-3,
             seed: 0xC0FF_EE00_D15EA5ED,
             randomize_ops: 0.5,
+            stagnation_iters: 2_000, // sensible default; tune per instance size
         }
     }
 }
@@ -97,14 +82,38 @@ where
         if op_count == 0 {
             return self.best_snapshot;
         }
+
         let mut rr = 0usize;
         let mut evaluator = CandidateEvaluator::<T>::new(self.context.state());
+        let mut iters_since_best = 0usize;
 
         loop {
             let now = Instant::now();
             if now >= deadline {
                 break;
             }
+
+            // stagnation kick: after N non-improving iterations
+            if iters_since_best >= params.stagnation_iters {
+                if let Some(kicked) = self.apply_random_perturbation(&mut rng) {
+                    // accept the perturbation unconditionally (kick always “succeeds”)
+                    if let Some(cand) = CandidateEvaluator::<T>::new(self.context.state()).evaluate(
+                        &self.context,
+                        self.context.state(),
+                        kicked,
+                    ) {
+                        self.context.accept_candidate(cand);
+
+                        // Update best if strictly improved; reset evaluator + stagnation counter
+                        if self.context.state().current_true_cost() < self.best_snapshot.true_cost {
+                            self.best_snapshot = self.context.state().snapshot();
+                        }
+                        evaluator = CandidateEvaluator::<T>::new(self.context.state());
+                    }
+                }
+                iters_since_best = 0; // reset counter after a kick attempt
+            }
+
             let frac = (now - start).as_secs_f64() / params.time_limit.as_secs_f64();
             let temp = temperature(params.t_start, params.t_end, frac);
 
@@ -126,8 +135,7 @@ where
             let op_exec_start = Instant::now();
 
             let delta_opt = {
-                // Build a global ArcEvaluator that resolves the chain per (from,to)
-                // and delegates to SearchContext::make_search_arc_eval(...)
+                // Global arc evaluator over (u,v)
                 let arc_eval = self.make_global_arc_evaluator();
                 let op = &self.context.operators().get_operators()[op_idx].operator;
                 op.make_neighboor(self.context.state(), &arc_eval)
@@ -141,6 +149,7 @@ where
                 self.context
                     .operators_mut()
                     .record_exec_time_ns(op_idx, elapsed_ns);
+                iters_since_best = iters_since_best.saturating_add(1);
                 continue;
             }
 
@@ -152,16 +161,30 @@ where
                 let true_delta = cand.true_delta_cost;
 
                 if accept {
-                    //println!("Accept");
                     self.context
                         .operators_mut()
                         .record_accept(op_idx, true_delta);
                     self.context.accept_candidate(cand);
 
+                    // strict improvement?
                     if self.context.state().current_true_cost() < self.best_snapshot.true_cost {
+                        println!(
+                            "Found {}",
+                            Instant::now().duration_since(start).as_secs_f64()
+                        );
                         self.best_snapshot = self.context.state().snapshot();
+                        iters_since_best = 0;
+                    } else {
+                        iters_since_best = iters_since_best.saturating_add(1);
                     }
+
+                    // rebuild evaluator after any acceptance (keeps caches consistent)
+                    evaluator = CandidateEvaluator::<T>::new(self.context.state());
+                } else {
+                    iters_since_best = iters_since_best.saturating_add(1);
                 }
+            } else {
+                iters_since_best = iters_since_best.saturating_add(1);
             }
 
             let elapsed_ns = op_exec_start.elapsed().as_nanos() as f64;
@@ -171,6 +194,33 @@ where
         }
 
         self.best_snapshot
+    }
+
+    /// If any perturbations were registered in the context, pick one at random and apply it.
+    /// Returns the produced delta (always), or None if no perturbations exist.
+    fn apply_random_perturbation(
+        &mut self,
+        rng: &mut ChaCha8Rng,
+    ) -> Option<crate::state::chain_set::delta::ChainSetDelta> {
+        let perts = self.context.pertubations();
+        if perts.is_empty() {
+            return None;
+        }
+
+        let idx = rng_range_usize(rng, perts.len());
+        let pert = &perts[idx];
+
+        println!("Applying perturbation #{}: {}", idx, pert.name());
+
+        // Use the same global arc evaluator used for operators
+        let arc_eval = self.make_global_arc_evaluator();
+
+        // Provide working copies of vars (the perturbation may schedule locally)
+        let mut iv = self.context.state().interval_vars().to_vec();
+        let mut dv = self.context.state().decision_vars().to_vec();
+
+        let delta = pert.apply(self.context.state(), &arc_eval, &mut iv, &mut dv, rng);
+        Some(delta)
     }
 
     #[inline]

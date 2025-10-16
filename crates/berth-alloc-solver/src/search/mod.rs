@@ -19,6 +19,11 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+pub mod candidate;
+pub mod candidate_evaluator;
 pub mod filter;
 pub mod operator;
 pub mod operator_lib;
+pub mod patch;
+pub mod pertubation_lib;
+pub mod perturbation;

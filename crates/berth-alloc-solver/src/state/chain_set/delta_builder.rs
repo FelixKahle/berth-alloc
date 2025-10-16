@@ -148,6 +148,15 @@ impl<'a> ChainSetDeltaBuilder<'a> {
         true
     }
 
+    pub fn new_with_delta(base: &'a ChainSet, delta: ChainSetDelta) -> Self {
+        Self { base, delta }
+    }
+
+    /// Replace the current working delta (useful when choosing a best trial).
+    pub fn replace_delta(&mut self, delta: ChainSetDelta) {
+        self.delta = delta;
+    }
+
     #[inline]
     pub fn remove_after(&mut self, prev: NodeIndex) -> Option<NodeIndex> {
         let x = {

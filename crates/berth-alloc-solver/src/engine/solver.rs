@@ -35,7 +35,21 @@ use crate::{
     },
     search::{
         filter::{feasible_berth_filter::FeasibleBerthFilter, filter_stack::FilterStack},
-        operator_lib::relocate::RelocateNeighborsBestImprovement,
+        operator_lib::{
+            assign::AssignUnassignedFirstFeasible,
+            cross_exchange::CrossExchangeBestImprovement,
+            or_opt::OrOptKNeighborsBestImprovement,
+            regret::RegretKInsert,
+            relocate::RelocateNeighborsBestImprovement,
+            ruin::RuinRandomSegment,
+            shaw::{ShawDestroyPackInsert, ShawPackParams},
+            swap::{RandomSwapNeighborsBlind, SwapNeighborsBestImprovement},
+            two_opt_reverse::TwoOptReverseBestImprovement,
+        },
+        pertubation_lib::{
+            greedy::GreedyRuinRepair, insertion::BestInsertionRuinRepair,
+            nuke::NukeChainRuinRepair, walk::RandomWalkRuinRepair,
+        },
     },
     state::{
         chain_set::index::NodeIndex, err::SolverModelBuildError, search_state::SearchSnapshot,
@@ -44,7 +58,63 @@ use crate::{
 use berth_alloc_core::prelude::Cost;
 use berth_alloc_model::prelude::{Problem, SolutionRef};
 use num_traits::{CheckedAdd, CheckedSub, SaturatingSub, Zero};
-use std::{convert::TryInto, num::NonZeroUsize};
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+use std::{
+    convert::TryInto,
+    num::NonZeroUsize,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+/// Runtime-tunable engine knobs.
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
+    /// Target number of worker threads. Clamped to [1, available_parallelism()].
+    pub num_workers: usize,
+    /// Total wall-clock budget for the solve (shared by workers).
+    pub total_time: Duration,
+    /// Search objective mixture parameter (passed to SearchContext).
+    pub lambda: f64,
+
+    /// Proximity alpha used to build the proximity map.
+    pub proximity_alpha: f64,
+
+    /// Operator budgets / limits
+    pub relocate_scan_cap: Option<NonZeroUsize>,
+    pub cross_exchange_scan_cap: Option<usize>,
+
+    /// Perturbation (ruin/repair) settings
+    pub greedy_ruin_remove_k: usize,
+    pub greedy_ruin_scan_cap: Option<usize>,
+
+    /// Simulated annealing parameters (per worker)
+    pub sa_t_start: f64,
+    pub sa_t_end: f64,
+    pub sa_randomize_ops: f32,
+    /// Trigger a perturbation after this many non-improving iterations (Search reads this).
+    /// NOTE: keep here so callers can configure it. Your Search::SAParams should have this field.
+    pub sa_stagnation_iters: usize,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            num_workers: 1,
+            total_time: Duration::from_secs(1),
+            lambda: 1.0,
+            proximity_alpha: 1.0,
+            relocate_scan_cap: Some(NonZeroUsize::new(50_000).unwrap()),
+            cross_exchange_scan_cap: Some(50_000),
+            greedy_ruin_remove_k: 20,
+            greedy_ruin_scan_cap: Some(1_000),
+            sa_t_start: 500.0,
+            sa_t_end: 10.0,
+            sa_randomize_ops: 0.85,
+            sa_stagnation_iters: 500,
+        }
+    }
+}
 
 pub struct EngineParams {
     pub proximity_alpha: f64,
@@ -90,52 +160,69 @@ where
         })
     }
 
-    pub fn solve_with_time_budget(
-        &mut self,
-        total_budget: std::time::Duration,
-    ) -> SolutionRef<'problem, T>
+    /// Back-compat helper: keep your old API but drive it through EngineConfig.
+    pub fn solve_with_time_budget(&mut self, total_budget: Duration) -> SolutionRef<'problem, T>
     where
         T: Send + Sync + Zero + SaturatingSub,
     {
-        // Scale existing solve(): we reuse logic but override per-thread ms.
-        // Simple even split: each thread gets total_budget (we keep structure identical, just bump per-thread time).
-        // For a more refined split: divide by number of threads *some factor.
+        let mut cfg = EngineConfig::default();
+        cfg.total_time = total_budget;
+        cfg.proximity_alpha = 1.0;
+        self.solve_with_config(cfg)
+    }
+
+    /// Main entry: run the multi-worker SA+operators+perturbation search with the given config.
+    pub fn solve_with_config(&mut self, cfg: EngineConfig) -> SolutionRef<'problem, T>
+    where
+        T: Send + Sync + Zero + SaturatingSub,
+    {
+        // Build an initial solution for fallback/export (and for parity).
         let opener = GreedyOpening;
         let initial_state = opener.build(&self.solver_model);
 
-        let num_threads = std::thread::available_parallelism()
+        // Clamp worker count.
+        let hw = std::thread::available_parallelism()
             .map(|n| n.get())
-            .unwrap_or(1)
-            //.min(1) // TODO: Remove
-            .max(1);
+            .unwrap_or(1);
+        let num_workers = cfg.num_workers.clamp(1, hw);
 
-        let per_thread_time = total_budget;
-        let lambda = 1.0_f64;
+        // Even split the time budget per worker (keeps things simple/deterministic).
+        let per_worker_time = cfg.total_time;
 
-        let mut snapshots: Vec<SearchSnapshot<T>> = Vec::with_capacity(num_threads);
+        let lambda = cfg.lambda;
+
+        // Collect worker snapshots.
+        let mut snapshots: Vec<SearchSnapshot<T>> = Vec::with_capacity(num_workers);
+
         std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(num_threads);
-            for tid in 0..num_threads {
+            let mut handles = Vec::with_capacity(num_workers);
+
+            for tid in 0..num_workers {
+                // Immutable refs we can share into the thread.
                 let model_ref = &self.solver_model;
                 let prox_ref = &self.proximity_map;
                 let pipe_ref = &self.pipeline;
                 let filters_ref = &self.filter_stack;
 
-                handles.push(scope.spawn(move || {
-                    let opener = GreedyOpening;
-                    let state = opener.build(model_ref);
+                // Thread-local copy of config values we need.
+                let cfg_t = cfg.clone();
 
+                handles.push(scope.spawn(move || {
+                    // Fresh opening per worker to avoid contention.
+                    let state = GreedyOpening.build(model_ref);
+
+                    // Contexts
                     let engine_context =
                         EngineContext::new(model_ref, prox_ref, pipe_ref, filters_ref);
-                    let mut search_context = SearchContext::new(&engine_context, state, lambda);
+                    let mut search_ctx = SearchContext::new(&engine_context, state, lambda);
 
+                    // Neighborhood helper accessors using proximity lists.
                     let get_outgoing = {
                         let lists = prox_ref.any_feasibleish().lists(); // &'engine _
                         Box::new(move |node: NodeIndex, _start: NodeIndex| {
                             lists.outgoing_for(node).unwrap_or(&[])
                         })
                     };
-
                     let get_incoming = {
                         let lists = prox_ref.any_feasibleish().lists();
                         Box::new(move |node: NodeIndex, _start: NodeIndex| {
@@ -143,32 +230,175 @@ where
                         })
                     };
 
-                    search_context.operators_mut().add_operator(Box::new(
+                    // ----- Operators -----
+                    // ----- Operators -----
+                    // 1) Relocate neighbors (best improvement)
+                    search_ctx.operators_mut().add_operator(Box::new(
                         RelocateNeighborsBestImprovement::new(
-                            false,
-                            Box::new(|| {
-                                // None = unlimited; or e.g. Some(NonZeroUsize::new(50_000).unwrap())
-                                Some(NonZeroUsize::new(50_000).unwrap())
-                            }),
-                            Some(get_outgoing),
-                            Some(get_incoming),
+                            /*same_chain_only=*/ false,
+                            Box::new(move || cfg_t.relocate_scan_cap),
+                            Some(get_outgoing.clone()),
+                            Some(get_incoming.clone()),
                             None,
                         ),
                     ));
 
+                    // 2) Assign any unassigned node (first feasible)
+                    search_ctx
+                        .operators_mut()
+                        .add_operator(Box::new(AssignUnassignedFirstFeasible::new()));
+
+                    // 3) Swap neighbors (best improvement)
+                    search_ctx.operators_mut().add_operator(Box::new(
+                        SwapNeighborsBestImprovement::new(
+                            /*same_chain_only=*/ false,
+                            Box::new(move || cfg_t.relocate_scan_cap),
+                            Some(get_outgoing.clone()),
+                            Some(get_incoming.clone()),
+                            None,
+                        ),
+                    ));
+
+                    // 4) Random-blind swap (lightweight diversification)
+                    search_ctx.operators_mut().add_operator(Box::new(
+                        RandomSwapNeighborsBlind::new(
+                            /*same_chain_only=*/ false,
+                            std::num::NonZeroUsize::new(256).unwrap(),
+                            Some(get_outgoing.clone()),
+                            Some(get_incoming.clone()),
+                            None,
+                            Box::new(|n| {
+                                if n <= 1 {
+                                    0
+                                } else {
+                                    rand::rng().random_range(0..n)
+                                }
+                            }),
+                        ),
+                    ));
+
+                    search_ctx.operators_mut().add_operator(Box::new(
+                        RandomSwapNeighborsBlind::new(
+                            /*same_chain_only=*/ true,
+                            std::num::NonZeroUsize::new(256).unwrap(),
+                            Some(get_outgoing.clone()),
+                            Some(get_incoming.clone()),
+                            None,
+                            Box::new(|n| {
+                                if n <= 1 {
+                                    0
+                                } else {
+                                    rand::rng().random_range(0..n)
+                                }
+                            }),
+                        ),
+                    ));
+
+                    // 5) Cross-exchange (best improvement)
+                    search_ctx.operators_mut().add_operator(Box::new(
+                        CrossExchangeBestImprovement::new(
+                            /*same_chain_only=*/ false,
+                            cfg_t.cross_exchange_scan_cap,
+                        ),
+                    ));
+
+                    search_ctx.operators_mut().add_operator(Box::new(
+                        CrossExchangeBestImprovement::new(
+                            /*same_chain_only=*/ true,
+                            cfg_t.cross_exchange_scan_cap,
+                        ),
+                    ));
+
+                    // 6) Or-opt (block relocate) with small K
+                    search_ctx.operators_mut().add_operator(Box::new(
+                        OrOptKNeighborsBestImprovement::new(
+                            /*same_chain_only=*/ false,
+                            /*max_k=*/ 3,
+                            Box::new(move || cfg_t.relocate_scan_cap),
+                            Some(get_outgoing.clone()),
+                            Some(get_incoming.clone()),
+                            None,
+                        ),
+                    ));
+
+                    search_ctx.operators_mut().add_operator(Box::new(
+                        OrOptKNeighborsBestImprovement::new(
+                            /*same_chain_only=*/ true,
+                            /*max_k=*/ 3,
+                            Box::new(move || cfg_t.relocate_scan_cap),
+                            Some(get_outgoing.clone()),
+                            Some(get_incoming.clone()),
+                            None,
+                        ),
+                    ));
+
+                    // 7) 2-opt reverse (intra-chain)
+                    search_ctx.operators_mut().add_operator(Box::new(
+                        TwoOptReverseBestImprovement::new(
+                            /*same_chain_only=*/ false,
+                            cfg_t.cross_exchange_scan_cap,
+                        ),
+                    ));
+
+                    search_ctx
+                        .pertubations_mut()
+                        .push(Box::new(BestInsertionRuinRepair::new(
+                            40,
+                            None,
+                            GreedyScheduler,
+                        )));
+
+                    search_ctx
+                        .pertubations_mut()
+                        .push(Box::new(BestInsertionRuinRepair::new(
+                            10,
+                            Some(10_000),
+                            GreedyScheduler,
+                        )));
+
+                    // 9) Regret-K insert to reinsert isolated nodes more selectively
+                    search_ctx
+                        .operators_mut()
+                        .add_operator(Box::new(RegretKInsert::new(
+                            std::num::NonZeroUsize::new(2).unwrap(),
+                            cfg_t.greedy_ruin_scan_cap,
+                            GreedyScheduler,
+                        )));
+
+                    search_ctx
+                        .pertubations_mut()
+                        .push(Box::new(RandomWalkRuinRepair::new(
+                            0.2,
+                            Some(10_000),
+                            GreedyScheduler,
+                        )));
+
+                    search_ctx
+                        .pertubations_mut()
+                        .push(Box::new(RandomWalkRuinRepair::new(
+                            0.05,
+                            Some(10_000),
+                            GreedyScheduler,
+                        )));
+
+                    // ----- SA params (per worker) -----
                     let sa_params = SAParams {
-                        time_limit: per_thread_time,
-                        t_start: 500.0,
-                        t_end: 1e-3,
+                        time_limit: per_worker_time,
+                        t_start: cfg_t.sa_t_start,
+                        t_end: cfg_t.sa_t_end,
                         seed: 0xBEEF_CA_FE ^ (tid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-                        randomize_ops: 0.85,
+                        randomize_ops: cfg_t.sa_randomize_ops,
+                        // This field should exist in your Search::SAParams
+                        stagnation_iters: cfg_t.sa_stagnation_iters,
                     };
 
-                    let search = Search::new(search_context);
+                    // Run search
+                    let search = Search::new(search_ctx);
                     search.run_sa_time_cap(sa_params)
                 }));
             }
 
+            // Join
             for h in handles {
                 if let Ok(snap) = h.join() {
                     snapshots.push(snap);
@@ -176,6 +406,7 @@ where
             }
         });
 
+        // Pick best snapshot (lowest true cost)
         let best_snapshot_opt = snapshots
             .into_iter()
             .min_by(|a, b| a.true_cost.cmp(&b.true_cost));
@@ -183,6 +414,7 @@ where
         let best_snapshot = match best_snapshot_opt {
             Some(s) => s,
             None => {
+                // Fallback to exporting the opening if nothing came back (shouldn’t happen).
                 return initial_state
                     .try_into()
                     .expect("initial state export must succeed");
@@ -217,15 +449,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
     use berth_alloc_model::{prelude::SolutionView, problem::loader::ProblemLoader};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn test_load_all_instances_from_workspace_root_instances_folder_and_create_engine() {
         use std::fs;
-        use std::path::{Path, PathBuf};
 
         fn find_instances_dir() -> Option<PathBuf> {
             let mut cur: Option<&Path> = Some(Path::new(env!("CARGO_MANIFEST_DIR")));
@@ -287,7 +517,12 @@ mod tests {
             )
             .expect("Failed to create SolverEngine");
 
-            let solution = engine.solve_with_time_budget(Duration::from_secs(1));
+            // Use config path (keeps old behavior too)
+            let mut cfg = EngineConfig::default();
+            cfg.total_time = Duration::from_millis(1000);
+            cfg.num_workers = 1;
+
+            let solution = engine.solve_with_config(cfg);
             // Basic sanity: solution flexible assignments count <= requests.
             assert!(
                 solution.flexible_assignments().iter().count()

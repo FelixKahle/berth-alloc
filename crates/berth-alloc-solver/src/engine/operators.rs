@@ -19,9 +19,10 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::search::operator::traits::NeighborhoodOperator;
 use berth_alloc_core::{math::emwa::Ewma, prelude::Cost};
 use num_traits::{CheckedAdd, CheckedSub};
+
+use crate::search::operator::NeighborhoodOperator;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NeighborhoodOperatorStats {

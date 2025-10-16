@@ -248,19 +248,19 @@ fn build_lists_with<S: Copy + Ord>(
 fn invert_lists(n: usize, outgoing: &[Vec<NodeIndex>]) -> Vec<Vec<NodeIndex>> {
     let mut indeg = vec![0usize; n];
     for row in outgoing {
-        for j in row {
+        for &j in row {
             indeg[j.get()] += 1;
         }
     }
 
     let mut incoming: Vec<Vec<NodeIndex>> = Vec::with_capacity(n);
-    for j in indeg.iter().take(n) {
-        incoming.push(Vec::with_capacity(indeg[*j]));
+    for (_, &deg) in indeg.iter().enumerate() {
+        incoming.push(Vec::with_capacity(deg));
     }
 
     for (i, row) in outgoing.iter().enumerate() {
         let ni = NodeIndex::new(i);
-        for j in row {
+        for &j in row {
             incoming[j.get()].push(ni);
         }
     }

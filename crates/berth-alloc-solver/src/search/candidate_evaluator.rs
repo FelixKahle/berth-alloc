@@ -25,7 +25,9 @@ use crate::{
     eval::objective::Objective,
     model::{index::RequestIndex, solver_model::SolverModel},
     scheduling::traits::Scheduler,
-    search::{filter::traits::FeasibilityFilter, operator::patch::VarPatch},
+    search::{
+        candidate::NeighborhoodCandidate, filter::traits::FeasibilityFilter, patch::VarPatch,
+    },
     state::{
         chain_set::{delta::ChainSetDelta, overlay::ChainSetOverlay, view::ChainSetView},
         search_state::SolverSearchState,
@@ -33,45 +35,6 @@ use crate::{
 };
 use berth_alloc_core::prelude::Cost;
 use num_traits::{CheckedAdd, CheckedSub, Zero};
-
-/// Represents a fully evaluated, feasible "move" that a search algorithm can apply.
-///
-/// This struct is the output of the `CandidateEvaluator`. It contains everything the
-/// main search loop needs to accept a change: the structural `delta`, the resulting
-/// changes to decision variables, and the calculated change in cost (for both the
-/// true and search objectives).
-#[derive(Debug, Clone)]
-pub struct NeighborhoodCandidate<T> {
-    /// The structural change to the chain set (e.g., "move request 5 after request 10").
-    pub delta: ChainSetDelta,
-    /// A sparse list of changes to the `IntervalVar`s, resulting from re-scheduling.
-    pub interval_var_patch: Vec<VarPatch<IntervalVar<T>>>,
-    /// A sparse list of changes to the `DecisionVar`s, resulting from re-scheduling.
-    pub decision_vars_patch: Vec<VarPatch<DecisionVar<T>>>,
-    /// The incremental change in cost according to the "true" objective function.
-    pub true_delta_cost: Cost,
-    /// The incremental change in cost according to the "search" objective function.
-    pub search_delta_cost: Cost,
-}
-
-impl<T> NeighborhoodCandidate<T> {
-    #[inline]
-    pub fn new(
-        delta: ChainSetDelta,
-        interval_var_patch: Vec<VarPatch<IntervalVar<T>>>,
-        decision_vars_patch: Vec<VarPatch<DecisionVar<T>>>,
-        true_delta_cost: Cost,
-        search_delta_cost: Cost,
-    ) -> Self {
-        Self {
-            delta,
-            interval_var_patch,
-            decision_vars_patch,
-            true_delta_cost,
-            search_delta_cost,
-        }
-    }
-}
 
 /// A reusable, temporary workspace for evaluating a candidate move.
 ///

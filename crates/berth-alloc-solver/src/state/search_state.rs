@@ -26,7 +26,7 @@ use crate::{
         index::{BerthIndex, RequestIndex},
         solver_model::SolverModel,
     },
-    search::operator::runner::NeighborhoodCandidate,
+    search::candidate::NeighborhoodCandidate,
     state::chain_set::base::ChainSet,
 };
 use berth_alloc_core::prelude::Cost;

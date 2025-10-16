@@ -19,13 +19,26 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod assign;
-pub mod cross_exchange;
-pub mod or_opt;
-pub mod pop;
-pub mod regret;
-pub mod relocate;
-pub mod ruin;
-pub mod shaw;
-pub mod swap;
-pub mod two_opt_reverse;
+use crate::{
+    core::{decisionvar::DecisionVar, intervalvar::IntervalVar},
+    eval::ArcEvaluator,
+    state::{chain_set::delta::ChainSetDelta, search_state::SolverSearchState},
+};
+use num_traits::{CheckedAdd, CheckedSub};
+use rand_chacha::ChaCha8Rng;
+
+pub trait Perturbation<T>
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub,
+{
+    fn name(&self) -> &str;
+
+    fn apply<'state, 'model, 'problem>(
+        &self,
+        search_state: &'state SolverSearchState<'model, 'problem, T>,
+        arc_eval: &ArcEvaluator,
+        ivars: &mut [IntervalVar<T>],
+        dvars: &mut [DecisionVar<T>],
+        rng: &mut ChaCha8Rng,
+    ) -> ChainSetDelta;
+}
