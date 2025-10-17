@@ -26,7 +26,7 @@ use crate::{
         asg::{AssignmentContainer, AssignmentView},
         err::AssignmentOverlapError,
         prob::Problem,
-        req::RequestIdentifier,
+        req::{RequestIdentifier, RequestView},
     },
     validation::err::{CrossValidationError, RequestIdNotUniqueError},
 };
@@ -791,7 +791,7 @@ mod more_tests {
         let mut berths = BerthContainer::new();
         berths.insert(b1.clone());
 
-        let mut prob_flex = RequestContainer::<FlexibleKind, i64>::new();
+        let mut prob_flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
         prob_flex.insert(req_needed.clone());
 
         let prob = Problem::new(berths, AssignmentContainer::new(), prob_flex).unwrap();
@@ -811,7 +811,7 @@ mod more_tests {
         let mut berths = BerthContainer::new();
         berths.insert(b1.clone());
 
-        let mut prob_flex = RequestContainer::<FlexibleKind, i64>::new();
+        let mut prob_flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
         prob_flex.insert(req_needed.clone());
 
         let prob = Problem::new(berths, AssignmentContainer::new(), prob_flex).unwrap();
@@ -876,7 +876,7 @@ mod more_tests {
         let mut berths = BerthContainer::new();
         berths.insert(b1);
 
-        let mut prob_flex = RequestContainer::<FlexibleKind, i64>::new();
+        let mut prob_flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
         prob_flex.insert(r);
 
         let prob = Problem::new(berths, AssignmentContainer::new(), prob_flex).unwrap();
@@ -897,7 +897,7 @@ mod more_tests {
         let prob = Problem::new(
             berths,
             AssignmentContainer::new(),
-            RequestContainer::<FlexibleKind, i64>::new(),
+            RequestContainer::<i64, Request<FlexibleKind, i64>>::new(),
         )
         .unwrap();
 

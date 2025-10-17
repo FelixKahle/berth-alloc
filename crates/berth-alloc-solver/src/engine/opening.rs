@@ -19,8 +19,14 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod core;
-pub mod engine;
-pub mod model;
-pub mod search;
-pub mod state;
+use crate::state::solver_state::SolverState;
+use berth_alloc_model::prelude::Problem;
+use std::sync::Arc;
+
+pub trait OpeningStrategy<T: Copy + Ord> {
+    type Error: std::fmt::Debug;
+
+    fn build<'p>(&self, problem: &'p Problem<T>) -> Result<SolverState<'p, T>, Self::Error>;
+}
+
+pub type OpeningProvider<'p, T> = Arc<dyn Fn() -> Option<SolverState<'p, T>> + Send + Sync + 'p>;

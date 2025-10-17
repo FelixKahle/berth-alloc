@@ -130,6 +130,14 @@ impl<T: Ord + Copy> Berth<T> {
         self.horizon_opt()
             .unwrap_or_else(|| TimePoint::new(T::zero()))
     }
+
+    #[inline]
+    pub fn horizon_interval(&self) -> TimeInterval<T>
+    where
+        T: Zero,
+    {
+        TimeInterval::new(TimePoint::new(T::zero()), self.horizon())
+    }
 }
 
 #[repr(transparent)]

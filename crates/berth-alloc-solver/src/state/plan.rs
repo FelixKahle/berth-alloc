@@ -24,25 +24,49 @@ use berth_alloc_core::prelude::Cost;
 
 #[derive(Debug, Clone)]
 pub struct Plan<'p, T: Copy + Ord> {
+    /// Full snapshot of the proposed ledger (source of truth).
     pub ledger: Ledger<'p, T>,
+    /// Sparse terminal updates to apply to the current state.
     pub terminal_delta: TerminalDelta<'p, T>,
+    /// Cost change relative to the *base* state this plan was built against.
     pub delta_cost: Cost,
-    pub unassigned: usize,
+    /// Unassigned change (can be negative). Relative to the *base* state.
+    pub delta_unassigned: i32,
 }
 
 impl<'p, T: Copy + Ord> Plan<'p, T> {
     #[inline]
-    pub fn new(
+    pub fn new_delta(
         ledger: Ledger<'p, T>,
         terminal_delta: TerminalDelta<'p, T>,
         delta_cost: Cost,
-        unassigned: usize,
+        delta_unassigned: i32,
     ) -> Self {
         Self {
             ledger,
             terminal_delta,
             delta_cost,
-            unassigned,
+            delta_unassigned,
+        }
+    }
+
+    /// Convenience: build deltas from absolute “new” values + a base snapshot.
+    #[inline]
+    pub fn from_absolute(
+        ledger: Ledger<'p, T>,
+        terminal_delta: TerminalDelta<'p, T>,
+        new_cost: Cost,
+        new_unassigned: usize,
+        base_cost: Cost,
+        base_unassigned: usize,
+    ) -> Self {
+        let delta_cost = new_cost - base_cost;
+        let delta_unassigned = new_unassigned as i32 - base_unassigned as i32;
+        Self {
+            ledger,
+            terminal_delta,
+            delta_cost,
+            delta_unassigned,
         }
     }
 }

@@ -19,10 +19,9 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use std::ops::Mul;
-
 use berth_alloc_core::prelude::Cost;
 use num_traits::{CheckedAdd, CheckedSub};
+use std::ops::Mul;
 
 use crate::state::registry::ledger::Ledger;
 
@@ -45,11 +44,7 @@ impl Fitness {
 impl PartialOrd for Fitness {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        // First compare by unassigned requests, then by cost
-        match self.unassigned_requests.cmp(&other.unassigned_requests) {
-            std::cmp::Ordering::Equal => self.cost.partial_cmp(&other.cost),
-            ord => Some(ord),
-        }
+        Some(self.cmp(other))
     }
 }
 
@@ -86,7 +81,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use berth_alloc_model::problem::asg::AssignmentView;
+    use berth_alloc_model::problem::{asg::AssignmentView, req::RequestView};
 
     use super::*;
 
@@ -173,8 +168,7 @@ mod tests {
         let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
 
         // two flexible requests on berth 1
-        let mut flex =
-            berth_alloc_model::problem::req::RequestContainer::<FlexibleKind, i64>::new();
+        let mut flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
         let mut pt = BTreeMap::new();
         pt.insert(BerthIdentifier::new(1), td(10));
         let r1 =
@@ -219,8 +213,7 @@ mod tests {
 
         let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
 
-        let mut flex =
-            berth_alloc_model::problem::req::RequestContainer::<FlexibleKind, i64>::new();
+        let mut flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
         let mut pt = BTreeMap::new();
         pt.insert(b1_id, td(10));
         let r1 =
@@ -283,8 +276,7 @@ mod tests {
         fixed.insert(af);
 
         // One flexible request, unassigned
-        let mut flex =
-            berth_alloc_model::problem::req::RequestContainer::<FlexibleKind, i64>::new();
+        let mut flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
         let mut pt_flex = BTreeMap::new();
         pt_flex.insert(b1_id, td(5));
         let rflex =

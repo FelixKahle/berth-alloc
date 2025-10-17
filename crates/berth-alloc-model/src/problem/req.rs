@@ -27,7 +27,7 @@ use crate::{
     },
 };
 use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval};
-use num_traits::CheckedSub;
+use num_traits::{CheckedAdd, CheckedSub};
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::Display,
@@ -42,6 +42,175 @@ impl IdentifierMarkerName for RequestIdentifierMarker {
 }
 
 pub type RequestIdentifier = Identifier<u32, RequestIdentifierMarker>;
+
+pub trait RequestView<T: Ord + Copy> {
+    fn id(&self) -> RequestIdentifier;
+    fn feasible_window(&self) -> TimeInterval<T>;
+    fn weight(&self) -> Cost;
+    fn processing_times(&self) -> &BTreeMap<BerthIdentifier, TimeDelta<T>>;
+    fn iter_allowed_berths_ids<'a>(&'a self) -> impl Iterator<Item = BerthIdentifier> + 'a
+    where
+        T: 'a,
+    {
+        self.processing_times().keys().copied()
+    }
+
+    #[inline]
+    fn processing_time_for(&self, berth_id: BerthIdentifier) -> Option<TimeDelta<T>> {
+        self.processing_times().get(&berth_id).copied()
+    }
+
+    #[inline]
+    fn is_berth_feasible(&self, berth_id: BerthIdentifier) -> bool {
+        self.processing_times().contains_key(&berth_id)
+    }
+
+    #[inline]
+    fn request_allowed_degree(&self) -> usize {
+        self.processing_times().len()
+    }
+
+    #[inline]
+    fn request_slack(&self) -> TimeDelta<T>
+    where
+        T: CheckedAdd + CheckedSub + Copy + Ord + num_traits::Zero,
+    {
+        let best_pt = self
+            .processing_times()
+            .values()
+            .copied()
+            .min()
+            .unwrap_or_else(TimeDelta::zero);
+
+        self.feasible_window().length() - best_pt
+    }
+
+    #[inline]
+    fn best_processing_time(&self) -> Option<TimeDelta<T>> {
+        self.processing_times().values().copied().min()
+    }
+
+    #[inline]
+    fn worst_processing_time(&self) -> Option<TimeDelta<T>> {
+        self.processing_times().values().copied().max()
+    }
+
+    #[inline]
+    fn range_processing_time(&self) -> Option<TimeDelta<T>>
+    where
+        T: Ord + Copy + CheckedSub,
+    {
+        Some(self.worst_processing_time()? - self.best_processing_time()?)
+    }
+
+    #[inline]
+    fn slack_ratio(&self) -> f64
+    where
+        T: CheckedAdd + CheckedSub + num_traits::Zero + num_traits::ToPrimitive,
+    {
+        let len = self
+            .feasible_window()
+            .length()
+            .value()
+            .to_f64()
+            .unwrap_or(0.0);
+        if len == 0.0 {
+            return 0.0;
+        }
+        let slack = self.request_slack().value().to_f64().unwrap_or(0.0);
+        (slack / len).clamp(0.0, 1.0)
+    }
+
+    #[inline]
+    fn tightness_min(&self) -> f64
+    where
+        T: CheckedSub + num_traits::ToPrimitive + num_traits::Zero,
+    {
+        let len = self
+            .feasible_window()
+            .length()
+            .value()
+            .to_f64()
+            .unwrap_or(0.0);
+        if len == 0.0 {
+            return 1.0;
+        }
+        let pt = self
+            .best_processing_time()
+            .unwrap_or_else(TimeDelta::zero)
+            .value()
+            .to_f64()
+            .unwrap_or(0.0);
+        (pt / len).clamp(0.0, 1.0)
+    }
+
+    #[inline]
+    fn tightness_max(&self) -> f64
+    where
+        T: CheckedSub + num_traits::ToPrimitive + num_traits::Zero,
+    {
+        let len = self
+            .feasible_window()
+            .length()
+            .value()
+            .to_f64()
+            .unwrap_or(0.0);
+        if len == 0.0 {
+            return 1.0;
+        }
+        let pt = self
+            .worst_processing_time()
+            .unwrap_or_else(TimeDelta::zero)
+            .value()
+            .to_f64()
+            .unwrap_or(0.0);
+        (pt / len).clamp(0.0, 1.0)
+    }
+
+    #[inline]
+    fn berth_preference(&self) -> Vec<(BerthIdentifier, TimeDelta<T>)> {
+        let mut v: Vec<_> = self
+            .processing_times()
+            .iter()
+            .map(|(b, d)| (*b, *d))
+            .collect();
+        v.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        v
+    }
+
+    #[inline]
+    fn time_fraction_on(&self, bid: BerthIdentifier) -> Option<f64>
+    where
+        T: CheckedSub + num_traits::ToPrimitive,
+    {
+        let pt = self.processing_time_for(bid)?;
+        let len = self
+            .feasible_window()
+            .length()
+            .value()
+            .to_f64()
+            .unwrap_or(0.0);
+        if len == 0.0 {
+            return Some(0.0);
+        }
+        let x = pt.value().to_f64().unwrap_or(0.0);
+        Some((x / len).clamp(0.0, 1.0))
+    }
+
+    #[inline]
+    fn allowed_signature(&self) -> std::collections::BTreeSet<BerthIdentifier> {
+        self.processing_times().keys().copied().collect()
+    }
+
+    #[inline]
+    fn latest_start_offset_for(&self, bid: BerthIdentifier) -> Option<TimeDelta<T>>
+    where
+        T: CheckedSub,
+    {
+        self.processing_time_for(bid)
+            .map(|pt| self.feasible_window().length() - pt)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Request<K: Kind, T: Ord + Copy> {
@@ -117,40 +286,35 @@ impl<K: Kind, T: Ord + Copy + CheckedSub> Request<K, T> {
             _phantom: std::marker::PhantomData,
         })
     }
+}
 
+impl<K: Kind, T: Ord + Copy> RequestView<T> for Request<K, T> {
     #[inline]
-    pub fn id(&self) -> RequestIdentifier {
+    fn id(&self) -> RequestIdentifier {
         self.id
     }
 
     #[inline]
-    pub fn feasible_window(&self) -> TimeInterval<T> {
+    fn feasible_window(&self) -> TimeInterval<T> {
         self.feasible_window
     }
 
     #[inline]
-    pub fn weight(&self) -> Cost {
+    fn weight(&self) -> Cost {
         self.weight
     }
 
     #[inline]
-    pub fn processing_times(&self) -> &BTreeMap<BerthIdentifier, TimeDelta<T>> {
+    fn processing_times(&self) -> &BTreeMap<BerthIdentifier, TimeDelta<T>> {
         &self.processing_times
     }
 
     #[inline]
-    pub fn iter_allowed_berths_ids(&self) -> impl Iterator<Item = BerthIdentifier> + '_ {
+    fn iter_allowed_berths_ids<'a>(&'a self) -> impl Iterator<Item = BerthIdentifier> + 'a
+    where
+        T: 'a,
+    {
         self.processing_times.keys().copied()
-    }
-
-    #[inline]
-    pub fn processing_time_for(&self, berth_id: BerthIdentifier) -> Option<TimeDelta<T>> {
-        self.processing_times.get(&berth_id).copied()
-    }
-
-    #[inline]
-    pub fn is_berth_feasible(&self, berth_id: BerthIdentifier) -> bool {
-        self.processing_times.contains_key(&berth_id)
     }
 }
 
@@ -173,78 +337,205 @@ impl<K: Kind, T: Ord + Copy + Display> std::fmt::Display for Request<K, T> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AnyRequest<T: Ord + Copy> {
+    Fixed(Request<FixedKind, T>),
+    Flexible(Request<FlexibleKind, T>),
+}
+
+impl<T: Ord + Copy> RequestView<T> for AnyRequest<T> {
+    fn id(&self) -> RequestIdentifier {
+        match self {
+            AnyRequest::Fixed(r) => r.id(),
+            AnyRequest::Flexible(r) => r.id(),
+        }
+    }
+
+    fn feasible_window(&self) -> TimeInterval<T> {
+        match self {
+            AnyRequest::Fixed(r) => r.feasible_window(),
+            AnyRequest::Flexible(r) => r.feasible_window(),
+        }
+    }
+
+    fn weight(&self) -> Cost {
+        match self {
+            AnyRequest::Fixed(r) => r.weight(),
+            AnyRequest::Flexible(r) => r.weight(),
+        }
+    }
+
+    fn processing_times(&self) -> &BTreeMap<BerthIdentifier, TimeDelta<T>> {
+        match self {
+            AnyRequest::Fixed(r) => r.processing_times(),
+            AnyRequest::Flexible(r) => r.processing_times(),
+        }
+    }
+}
+
+impl<T: Copy + Ord + std::fmt::Display> std::fmt::Display for AnyRequest<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnyRequest::Fixed(r) => write!(f, "{}", r),
+            AnyRequest::Flexible(r) => write!(f, "{}", r),
+        }
+    }
+}
+
+impl<T: Copy + Ord> From<Request<FixedKind, T>> for AnyRequest<T> {
+    #[inline]
+    fn from(r: Request<FixedKind, T>) -> Self {
+        AnyRequest::Fixed(r)
+    }
+}
+
+impl<T: Copy + Ord> From<Request<FlexibleKind, T>> for AnyRequest<T> {
+    #[inline]
+    fn from(r: Request<FlexibleKind, T>) -> Self {
+        AnyRequest::Flexible(r)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AnyRequestRef<'a, T: Ord + Copy> {
+    Fixed(&'a Request<FixedKind, T>),
+    Flexible(&'a Request<FlexibleKind, T>),
+}
+
+impl<'a, T: Ord + Copy> RequestView<T> for AnyRequestRef<'a, T> {
+    fn id(&self) -> RequestIdentifier {
+        match self {
+            AnyRequestRef::Fixed(r) => r.id(),
+            AnyRequestRef::Flexible(r) => r.id(),
+        }
+    }
+
+    fn feasible_window(&self) -> TimeInterval<T> {
+        match self {
+            AnyRequestRef::Fixed(r) => r.feasible_window(),
+            AnyRequestRef::Flexible(r) => r.feasible_window(),
+        }
+    }
+
+    fn weight(&self) -> Cost {
+        match self {
+            AnyRequestRef::Fixed(r) => r.weight(),
+            AnyRequestRef::Flexible(r) => r.weight(),
+        }
+    }
+
+    fn processing_times(&self) -> &BTreeMap<BerthIdentifier, TimeDelta<T>> {
+        match self {
+            AnyRequestRef::Fixed(r) => r.processing_times(),
+            AnyRequestRef::Flexible(r) => r.processing_times(),
+        }
+    }
+}
+
+impl<'a, T: Copy + Ord + std::fmt::Display> std::fmt::Display for AnyRequestRef<'a, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnyRequestRef::Fixed(r) => write!(f, "{}", r),
+            AnyRequestRef::Flexible(r) => write!(f, "{}", r),
+        }
+    }
+}
+
+impl<'a, T: Copy + Ord> From<&'a Request<FixedKind, T>> for AnyRequestRef<'a, T> {
+    #[inline]
+    fn from(r: &'a Request<FixedKind, T>) -> Self {
+        AnyRequestRef::Fixed(r)
+    }
+}
+
+impl<'a, T: Copy + Ord> From<&'a Request<FlexibleKind, T>> for AnyRequestRef<'a, T> {
+    #[inline]
+    fn from(r: &'a Request<FlexibleKind, T>) -> Self {
+        AnyRequestRef::Flexible(r)
+    }
+}
+
 #[repr(transparent)]
 #[derive(Debug, Clone)]
-pub struct RequestContainer<K: Kind, T: Ord + Copy>(HashMap<RequestIdentifier, Request<K, T>>);
+pub struct RequestContainer<T: Ord + Copy, V: RequestView<T>> {
+    inner: HashMap<RequestIdentifier, V>,
+    _phantom: std::marker::PhantomData<T>,
+}
 
-impl<K: Kind, T: Copy + Ord> Default for RequestContainer<K, T> {
+impl<T: Copy + Ord, V: RequestView<T>> Default for RequestContainer<T, V> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<K: Kind, T: Copy + Ord> RequestContainer<K, T> {
+impl<T: Copy + Ord, V: RequestView<T>> RequestContainer<T, V> {
     #[inline]
     pub fn new() -> Self {
-        Self(HashMap::new())
+        Self {
+            inner: HashMap::new(),
+            _phantom: std::marker::PhantomData,
+        }
     }
 
     #[inline]
     pub fn with_capacity(cap: usize) -> Self {
-        Self(HashMap::with_capacity(cap))
+        Self {
+            inner: HashMap::with_capacity(cap),
+            _phantom: std::marker::PhantomData,
+        }
     }
 
     #[inline]
-    pub fn insert(&mut self, request: Request<K, T>) -> Option<Request<K, T>>
+    pub fn insert(&mut self, request: V) -> Option<V>
     where
         T: CheckedSub,
     {
-        self.0.insert(request.id(), request)
+        self.inner.insert(request.id(), request)
     }
 
     #[inline]
-    pub fn remove(&mut self, id: RequestIdentifier) -> Option<Request<K, T>> {
-        self.0.remove(&id)
+    pub fn remove(&mut self, id: RequestIdentifier) -> Option<V> {
+        self.inner.remove(&id)
     }
 
     #[inline]
     pub fn contains_id(&self, id: RequestIdentifier) -> bool {
-        self.0.contains_key(&id)
+        self.inner.contains_key(&id)
     }
 
     #[inline]
-    pub fn contains_request(&self, request: &Request<K, T>) -> bool
+    pub fn contains_request(&self, request: &V) -> bool
     where
         T: CheckedSub,
     {
         let id = request.id();
-        self.0.contains_key(&id)
+        self.inner.contains_key(&id)
     }
 
     #[inline]
-    pub fn get(&self, id: RequestIdentifier) -> Option<&Request<K, T>> {
-        self.0.get(&id)
+    pub fn get(&self, id: RequestIdentifier) -> Option<&V> {
+        self.inner.get(&id)
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.inner.len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.inner.is_empty()
     }
 
     #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = &Request<K, T>> {
-        self.0.values()
+    pub fn iter(&self) -> impl Iterator<Item = &V> {
+        self.inner.values()
     }
 }
 
-impl<K: Kind, T: Copy + Ord + CheckedSub> FromIterator<Request<K, T>> for RequestContainer<K, T> {
+impl<T: Copy + Ord + CheckedSub, V: RequestView<T>> FromIterator<V> for RequestContainer<T, V> {
     #[inline]
-    fn from_iter<I: IntoIterator<Item = Request<K, T>>>(iter: I) -> Self {
+    fn from_iter<I: IntoIterator<Item = V>>(iter: I) -> Self {
         let mut c = Self::new();
         for r in iter {
             c.insert(r);

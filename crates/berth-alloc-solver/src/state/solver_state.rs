@@ -124,21 +124,26 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cos
 
         #[cfg(debug_assertions)]
         let prev_fit = self.fitness.clone();
+
+        // Swap in proposed ledger then apply terminal delta
         self.ledger = plan.ledger;
         let res = self.terminal_occupancy.apply_delta(plan.terminal_delta);
         debug_assert!(res.is_ok(), "Failed to apply terminal delta: {:?}", res);
+
+        // Recompute fitness from the new ledger
         self.fitness = (&self.ledger).into();
 
         #[cfg(debug_assertions)]
         {
             debug_assert_eq!(
-                self.fitness.unassigned_requests, plan.unassigned,
-                "Plan.unassigned should match the post-apply unassigned count"
+                self.fitness.unassigned_requests as i32,
+                prev_fit.unassigned_requests as i32 + plan.delta_unassigned,
+                "prev_unassigned + delta_unassigned must equal new unassigned"
             );
             debug_assert_eq!(
                 self.fitness.cost,
                 prev_fit.cost + plan.delta_cost,
-                "prev_cost + plan.delta_cost must equal new cost"
+                "prev_cost + delta_cost must equal new cost"
             );
         }
     }
@@ -158,6 +163,16 @@ impl<'p, T: Copy + Ord> SolverStateView<'p, T> for SolverState<'p, T> {
     #[inline]
     fn fitness(&self) -> &Fitness {
         &self.fitness
+    }
+}
+
+impl<'p, T: Copy + Ord + std::fmt::Display> std::fmt::Display for SolverState<'p, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SolverState {{ cost: {}, unassigned_requests: {} }}",
+            self.fitness.cost, self.fitness.unassigned_requests
+        )
     }
 }
 
@@ -190,7 +205,7 @@ mod feasible_state_tests {
 
     use super::*;
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
-    use berth_alloc_model::prelude::*;
+    use berth_alloc_model::{prelude::*, problem::req::RequestView};
     use std::collections::BTreeMap;
 
     #[inline]
@@ -240,8 +255,7 @@ mod feasible_state_tests {
         let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
 
         // flexible: r1 (pt=10 on b1), r2 (pt=5 on b1)
-        let mut flex =
-            berth_alloc_model::problem::req::RequestContainer::<FlexibleKind, i64>::new();
+        let mut flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
         flex.insert(flex_req(1, (0, 200), &[(1, 10)], 1));
         flex.insert(flex_req(2, (0, 200), &[(1, 5)], 1));
 
@@ -309,14 +323,15 @@ mod feasible_state_tests {
 
         // Plan bookkeeping must match SolverState::apply_plan debug assertions
         let delta_cost = ledger1.cost() - st.fitness().cost;
-        let unassigned = ledger1.unassigned_request_count();
+        let delta_unassigned =
+            ledger1.unassigned_request_count() as i32 - st.fitness().unassigned_requests as i32;
 
         // Construct the plan using the updated ledger and delta
         let plan = Plan {
             ledger: ledger1,
             terminal_delta: delta,
             delta_cost,
-            unassigned,
+            delta_unassigned,
         };
 
         // Apply plan

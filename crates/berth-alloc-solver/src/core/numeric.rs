@@ -19,8 +19,34 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod core;
-pub mod engine;
-pub mod model;
-pub mod search;
-pub mod state;
+use berth_alloc_core::prelude::Cost;
+use num_traits::{CheckedAdd, CheckedSub, Zero};
+use std::ops::Mul;
+
+pub trait SolveNumeric:
+    Copy
+    + Ord
+    + CheckedAdd
+    + CheckedSub
+    + Zero
+    + Send
+    + Sync
+    + Into<Cost>
+    + Mul<Self, Output = Cost>
+    + std::fmt::Debug
+{
+}
+
+impl<T> SolveNumeric for T where
+    T: Copy
+        + Ord
+        + CheckedAdd
+        + CheckedSub
+        + Zero
+        + Send
+        + Sync
+        + Into<Cost>
+        + Mul<Self, Output = Cost>
+        + std::fmt::Debug
+{
+}

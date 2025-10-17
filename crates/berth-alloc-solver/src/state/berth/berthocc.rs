@@ -25,12 +25,22 @@ use crate::state::berth::err::{
 };
 use berth_alloc_core::prelude::*;
 use berth_alloc_model::prelude::*;
+use num_traits::Zero;
 use rangemap::RangeSet;
 
 pub trait BerthRead<'b, T: Copy + Ord> {
     fn is_free(&self, interval: TimeInterval<T>) -> bool;
     fn is_occupied(&self, interval: TimeInterval<T>) -> bool;
     fn berth(&self) -> &'b Berth<T>;
+
+    #[inline]
+    fn iter_free_intervals(&self) -> impl Iterator<Item = TimeInterval<T>>
+    where
+        T: Zero + 'b,
+    {
+        self.iter_free_intervals_in(self.berth().horizon_interval())
+    }
+
     fn iter_free_intervals_in(
         &self,
         window: TimeInterval<T>,

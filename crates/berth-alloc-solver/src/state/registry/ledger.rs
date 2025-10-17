@@ -24,7 +24,10 @@ use berth_alloc_core::prelude::{Cost, TimePoint};
 use berth_alloc_model::{
     common::{FixedKind, FlexibleKind},
     prelude::{Assignment, AssignmentContainer, Berth, Problem, Request, RequestContainer},
-    problem::asg::{AssignmentRef, AssignmentView},
+    problem::{
+        asg::{AssignmentRef, AssignmentView},
+        req::RequestView,
+    },
     validation,
 };
 use num_traits::{CheckedAdd, CheckedSub};
@@ -66,7 +69,7 @@ impl<'p, T: Copy + Ord> Ledger<'p, T> {
     }
 
     #[inline]
-    pub fn flexible_requests(&self) -> &RequestContainer<FlexibleKind, T>
+    pub fn flexible_requests(&self) -> &RequestContainer<T, Request<FlexibleKind, T>>
     where
         T: CheckedAdd + CheckedSub,
     {
@@ -253,8 +256,7 @@ mod tests {
         let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
 
         // flexible: r1 (pt=10 on b1), r2 (pt=5 on b1)
-        let mut flex =
-            berth_alloc_model::problem::req::RequestContainer::<FlexibleKind, i64>::new();
+        let mut flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
         flex.insert(flex_req(1, (0, 200), &[(1, 10)], 1));
         flex.insert(flex_req(2, (0, 200), &[(1, 5)], 1));
 
@@ -329,8 +331,7 @@ mod tests {
 
         let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
 
-        let mut flex =
-            berth_alloc_model::problem::req::RequestContainer::<FlexibleKind, i64>::new();
+        let mut flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
         flex.insert(flex_req(9, (10, 100), &[(1, 5)], 1));
 
         let prob = Problem::new(berths, fixed, flex).unwrap();
@@ -388,8 +389,7 @@ mod tests {
         fixed_cont.insert(af);
 
         // one flexible (unused in this test)
-        let mut flex =
-            berth_alloc_model::problem::req::RequestContainer::<FlexibleKind, i64>::new();
+        let mut flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
         flex.insert(flex_req(200, (0, 100), &[(1, 5)], 1));
 
         let prob = Problem::new(berths, fixed_cont, flex).unwrap();
@@ -430,8 +430,7 @@ mod tests {
 
         let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
 
-        let mut flex =
-            berth_alloc_model::problem::req::RequestContainer::<FlexibleKind, i64>::new();
+        let mut flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
         // r1: pt=10, weight=2
         flex.insert(flex_req(10, (0, 300), &[(1, 10)], 2));
         // r2: pt=15, weight=3

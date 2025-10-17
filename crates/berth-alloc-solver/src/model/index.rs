@@ -19,68 +19,60 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub trait IdentifierMarkerName: Copy {
-    const NAME: &'static str;
-}
-
 #[repr(transparent)]
-#[must_use]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Identifier<I, U>(I, core::marker::PhantomData<U>);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BerthIndex(pub usize);
 
-impl<I, U> Identifier<I, U> {
+impl BerthIndex {
     #[inline]
-    pub fn new(id: I) -> Self {
-        Self(id, core::marker::PhantomData)
+    pub const fn new(index: usize) -> Self {
+        Self(index)
     }
 
     #[inline]
-    pub fn value(&self) -> &I {
-        &self.0
-    }
-
-    #[inline]
-    pub fn into_inner(self) -> I {
+    pub const fn get(self) -> usize {
         self.0
     }
 }
 
-impl<I, U> std::fmt::Display for Identifier<I, U>
-where
-    I: std::fmt::Display,
-    U: IdentifierMarkerName,
-{
+impl std::fmt::Display for BerthIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}({})", U::NAME, self.0)
+        write!(f, "BerthIndex({})", self.0)
     }
 }
 
-pub trait Kind: Clone {
-    const NAME: &'static str;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct FixedKind;
-
-impl Kind for FixedKind {
-    const NAME: &'static str = "Fixed";
-}
-
-impl std::fmt::Display for FixedKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", Self::NAME)
+impl From<usize> for BerthIndex {
+    #[inline]
+    fn from(value: usize) -> Self {
+        Self::new(value)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct FlexibleKind;
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RequestIndex(pub usize);
 
-impl Kind for FlexibleKind {
-    const NAME: &'static str = "Flexible";
+impl RequestIndex {
+    #[inline]
+    pub const fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    #[inline]
+    pub const fn get(self) -> usize {
+        self.0
+    }
 }
 
-impl std::fmt::Display for FlexibleKind {
+impl std::fmt::Display for RequestIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", Self::NAME)
+        write!(f, "RequestIndex({})", self.0)
+    }
+}
+
+impl From<usize> for RequestIndex {
+    #[inline]
+    fn from(value: usize) -> Self {
+        Self::new(value)
     }
 }
