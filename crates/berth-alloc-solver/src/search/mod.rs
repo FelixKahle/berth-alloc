@@ -18,17 +18,3 @@
 // LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-use std::time::Instant;
-
-pub trait Clock: Send + Sync {
-    fn now(&self) -> Instant;
-}
-
-#[derive(Default, Debug, Clone, Copy)]
-pub struct SystemClock;
-impl Clock for SystemClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-}

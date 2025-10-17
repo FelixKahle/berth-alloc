@@ -19,7 +19,7 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::berth::err::{BerthApplyError, BerthUpdateError};
+use crate::state::berth::err::{BerthApplyError, BerthUpdateError};
 use berth_alloc_model::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

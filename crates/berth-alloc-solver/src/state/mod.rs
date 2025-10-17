@@ -19,21 +19,9 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::framework::state::SolverState;
-use berth_alloc_model::prelude::{Problem, SolutionRef};
-
-pub trait ConstructionSolver<T: Copy + Ord> {
-    type Error;
-
-    fn construct<'p>(&mut self, problem: &'p Problem<T>)
-    -> Result<SolverState<'p, T>, Self::Error>;
-}
-
-pub trait Solver<T: Copy + Ord> {
-    type Error;
-
-    fn solve<'p>(
-        &mut self,
-        problem: &'p Problem<T>,
-    ) -> Result<Option<SolutionRef<'p, T>>, Self::Error>;
-}
+pub mod berth;
+pub mod fitness;
+pub mod plan;
+pub mod registry;
+pub mod solver_state;
+pub mod terminal;

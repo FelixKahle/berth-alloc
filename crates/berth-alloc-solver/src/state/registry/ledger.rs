@@ -19,18 +19,16 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use std::ops::Mul;
-
-use crate::registry::err::{LedgerCommitError, LedgerUncomitError};
+use crate::state::registry::err::{LedgerCommitError, LedgerUncomitError};
 use berth_alloc_core::prelude::{Cost, TimePoint};
 use berth_alloc_model::{
     common::{FixedKind, FlexibleKind},
-    prelude::{
-        Assignment, AssignmentContainer, Berth, Problem, Request, RequestContainer, StateValidator,
-    },
+    prelude::{Assignment, AssignmentContainer, Berth, Problem, Request, RequestContainer},
     problem::asg::{AssignmentRef, AssignmentView},
+    validation,
 };
 use num_traits::{CheckedAdd, CheckedSub};
+use std::ops::Mul;
 
 #[derive(Debug, Clone)]
 pub struct Ledger<'p, T: Copy + Ord> {
@@ -86,22 +84,22 @@ impl<'p, T: Copy + Ord> Ledger<'p, T> {
         T: CheckedAdd + CheckedSub,
     {
         let assignment = AssignmentRef::new(request, berth, start_time)?;
-        StateValidator::validate_nooverlap_with(
+        validation::validate_nooverlap_with(
             self.problem().fixed_assignments(),
             self.commited_assignments(),
             self.problem(),
             &assignment,
         )?;
-        StateValidator::validate_no_extra_flexible_assignments_with(
+        validation::validate_no_extra_flexible_assignments_with(
             self.commited_assignments(),
             &assignment,
         )?;
-        StateValidator::validate_request_ids_unique_with(
+        validation::validate_request_ids_unique_with(
             self.problem().fixed_assignments(),
             self.commited_assignments(),
             &assignment,
         )?;
-        StateValidator::validate_no_extra_flexible_requests_with(
+        validation::validate_no_extra_flexible_requests_with(
             self.commited_assignments(),
             self.problem(),
             &assignment,
@@ -146,6 +144,14 @@ impl<'p, T: Copy + Ord> Ledger<'p, T> {
             .flexible_requests()
             .iter()
             .filter(move |r| self.commited.contains_id(r.id()))
+    }
+
+    #[inline]
+    pub fn unassigned_request_count(&self) -> usize
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        self.iter_unassigned_requests().count()
     }
 
     #[inline]

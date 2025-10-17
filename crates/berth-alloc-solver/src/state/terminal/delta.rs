@@ -19,7 +19,7 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::berth::berthocc::BerthOccupancy;
+use crate::state::berth::berthocc::BerthOccupancy;
 use berth_alloc_model::prelude::BerthIdentifier;
 
 #[derive(Debug, Clone)]

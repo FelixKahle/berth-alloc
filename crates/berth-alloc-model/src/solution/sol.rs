@@ -27,7 +27,7 @@ use crate::{
         req::RequestIdentifier,
     },
     solution::SolutionError,
-    validation::StateValidator,
+    validation,
 };
 use berth_alloc_core::prelude::Cost;
 use num_traits::{CheckedAdd, CheckedSub};
@@ -89,13 +89,13 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub> Solution<T> {
         flexible_assignments: AssignmentContainer<FlexibleKind, T, Assignment<FlexibleKind, T>>,
         problem: &Problem<T>,
     ) -> Result<Self, SolutionError> {
-        StateValidator::validate_no_extra_fixed_assignments(&fixed_assignments)?;
-        StateValidator::validate_no_extra_flexible_assignments(&flexible_assignments)?;
-        StateValidator::validate_request_ids_unique(&fixed_assignments, &flexible_assignments)?;
-        StateValidator::validate_all_fixed_assignments_present(&fixed_assignments, problem)?;
-        StateValidator::validate_all_flexible_assignments_present(&flexible_assignments, problem)?;
-        StateValidator::validate_no_extra_fixed_requests(&fixed_assignments, problem)?;
-        StateValidator::validate_no_extra_flexible_requests(&flexible_assignments, problem)?;
+        validation::validate_no_extra_fixed_assignments(&fixed_assignments)?;
+        validation::validate_no_extra_flexible_assignments(&flexible_assignments)?;
+        validation::validate_request_ids_unique(&fixed_assignments, &flexible_assignments)?;
+        validation::validate_all_fixed_assignments_present(&fixed_assignments, problem)?;
+        validation::validate_all_flexible_assignments_present(&flexible_assignments, problem)?;
+        validation::validate_no_extra_fixed_requests(&fixed_assignments, problem)?;
+        validation::validate_no_extra_flexible_requests(&flexible_assignments, problem)?;
 
         Ok(Self {
             fixed_assignments,
@@ -165,13 +165,13 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub> SolutionRef<'p, T> {
         >,
         problem: &'p Problem<T>,
     ) -> Result<Self, SolutionError> {
-        StateValidator::validate_no_extra_fixed_assignments(&fixed_assignments)?;
-        StateValidator::validate_no_extra_flexible_assignments(&flexible_assignments)?;
-        StateValidator::validate_request_ids_unique(&fixed_assignments, &flexible_assignments)?;
-        StateValidator::validate_all_fixed_assignments_present(&fixed_assignments, problem)?;
-        StateValidator::validate_all_flexible_assignments_present(&flexible_assignments, problem)?;
-        StateValidator::validate_no_extra_fixed_requests(&fixed_assignments, problem)?;
-        StateValidator::validate_no_extra_flexible_requests(&flexible_assignments, problem)?;
+        validation::validate_no_extra_fixed_assignments(&fixed_assignments)?;
+        validation::validate_no_extra_flexible_assignments(&flexible_assignments)?;
+        validation::validate_request_ids_unique(&fixed_assignments, &flexible_assignments)?;
+        validation::validate_all_fixed_assignments_present(&fixed_assignments, problem)?;
+        validation::validate_all_flexible_assignments_present(&flexible_assignments, problem)?;
+        validation::validate_no_extra_fixed_requests(&fixed_assignments, problem)?;
+        validation::validate_no_extra_flexible_requests(&flexible_assignments, problem)?;
 
         Ok(Self {
             fixed_assignments,
@@ -238,7 +238,7 @@ mod tests {
             prob::Problem,
             req::{Request, RequestContainer, RequestIdentifier},
         },
-        validation::{StateValidator, err::CrossValidationError},
+        validation::err::CrossValidationError,
     };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
     use std::collections::BTreeMap;
@@ -441,8 +441,8 @@ mod tests {
         let flex_solution =
             AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
 
-        let err = StateValidator::validate_nonoverlap(&fixed_solution, &flex_solution, &prob)
-            .unwrap_err();
+        let err =
+            validation::validate_nonoverlap(&fixed_solution, &flex_solution, &prob).unwrap_err();
 
         match err {
             CrossValidationError::UnknownBerth(e) => {
@@ -481,7 +481,7 @@ mod tests {
             AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
         s_flex.insert(ax);
 
-        let err = StateValidator::validate_nonoverlap(&s_fixed, &s_flex, &prob).unwrap_err();
+        let err = validation::validate_nonoverlap(&s_fixed, &s_flex, &prob).unwrap_err();
         match err {
             CrossValidationError::Overlap(e) => {
                 let a = e.first();
@@ -521,7 +521,7 @@ mod tests {
             AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
         s_flex.insert(a2);
 
-        StateValidator::validate_nonoverlap(&s_fixed, &s_flex, &prob).unwrap();
+        validation::validate_nonoverlap(&s_fixed, &s_flex, &prob).unwrap();
     }
 
     #[test]
@@ -553,7 +553,7 @@ mod tests {
             AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
         s_flex.insert(a2);
 
-        StateValidator::validate_nonoverlap(&s_fixed, &s_flex, &prob).unwrap();
+        validation::validate_nonoverlap(&s_fixed, &s_flex, &prob).unwrap();
     }
 
     #[test]
@@ -583,7 +583,7 @@ mod tests {
             AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
         s_flex.insert(a_norm);
 
-        StateValidator::validate_nonoverlap(&s_fixed, &s_flex, &prob).unwrap();
+        validation::validate_nonoverlap(&s_fixed, &s_flex, &prob).unwrap();
     }
 
     // ---------- Incremental check: validate_nooverlap_with ----------
@@ -609,7 +609,7 @@ mod tests {
         let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
         let flex = AssignmentContainer::<FlexibleKind, i64, Assignment<FlexibleKind, i64>>::new();
 
-        let err = StateValidator::validate_nooverlap_with::<_, FixedKind, _, _, _>(
+        let err = validation::validate_nooverlap_with::<_, FixedKind, _, _, _>(
             &fixed, &flex, &prob, &cand,
         )
         .unwrap_err();
@@ -648,7 +648,7 @@ mod tests {
         let rx = req_flex(12, (0, 100), &[(1, 10)]);
         let cand = asg_flex(&rx, &b1, 5);
 
-        let err = StateValidator::validate_nooverlap_with::<_, FlexibleKind, _, _, _>(
+        let err = validation::validate_nooverlap_with::<_, FlexibleKind, _, _, _>(
             &fixed, &flex, &prob, &cand,
         )
         .unwrap_err();
@@ -687,7 +687,7 @@ mod tests {
         let rx = req_flex(22, (0, 100), &[(1, 10)]);
         let cand = asg_flex(&rx, &b1, 10);
 
-        StateValidator::validate_nooverlap_with::<_, FlexibleKind, _, _, _>(
+        validation::validate_nooverlap_with::<_, FlexibleKind, _, _, _>(
             &fixed, &flex, &prob, &cand,
         )
         .unwrap();
@@ -721,7 +721,7 @@ mod tests {
         let rx = req_flex(32, (0, 100), &[(2, 10)]);
         let cand = asg_flex(&rx, &b2, 0);
 
-        StateValidator::validate_nooverlap_with::<_, FlexibleKind, _, _, _>(
+        validation::validate_nooverlap_with::<_, FlexibleKind, _, _, _>(
             &fixed, &flex, &prob, &cand,
         )
         .unwrap();
@@ -752,7 +752,7 @@ mod tests {
         let r_zero = req_flex(42, (0, 100), &[(1, 0)]); // pt = 0
         let cand = asg_flex(&r_zero, &b1, 5); // [5,5)
 
-        StateValidator::validate_nooverlap_with::<_, FlexibleKind, _, _, _>(
+        validation::validate_nooverlap_with::<_, FlexibleKind, _, _, _>(
             &fixed, &flex, &prob, &cand,
         )
         .unwrap();
@@ -785,9 +785,7 @@ mod tests {
         let r_same = req_fixed(55, (0, 100), &[(1, 10)]);
         let cand = asg_fixed(&r_same, &b1, 5);
 
-        StateValidator::validate_nooverlap_with::<_, FixedKind, _, _, _>(
-            &fixed, &flex, &prob, &cand,
-        )
-        .unwrap();
+        validation::validate_nooverlap_with::<_, FixedKind, _, _, _>(&fixed, &flex, &prob, &cand)
+            .unwrap();
     }
 }

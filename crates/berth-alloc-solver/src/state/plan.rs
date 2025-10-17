@@ -19,19 +19,30 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::framework::planning::{Plan, PlanningContext};
-use rand_chacha::ChaCha8Rng;
-use std::fmt::Debug;
+use crate::state::{registry::ledger::Ledger, terminal::delta::TerminalDelta};
+use berth_alloc_core::prelude::Cost;
 
-pub trait Operator: Debug + Send + Sync {
-    type Time: Copy + Ord;
+#[derive(Debug, Clone)]
+pub struct Plan<'p, T: Copy + Ord> {
+    pub ledger: Ledger<'p, T>,
+    pub terminal_delta: TerminalDelta<'p, T>,
+    pub delta_cost: Cost,
+    pub unassigned: usize,
+}
 
-    fn name(&self) -> &'static str;
-
-    fn propose<'s, 'p>(
-        &self,
-        iteration: usize,
-        context: PlanningContext<'s, 'p, Self::Time>,
-        rng: &mut ChaCha8Rng,
-    ) -> Option<Plan<'p, Self::Time>>;
+impl<'p, T: Copy + Ord> Plan<'p, T> {
+    #[inline]
+    pub fn new(
+        ledger: Ledger<'p, T>,
+        terminal_delta: TerminalDelta<'p, T>,
+        delta_cost: Cost,
+        unassigned: usize,
+    ) -> Self {
+        Self {
+            ledger,
+            terminal_delta,
+            delta_cost,
+            unassigned,
+        }
+    }
 }
