@@ -20,6 +20,7 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 pub mod berth;
+pub mod decisionvar;
 pub mod fitness;
 pub mod plan;
 pub mod registry;

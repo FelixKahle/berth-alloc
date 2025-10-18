@@ -24,33 +24,36 @@ use berth_alloc_model::prelude::RequestIdentifier;
 
 pub trait Operator<T: Copy + Ord, R: rand::Rng>: Send + Sync {
     fn name(&self) -> &str;
-    fn propose<'s, 'p>(
+    fn propose<'s, 'm, 'p>(
         &self,
-        context: &PlanningContext<'s, 'p, T>,
+        context: &PlanningContext<'s, 'm, 'p, T>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>>;
 }
 
 pub trait LocalMoveOperator<T: Copy + Ord, R: rand::Rng>: Send + Sync {
     fn name(&self) -> &str;
-    fn propose<'s, 'p>(&self, ctx: &PlanningContext<'s, 'p, T>, rng: &mut R)
-    -> Option<Plan<'p, T>>;
+    fn propose<'s, 'm, 'p>(
+        &self,
+        ctx: &PlanningContext<'s, 'm, 'p, T>,
+        rng: &mut R,
+    ) -> Option<Plan<'p, T>>;
 }
 
 pub trait DestroyOperator<T: Copy + Ord, R: rand::Rng>: Send + Sync {
     fn name(&self) -> &str;
-    fn select<'s, 'p>(
+    fn select<'s, 'm, 'p>(
         &self,
-        ctx: &PlanningContext<'s, 'p, T>,
+        ctx: &PlanningContext<'s, 'm, 'p, T>,
         rng: &mut R,
     ) -> Vec<RequestIdentifier>;
 }
 
 pub trait RepairOperator<T: Copy + Ord, R: rand::Rng>: Send + Sync {
     fn name(&self) -> &str;
-    fn repair<'s, 'p>(
+    fn repair<'s, 'm, 'p>(
         &self,
-        ctx: &PlanningContext<'s, 'p, T>,
+        ctx: &PlanningContext<'s, 'm, 'p, T>,
         removed: &[RequestIdentifier],
         rng: &mut R,
     ) -> Option<Plan<'p, T>>;

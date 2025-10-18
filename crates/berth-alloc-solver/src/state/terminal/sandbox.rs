@@ -19,19 +19,23 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::state::terminal::{
-    delta::TerminalDelta,
-    err::{BerthIdentifierNotFoundError, TerminalUpdateError},
-    terminalocc::{TerminalOccupancy, TerminalRead, TerminalWrite},
+use crate::{
+    model::index::BerthIndex,
+    state::{
+        berth::err::BerthUpdateError,
+        terminal::{
+            delta::TerminalDelta,
+            terminalocc::{TerminalOccupancy, TerminalRead, TerminalWrite},
+        },
+    },
 };
 use berth_alloc_core::prelude::TimeInterval;
-use berth_alloc_model::prelude::BerthIdentifier;
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone)]
 pub struct TerminalSandbox<'p, T: Copy + Ord> {
     inner: TerminalOccupancy<'p, T>,
-    touched: BTreeSet<BerthIdentifier>,
+    touched: BTreeSet<BerthIndex>,
 }
 
 impl<'p, T: Copy + Ord> TerminalSandbox<'p, T> {
@@ -51,34 +55,36 @@ impl<'p, T: Copy + Ord> TerminalSandbox<'p, T> {
     #[inline]
     pub fn occupy(
         &mut self,
-        id: BerthIdentifier,
+        index: BerthIndex,
         iv: TimeInterval<T>,
-    ) -> Result<(), TerminalUpdateError<T>> {
-        self.inner.occupy(id, iv)?;
-        self.touched.insert(id);
+    ) -> Result<(), BerthUpdateError<T>> {
+        self.inner.occupy(index, iv)?;
+        self.touched.insert(index);
         Ok(())
     }
 
     #[inline]
     pub fn release(
         &mut self,
-        id: BerthIdentifier,
+        index: BerthIndex,
         iv: TimeInterval<T>,
-    ) -> Result<(), TerminalUpdateError<T>> {
-        self.inner.release(id, iv)?;
-        self.touched.insert(id);
+    ) -> Result<(), BerthUpdateError<T>> {
+        self.inner.release(index, iv)?;
+        self.touched.insert(index);
         Ok(())
     }
 
     #[inline]
-    pub fn delta(&self) -> Result<TerminalDelta<'p, T>, BerthIdentifierNotFoundError> {
+    pub fn delta(&self) -> TerminalDelta<'p, T> {
         let mut updates = Vec::with_capacity(self.touched.len());
-        for &id in &self.touched {
-            let Some(occ) = self.inner.berth(id).cloned() else {
-                return Err(BerthIdentifierNotFoundError::new(id));
-            };
-            updates.push((id, occ));
+
+        for berth_index in self.touched.iter().copied() {
+            let index = berth_index.get();
+            debug_assert!(index < self.inner.berths_len());
+
+            let occ = self.inner.berth(berth_index).cloned().unwrap();
+            updates.push((berth_index, occ));
         }
-        Ok(TerminalDelta::from_updates(updates))
+        TerminalDelta::from_updates(updates)
     }
 }

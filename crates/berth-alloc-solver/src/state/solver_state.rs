@@ -19,25 +19,28 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::state::{
-    fitness::Fitness,
-    plan::Plan,
-    registry::ledger::Ledger,
-    terminal::terminalocc::{TerminalOccupancy, TerminalWrite},
+use crate::{
+    model::solver_model::SolverModel,
+    state::{
+        decisionvar::{DecisionVar, DecisionVarVec},
+        fitness::Fitness,
+        plan::{DecisionVarPatch, Plan},
+        terminal::terminalocc::{TerminalOccupancy, TerminalWrite},
+    },
 };
 use berth_alloc_core::prelude::Cost;
 use berth_alloc_model::{
-    prelude::{Problem, SolutionRef},
+    common::FlexibleKind,
+    prelude::{AssignmentContainer, SolutionRef},
+    problem::asg::AssignmentRef,
     solution::SolutionError,
-    validation,
 };
 use num_traits::{CheckedAdd, CheckedSub};
 use std::ops::Mul;
 
 pub trait SolverStateView<'p, T: Copy + Ord> {
-    fn ledger(&self) -> &Ledger<'p, T>;
+    fn decision_variables(&self) -> &[DecisionVar<T>];
     fn terminal_occupancy(&self) -> &TerminalOccupancy<'p, T>;
-
     fn fitness(&self) -> &Fitness;
 
     fn is_feasible(&self) -> bool {
@@ -51,7 +54,7 @@ pub trait SolverStateView<'p, T: Copy + Ord> {
 
 #[derive(Debug, Clone)]
 pub struct SolverState<'p, T: Copy + Ord> {
-    ledger: Ledger<'p, T>,
+    decision_variables: DecisionVarVec<T>,
     terminal_occupancy: TerminalOccupancy<'p, T>,
     fitness: Fitness,
 }
@@ -60,24 +63,16 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cos
     SolverState<'p, T>
 {
     #[inline]
-    pub fn new(ledger: Ledger<'p, T>, terminal_occupancy: TerminalOccupancy<'p, T>) -> Self {
-        let fitness: Fitness = (&ledger).into();
-
+    pub fn new(
+        decision_variables: DecisionVarVec<T>,
+        terminal_occupancy: TerminalOccupancy<'p, T>,
+        fitness: Fitness,
+    ) -> Self {
         Self {
-            ledger,
+            decision_variables,
             terminal_occupancy,
             fitness,
         }
-    }
-
-    #[inline]
-    pub fn ledger(&self) -> &Ledger<'p, T> {
-        &self.ledger
-    }
-
-    #[inline]
-    pub fn problem(&self) -> &'p Problem<T> {
-        self.ledger.problem()
     }
 
     #[inline]
@@ -86,75 +81,154 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cos
     }
 
     #[inline]
+    pub fn fitness(&self) -> &Fitness {
+        &self.fitness
+    }
+
+    #[inline]
     pub fn apply_plan(&mut self, plan: Plan<'p, T>)
     where
         T: std::fmt::Debug,
     {
         #[cfg(debug_assertions)]
-        {
-            debug_assert!(
-                validation::validate_nonoverlap(
-                    plan.ledger.fixed_assignments(),
-                    plan.ledger.commited_assignments(),
-                    plan.ledger.problem(),
-                )
-                .is_ok(),
-            );
-            debug_assert!(
-                validation::validate_no_extra_flexible_assignments(
-                    plan.ledger.commited_assignments()
-                )
-                .is_ok()
-            );
-            debug_assert!(
-                validation::validate_request_ids_unique(
-                    plan.ledger.fixed_assignments(),
-                    plan.ledger.commited_assignments(),
-                )
-                .is_ok()
-            );
-            debug_assert!(
-                validation::validate_no_extra_flexible_requests(
-                    plan.ledger.commited_assignments(),
-                    plan.ledger.problem(),
-                )
-                .is_ok()
-            );
-        }
-
+        let prev_cost = self.fitness.cost;
         #[cfg(debug_assertions)]
-        let prev_fit = self.fitness.clone();
+        let prev_unassigned = self.fitness.unassigned_requests;
 
-        // Swap in proposed ledger then apply terminal delta
-        self.ledger = plan.ledger;
+        self.apply_decision_var_patches(plan.decision_var_patches);
         let res = self.terminal_occupancy.apply_delta(plan.terminal_delta);
         debug_assert!(res.is_ok(), "Failed to apply terminal delta: {:?}", res);
 
-        // Recompute fitness from the new ledger
-        self.fitness = (&self.ledger).into();
-
         #[cfg(debug_assertions)]
         {
-            debug_assert_eq!(
-                self.fitness.unassigned_requests as i32,
-                prev_fit.unassigned_requests as i32 + plan.delta_unassigned,
-                "prev_unassigned + delta_unassigned must equal new unassigned"
+            debug_assert!(
+                self.fitness.cost == prev_cost + plan.delta_cost,
+                "fitness.cost did not match delta: prev={prev_cost}, delta={}, new={}",
+                plan.delta_cost,
+                self.fitness.cost
             );
+            debug_assert!(
+                self.fitness.cost.is_positive(),
+                "fitness.cost became negative"
+            );
+
+            let expected_unassigned = prev_unassigned
+                .checked_add_signed(isize::try_from(plan.delta_unassigned).unwrap())
+                .unwrap();
+
             debug_assert_eq!(
-                self.fitness.cost,
-                prev_fit.cost + plan.delta_cost,
-                "prev_cost + delta_cost must equal new cost"
+                self.fitness.unassigned_requests, expected_unassigned,
+                "fitness.unassigned_requests did not match delta"
+            );
+
+            let dv_unassigned = self.count_unassigned_requests();
+            debug_assert_eq!(
+                dv_unassigned, self.fitness.unassigned_requests,
+                "decision-variables unassigned count ({dv_unassigned}) differs from fitness.unassigned_requests ({})",
+                self.fitness.unassigned_requests
             );
         }
+    }
+
+    #[inline]
+    pub fn into_solution(
+        self,
+        solver_model: &'p SolverModel<'p, T>,
+    ) -> Result<SolutionRef<'p, T>, SolutionError>
+    where
+        T: std::fmt::Display + std::fmt::Debug,
+    {
+        let flexible_assignments = self.make_flexible_assignments(solver_model);
+        let fixed_assignments = solver_model
+            .problem()
+            .iter_fixed_assignments()
+            .map(|a| a.to_ref())
+            .collect();
+
+        SolutionRef::new(
+            fixed_assignments,
+            flexible_assignments,
+            solver_model.problem(),
+        )
+    }
+
+    pub fn make_flexible_assignments(
+        &self,
+        solver_model: &'p SolverModel<'p, T>,
+    ) -> AssignmentContainer<FlexibleKind, T, AssignmentRef<'p, 'p, FlexibleKind, T>>
+    where
+        T: std::fmt::Display + std::fmt::Debug,
+    {
+        let index_manager = solver_model.index_manager();
+        let problem = solver_model.problem();
+
+        let mut assignments = AssignmentContainer::<
+            FlexibleKind,
+            T,
+            AssignmentRef<'p, 'p, FlexibleKind, T>,
+        >::with_capacity(self.decision_variables.len());
+
+        for (request_index, decision_var) in self.decision_variables.enumerate() {
+            let DecisionVar::Assigned(decision) = decision_var else {
+                continue;
+            };
+
+            let Some(request_id) = index_manager.request_id(request_index) else {
+                debug_assert!(false, "request_id missing for {}", request_index);
+                continue;
+            };
+
+            let Some(berth_id) = index_manager.berth_id(decision.berth_index) else {
+                debug_assert!(false, "berth_id missing for {}", decision.berth_index);
+                continue;
+            };
+
+            let Some(request_ref) = problem.flexible_requests().get(request_id) else {
+                debug_assert!(false, "request {} not found in Problem", request_id);
+                continue;
+            };
+            let Some(berth_ref) = problem.berths().get(berth_id) else {
+                debug_assert!(false, "berth {} not found in Problem", berth_id);
+                continue;
+            };
+
+            match AssignmentRef::new(request_ref, berth_ref, decision.start_time) {
+                Ok(asg_ref) => {
+                    assignments.insert(asg_ref);
+                }
+                Err(_) => {
+                    debug_assert!(
+                        false,
+                        "failed to create AssignmentRef for request {} and berth {}",
+                        request_id, berth_id
+                    );
+                    continue;
+                }
+            }
+        }
+
+        assignments
+    }
+
+    #[inline(always)]
+    fn apply_decision_var_patches(&mut self, patches: Vec<DecisionVarPatch<T>>) {
+        for patch in patches {
+            self.decision_variables[patch.index] = patch.patch;
+        }
+    }
+
+    #[inline]
+    #[cfg(debug_assertions)]
+    fn count_unassigned_requests(&self) -> usize {
+        self.decision_variables
+            .as_slice()
+            .iter()
+            .filter(|dv| !dv.is_assigned())
+            .count()
     }
 }
 
 impl<'p, T: Copy + Ord> SolverStateView<'p, T> for SolverState<'p, T> {
-    #[inline]
-    fn ledger(&self) -> &Ledger<'p, T> {
-        &self.ledger
-    }
-
     #[inline]
     fn terminal_occupancy(&self) -> &TerminalOccupancy<'p, T> {
         &self.terminal_occupancy
@@ -163,6 +237,11 @@ impl<'p, T: Copy + Ord> SolverStateView<'p, T> for SolverState<'p, T> {
     #[inline]
     fn fitness(&self) -> &Fitness {
         &self.fitness
+    }
+
+    #[inline]
+    fn decision_variables(&self) -> &[DecisionVar<T>] {
+        &self.decision_variables
     }
 }
 
@@ -176,36 +255,30 @@ impl<'p, T: Copy + Ord + std::fmt::Display> std::fmt::Display for SolverState<'p
     }
 }
 
-impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub> TryInto<SolutionRef<'p, T>>
-    for SolverState<'p, T>
-{
-    type Error = SolutionError;
-
-    fn try_into(self) -> Result<SolutionRef<'p, T>, Self::Error> {
-        let problem = self.ledger.problem();
-        let fixed_refs = self
-            .ledger
-            .problem()
-            .fixed_assignments()
-            .iter()
-            .map(|a| a.to_ref())
-            .collect();
-        let flexible_refs = self.ledger.into_inner();
-        SolutionRef::new(fixed_refs, flexible_refs, problem)
-    }
-}
-
-#[allow(dead_code)]
 #[cfg(test)]
-mod feasible_state_tests {
-    use crate::state::{
-        berth::berthocc::{BerthRead, BerthWrite},
-        terminal::terminalocc::TerminalRead,
-    };
-
+mod tests {
     use super::*;
+    use crate::{
+        model::{
+            index::{BerthIndex, RequestIndex},
+            solver_model::SolverModel,
+        },
+        state::{
+            berth::berthocc::{BerthRead, BerthWrite},
+            decisionvar::{DecisionVar, DecisionVarVec},
+            plan::{DecisionVarPatch, Plan},
+            terminal::{
+                delta::TerminalDelta,
+                terminalocc::{TerminalOccupancy, TerminalRead},
+            },
+        },
+    };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
-    use berth_alloc_model::{prelude::*, problem::req::RequestView};
+    use berth_alloc_model::{
+        common::FlexibleKind,
+        prelude::{Berth, BerthIdentifier, Problem, RequestIdentifier, SolutionView},
+        problem::{builder::ProblemBuilder, req::Request},
+    };
     use std::collections::BTreeMap;
 
     #[inline]
@@ -213,12 +286,12 @@ mod feasible_state_tests {
         TimePoint::new(v)
     }
     #[inline]
-    fn td(v: i64) -> TimeDelta<i64> {
-        TimeDelta::new(v)
-    }
-    #[inline]
     fn iv(a: i64, b: i64) -> TimeInterval<i64> {
         TimeInterval::new(tp(a), tp(b))
+    }
+    #[inline]
+    fn td(v: i64) -> TimeDelta<i64> {
+        TimeDelta::new(v)
     }
     #[inline]
     fn bid(n: u32) -> BerthIdentifier {
@@ -228,6 +301,14 @@ mod feasible_state_tests {
     fn rid(n: u32) -> RequestIdentifier {
         RequestIdentifier::new(n)
     }
+    #[inline]
+    fn bi(n: usize) -> BerthIndex {
+        BerthIndex::new(n)
+    }
+    #[inline]
+    fn ri(n: usize) -> RequestIndex {
+        RequestIndex::new(n)
+    }
 
     fn berth(id: u32, s: i64, e: i64) -> Berth<i64> {
         Berth::from_windows(bid(id), [iv(s, e)])
@@ -236,192 +317,425 @@ mod feasible_state_tests {
     fn flex_req(
         id: u32,
         window: (i64, i64),
-        pt: &[(u32, i64)],
+        pts: &[(u32, i64)],
         weight: i64,
     ) -> Request<FlexibleKind, i64> {
         let mut m = BTreeMap::new();
-        for (b, d) in pt {
+        for (b, d) in pts {
             m.insert(bid(*b), td(*d));
         }
         Request::<FlexibleKind, i64>::new(rid(id), iv(window.0, window.1), weight, m).unwrap()
     }
 
-    fn problem_one_berth_two_flex() -> Problem<i64> {
-        // berths
-        let mut berths = berth_alloc_model::problem::berth::BerthContainer::new();
-        berths.insert(berth(1, 0, 1000));
+    fn make_problem_simple() -> Problem<i64> {
+        // Two berths and two flexible requests available on berth 1
+        let b1 = berth(1, 0, 100);
+        let b2 = berth(2, 0, 100);
 
-        // fixed (empty)
-        let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+        let r10 = flex_req(10, (0, 100), &[(1, 5)], 1);
+        let r20 = flex_req(20, (0, 100), &[(1, 5)], 1);
 
-        // flexible: r1 (pt=10 on b1), r2 (pt=5 on b1)
-        let mut flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
-        flex.insert(flex_req(1, (0, 200), &[(1, 10)], 1));
-        flex.insert(flex_req(2, (0, 200), &[(1, 5)], 1));
-
-        Problem::new(berths, fixed, flex).unwrap()
-    }
-
-    fn mk_occ<'b>(berths: &'b [Berth<i64>]) -> TerminalOccupancy<'b, i64> {
-        TerminalOccupancy::new(berths)
+        let mut builder = ProblemBuilder::new();
+        builder.add_berth(b1);
+        builder.add_berth(b2);
+        builder.add_flexible(r10);
+        builder.add_flexible(r20);
+        builder.build().expect("valid problem")
     }
 
     #[test]
-    fn test_new_initializes_fitness_from_ledger() {
-        let prob = problem_one_berth_two_flex();
-        let ledger = Ledger::new(&prob);
+    fn test_new_and_accessors() {
+        let base = vec![berth(1, 0, 100)];
+        let term = TerminalOccupancy::new(&base);
+        let dv = DecisionVarVec::from(vec![DecisionVar::unassigned(), DecisionVar::unassigned()]);
+        let fit = Fitness::new(100, 2);
 
-        // Build a terminal occupancy from the same berth shape used in the problem.
-        let base = vec![berth(1, 0, 1000)];
-        let term = mk_occ(&base);
+        let st = SolverState::new(dv, term, fit);
+        assert_eq!(st.fitness().cost, 100);
+        assert_eq!(st.fitness().unassigned_requests, 2);
+        assert!(!st.is_feasible());
+        assert_eq!(st.cost(), 100);
 
-        let st = SolverState::new(ledger, term);
-        assert_eq!(
-            st.fitness().unassigned_requests,
-            2,
-            "two flexible requests initially unassigned"
+        // Accessor returns the same slice semantics
+        assert_eq!(st.decision_variables().len(), 2);
+        assert!(matches!(
+            st.decision_variables()[0],
+            DecisionVar::Unassigned
+        ));
+    }
+
+    #[test]
+    fn test_display_format() {
+        let base = vec![berth(1, 0, 100)];
+        let term = TerminalOccupancy::new(&base);
+        let dv = DecisionVarVec::from(vec![DecisionVar::unassigned()]);
+        let fit = Fitness::new(123, 1);
+        let st = SolverState::new(dv, term, fit);
+
+        let s = format!("{}", st);
+        assert!(s.contains("cost: 123"), "fmt must include cost; got: {s}");
+        assert!(
+            s.contains("unassigned_requests: 1"),
+            "fmt must include unassigned; got: {s}"
         );
-        assert_eq!(st.fitness().cost, 0, "initial cost is zero");
-        assert!(!st.is_feasible(), "not feasible until all assigned");
-        assert_eq!(st.cost(), 0, "cost() forwards from fitness");
     }
 
     #[test]
-    fn test_apply_plan_updates_ledger_terminal_and_fitness() {
-        use crate::state::berth::berthocc::BerthOccupancy;
-        use crate::state::plan::Plan;
-        use crate::state::terminal::delta::TerminalDelta;
+    fn test_apply_decision_var_patches_private() {
+        let base = vec![berth(1, 0, 100)];
+        let term = TerminalOccupancy::new(&base);
+        // 3 vars: U, U, A
+        let mut st = SolverState::new(
+            DecisionVarVec::from(vec![
+                DecisionVar::unassigned(),
+                DecisionVar::unassigned(),
+                DecisionVar::assigned(BerthIndex::new(0), tp(50)),
+            ]),
+            term,
+            Fitness::new(10, 2),
+        );
 
-        let prob = problem_one_berth_two_flex();
+        // Apply patches directly (private method) to avoid delta assertions
+        st.apply_decision_var_patches(vec![
+            DecisionVarPatch::new(ri(0), DecisionVar::assigned(bi(0), tp(0))), // U -> A
+            DecisionVarPatch::new(ri(1), DecisionVar::unassigned()),           // stays U
+            DecisionVarPatch::new(ri(2), DecisionVar::unassigned()),           // A -> U
+        ]);
 
-        // Base terminal occupancy using the same berth definition as the problem.
-        let base = vec![berth(1, 0, 1000)];
-        let mut st = {
-            let ledger0 = Ledger::new(&prob);
-            let term0 = mk_occ(&base);
-            SolverState::new(ledger0, term0)
-        };
+        assert!(st.decision_variables()[0].is_assigned());
+        assert!(!st.decision_variables()[1].is_assigned());
+        assert!(!st.decision_variables()[2].is_assigned());
+    }
 
-        // Build a new ledger with r1 committed at t=0
-        let mut ledger1 = Ledger::new(&prob);
-        let req1 = prob
-            .flexible_requests()
-            .get(RequestIdentifier::new(1))
-            .expect("r1 exists");
-        let b1 = prob
-            .berths()
-            .get(BerthIdentifier::new(1))
-            .expect("berth 1 exists");
-        ledger1
-            .commit_assignment(req1, b1, tp(0))
-            .expect("commit should succeed");
+    #[test]
+    fn test_apply_plan_balanced_patches_and_terminal_delta() {
+        // Initial: [A(0,0), U] → unassigned=1; cost positive
+        let base = vec![berth(1, 0, 100)];
+        let term = TerminalOccupancy::new(&base);
 
-        // Create a terminal delta that reflects occupying [0,10) on berth 1
-        let mut b1_occ = BerthOccupancy::new(&base[0]);
-        b1_occ.occupy(iv(0, 10)).expect("occupy should succeed");
-        let delta = TerminalDelta::from_updates(vec![(BerthIdentifier::new(1), b1_occ)]);
+        // Build occupancy delta to occupy [0,5) on berth index 0
+        let mut occ0 = term.berth(BerthIndex(0)).cloned().expect("berth exists");
+        occ0.occupy(iv(0, 5)).expect("occupy in delta must succeed");
+        let delta = TerminalDelta::from_updates(vec![(BerthIndex(0), occ0)]);
 
-        // Plan bookkeeping must match SolverState::apply_plan debug assertions
-        let delta_cost = ledger1.cost() - st.fitness().cost;
-        let delta_unassigned =
-            ledger1.unassigned_request_count() as i32 - st.fitness().unassigned_requests as i32;
+        let dv = DecisionVarVec::from(vec![
+            DecisionVar::assigned(bi(0), tp(0)),
+            DecisionVar::unassigned(),
+        ]);
+        let mut st = SolverState::new(dv, term, Fitness::new(50, 1));
 
-        // Construct the plan using the updated ledger and delta
-        let plan = Plan {
-            ledger: ledger1,
-            terminal_delta: delta,
-            delta_cost,
-            delta_unassigned,
-        };
+        // Balanced patches: swap A<->U; delta_unassigned=0; delta_cost=0
+        let patches = vec![
+            DecisionVarPatch::new(ri(0), DecisionVar::unassigned()),
+            DecisionVarPatch::new(ri(1), DecisionVar::assigned(bi(0), tp(10))),
+        ];
 
-        // Apply plan
+        let plan = Plan::new_delta(patches, delta, 0, 0);
         st.apply_plan(plan);
 
-        // Ledger should now have r1 assigned, r2 unassigned
-        let assigned_ids: Vec<_> = st
-            .ledger()
-            .iter_assigned_requests()
-            .map(|r| r.id())
-            .collect();
-        assert_eq!(assigned_ids, vec![RequestIdentifier::new(1)]);
+        // Decision variables swapped
+        assert!(!st.decision_variables()[0].is_assigned());
+        assert!(st.decision_variables()[1].is_assigned());
 
-        let unassigned_ids: Vec<_> = st
-            .ledger()
-            .iter_unassigned_requests()
-            .map(|r| r.id())
-            .collect();
-        assert_eq!(unassigned_ids, vec![RequestIdentifier::new(2)]);
-
-        // Fitness should reflect 1 unassigned and positive cost
-        assert_eq!(st.fitness().unassigned_requests, 1);
-        assert!(st.fitness().cost > 0);
-        assert_eq!(st.cost(), st.fitness().cost);
-
-        // Terminal occupancy should mark [0,10) on berth 1 as not free
-        let berth_view = st
+        // Terminal occupancy reflects [0,5) occupied on index 0
+        let b0_view = st
             .terminal_occupancy()
-            .berth(BerthIdentifier::new(1))
-            .expect("berth 1 should exist in terminal");
-        assert!(
-            !berth_view.is_free(iv(0, 10)),
-            "interval [0,10) should be occupied"
+            .berth(BerthIndex(0))
+            .expect("berth 0 must exist");
+        assert!(b0_view.is_occupied(iv(0, 5)), "terminal delta not applied");
+    }
+
+    #[test]
+    fn test_make_flexible_assignments_happy_path() {
+        let prob = make_problem_simple();
+        let model = SolverModel::try_from(&prob).expect("build model");
+
+        // Build DV with both assigned on berth index of id 1
+        let bi1 = model.index_manager().berth_index(bid(1)).unwrap();
+        let dv = DecisionVarVec::from(vec![
+            DecisionVar::assigned(bi1, tp(0)),
+            DecisionVar::assigned(bi1, tp(10)),
+        ]);
+        let term = TerminalOccupancy::new(std::iter::empty::<&Berth<i64>>());
+        let st = SolverState::new(dv, term, Fitness::new(10, 0));
+
+        let flex = st.make_flexible_assignments(&model);
+        assert_eq!(
+            flex.len(),
+            model.flexible_requests_len(),
+            "all assigned should be materialized"
         );
     }
 
     #[test]
-    fn test_try_into_solution_ref_success() {
-        let prob = problem_one_berth_two_flex();
+    fn test_into_solution_success() {
+        let prob = make_problem_simple();
+        let model = SolverModel::try_from(&prob).expect("build model");
 
-        // Start with empty ledger and terminal occupancy
-        let base = vec![berth(1, 0, 1000)];
-        let ledger = Ledger::new(&prob);
-        let term = mk_occ(&base);
+        let bi1 = model.index_manager().berth_index(bid(1)).unwrap();
+        let dv = DecisionVarVec::from(vec![
+            DecisionVar::assigned(bi1, tp(0)),
+            DecisionVar::assigned(bi1, tp(10)),
+        ]);
+        let term = TerminalOccupancy::new(std::iter::empty::<&Berth<i64>>());
+        let st = SolverState::new(dv, term, Fitness::new(10, 0));
 
-        // Make a state, then commit both assignments so the solution is complete
-        let mut st = SolverState::new(ledger, term);
-        let r1 = prob.flexible_requests().get(rid(1)).unwrap();
-        let r2 = prob.flexible_requests().get(rid(2)).unwrap();
-        let b1 = prob.berths().get(bid(1)).unwrap();
-
-        st.ledger
-            .commit_assignment(r1, b1, tp(0))
-            .expect("commit r1 should succeed");
-        st.ledger
-            .commit_assignment(r2, b1, tp(20))
-            .expect("commit r2 should succeed");
-
-        // Recompute fitness by constructing a fresh state
-        let st = SolverState::new(st.ledger, st.terminal_occupancy);
-
-        // Now conversion to SolutionRef should succeed (no unassigned flex requests)
-        let sol: Result<SolutionRef<'_, i64>, _> = st.clone().try_into();
-        assert!(sol.is_ok(), "conversion to SolutionRef should succeed");
+        let sol = st.into_solution(&model).expect("into_solution Ok");
+        assert_eq!(sol.flexible_assignments_len(), 2);
     }
 
     #[test]
-    fn test_is_feasible_when_all_assigned() {
-        let prob = problem_one_berth_two_flex();
-
-        // Base term and ledger
-        let base = vec![berth(1, 0, 1000)];
-        let mut ledger = Ledger::new(&prob);
-        let term = mk_occ(&base);
-
-        // Commit both requests
-        let r1 = prob.flexible_requests().get(rid(1)).unwrap();
-        let r2 = prob.flexible_requests().get(rid(2)).unwrap();
-        let b1 = prob.berths().get(bid(1)).unwrap();
-        ledger.commit_assignment(r1, b1, tp(0)).unwrap();
-        ledger.commit_assignment(r2, b1, tp(20)).unwrap();
-
-        let st = SolverState::new(ledger, term);
-        assert!(
-            st.is_feasible(),
-            "all flexible requests assigned means feasible"
+    fn test_decision_variables_exposure_slice_semantics() {
+        let dv = DecisionVarVec::from(vec![
+            DecisionVar::unassigned(),
+            DecisionVar::assigned(bi(0), tp(1)),
+        ]);
+        let st = SolverState::new(
+            dv,
+            TerminalOccupancy::new(&[] as &[Berth<i64>]),
+            Fitness::new(5, 1),
         );
-        assert!(
-            st.cost() > 0,
-            "cost should be positive when assignments exist"
+
+        let slice = st.decision_variables();
+        assert_eq!(slice.len(), 2);
+        match slice[0] {
+            DecisionVar::Unassigned => {}
+            _ => panic!("expected Unassigned at 0"),
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn test_count_unassigned_requests_debug_only() {
+        let dv = DecisionVarVec::from(vec![
+            DecisionVar::unassigned(),
+            DecisionVar::assigned(bi(0), tp(1)),
+            DecisionVar::unassigned(),
+        ]);
+        let st = SolverState::new(
+            dv,
+            TerminalOccupancy::new(&[] as &[Berth<i64>]),
+            Fitness::new(7, 2),
         );
+        let cnt = st.count_unassigned_requests();
+        assert_eq!(cnt, 2);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic]
+    fn test_make_flexible_assignments_invalid_entries_debug_panics() {
+        let prob = make_problem_simple();
+        let model = SolverModel::try_from(&prob).expect("build model");
+
+        // Invalid berth index (out of range) for index 0
+        let invalid_bi = BerthIndex::new(999);
+        let bi1 = model.index_manager().berth_index(bid(1)).unwrap();
+
+        let dv = DecisionVarVec::from(vec![
+            DecisionVar::assigned(invalid_bi, tp(0)), // triggers debug_assert! false
+            DecisionVar::assigned(bi1, tp(10)),
+        ]);
+
+        // Empty terminal occupancy using a typed empty slice to avoid E0716
+        let term = TerminalOccupancy::new(&[] as &[Berth<i64>]);
+
+        let st = SolverState::new(dv, term, Fitness::new(10, 0));
+
+        // This should panic in debug mode due to debug_assert!(false, ...)
+        let _ = st.make_flexible_assignments(&model);
+    }
+
+    // In release builds, invalid entries are skipped (no panic).
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_make_flexible_assignments_skips_invalid_entries_release() {
+        let prob = make_problem_simple();
+        let model = SolverModel::try_from(&prob).expect("build model");
+
+        let invalid_bi = BerthIndex::new(999);
+        let bi1 = model.index_manager().berth_index(bid(1)).unwrap();
+
+        let dv = DecisionVarVec::from(vec![
+            DecisionVar::assigned(invalid_bi, tp(0)), // will be skipped in release
+            DecisionVar::assigned(bi1, tp(10)),       // ok
+        ]);
+
+        // Empty terminal occupancy using a typed empty slice to avoid E0716
+        let term = TerminalOccupancy::new(&[] as &[Berth<i64>]);
+
+        let st = SolverState::new(dv, term, Fitness::new(10, 0));
+
+        let flex = st.make_flexible_assignments(&model);
+        assert_eq!(
+            flex.len(),
+            1,
+            "invalid mapping should be skipped in release"
+        );
+    }
+
+    #[test]
+    fn test_make_flexible_assignments_empty() {
+        let prob = make_problem_simple();
+        let model = SolverModel::try_from(&prob).expect("build model");
+
+        let dv = DecisionVarVec::from(Vec::<DecisionVar<i64>>::new());
+        let term = TerminalOccupancy::new(&[] as &[Berth<i64>]);
+        let st = SolverState::new(dv, term, Fitness::new(0, 0));
+
+        let flex = st.make_flexible_assignments(&model);
+        assert_eq!(flex.len(), 0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic]
+    fn test_make_flexible_assignments_request_index_missing_debug_panics() {
+        let prob = make_problem_simple(); // 2 flex requests
+        let model = SolverModel::try_from(&prob).expect("build model");
+        let bi1 = model.index_manager().berth_index(bid(1)).unwrap();
+
+        // 3 DVs → index 2 has no RequestIdentifier mapping
+        let dv = DecisionVarVec::from(vec![
+            DecisionVar::assigned(bi1, tp(0)),
+            DecisionVar::assigned(bi1, tp(10)),
+            DecisionVar::assigned(bi1, tp(20)), // triggers missing request_id
+        ]);
+        let term = TerminalOccupancy::new(&[] as &[Berth<i64>]);
+        let st = SolverState::new(dv, term, Fitness::new(0, 0));
+
+        let _ = st.make_flexible_assignments(&model); // debug panics
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_make_flexible_assignments_request_index_missing_release_skips() {
+        let prob = make_problem_simple();
+        let model = SolverModel::try_from(&prob).expect("build model");
+        let bi1 = model.index_manager().berth_index(bid(1)).unwrap();
+
+        let dv = DecisionVarVec::from(vec![
+            DecisionVar::assigned(bi1, tp(0)),
+            DecisionVar::assigned(bi1, tp(10)),
+            DecisionVar::assigned(bi1, tp(20)), // skipped in release
+        ]);
+        let term = TerminalOccupancy::new(&[] as &[Berth<i64>]);
+        let st = SolverState::new(dv, term, Fitness::new(0, 0));
+
+        let flex = st.make_flexible_assignments(&model);
+        assert_eq!(flex.len(), 2);
+    }
+
+    #[test]
+    fn test_into_solution_includes_fixed_assignments() {
+        // Build a problem with one fixed assignment plus two flex
+        use berth_alloc_model::common::FixedKind;
+        use berth_alloc_model::prelude::Assignment;
+
+        let mut builder = berth_alloc_model::problem::builder::ProblemBuilder::new();
+
+        let b1 = Berth::from_windows(bid(1), [iv(0, 100)]);
+        let b2 = Berth::from_windows(bid(2), [iv(0, 100)]);
+        builder.add_berth(b1.clone());
+        builder.add_berth(b2.clone());
+
+        let r_fixed = Request::<FixedKind, i64>::new(
+            rid(999),
+            iv(0, 100),
+            1,
+            [(bid(1), td(10))].into_iter().collect(),
+        )
+        .unwrap();
+        let a_fixed =
+            Assignment::<FixedKind, i64>::new(r_fixed.clone(), b1.clone(), tp(0)).unwrap();
+        builder.add_fixed(a_fixed);
+
+        let r10 = flex_req(10, (0, 100), &[(1, 5)], 1);
+        let r20 = flex_req(20, (0, 100), &[(1, 5)], 1);
+        builder.add_flexible(r10);
+        builder.add_flexible(r20);
+
+        let prob = builder.build().expect("valid problem");
+        let model = SolverModel::try_from(&prob).expect("build model");
+
+        // Assign both flex on berth 1
+        let bi1 = model.index_manager().berth_index(bid(1)).unwrap();
+        let dv = DecisionVarVec::from(vec![
+            DecisionVar::assigned(bi1, tp(0)),
+            DecisionVar::assigned(bi1, tp(10)),
+        ]);
+        let term = TerminalOccupancy::new(std::iter::empty::<&Berth<i64>>());
+        let st = SolverState::new(dv, term, Fitness::new(0, 0));
+
+        let sol = st.into_solution(&model).expect("into_solution Ok");
+        assert_eq!(sol.flexible_assignments_len(), 2);
+        assert_eq!(
+            sol.fixed_assignments_len(),
+            1,
+            "fixed assignments preserved"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic]
+    fn test_apply_plan_unassigned_delta_mismatch_debug_panics() {
+        let base = vec![berth(1, 0, 100)];
+        let term = TerminalOccupancy::new(&base);
+
+        // Start with both Unassigned → unassigned=2
+        let dv = DecisionVarVec::from(vec![DecisionVar::unassigned(), DecisionVar::unassigned()]);
+        let mut st = SolverState::new(dv, term, Fitness::new(0, 2));
+
+        // Patch assigns one request (U -> A), so real delta_unassigned = -1,
+        // but we lie in the plan and set 0 → should panic in debug.
+        let patches = vec![DecisionVarPatch::new(
+            ri(0),
+            DecisionVar::assigned(bi(0), tp(0)),
+        )];
+        let delta = crate::state::terminal::delta::TerminalDelta::empty();
+
+        let plan = Plan::new_delta(patches, delta, 0, 0); // incorrect delta_unassigned
+        st.apply_plan(plan);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic]
+    fn test_apply_plan_cost_delta_mismatch_debug_panics() {
+        let base = vec![berth(1, 0, 100)];
+        let term = TerminalOccupancy::new(&base);
+        let dv = DecisionVarVec::from(vec![DecisionVar::unassigned()]);
+        // fitness.cost = 10, but we'll claim delta_cost = +7 and not change fitness → panic
+        let mut st = SolverState::new(dv, term, Fitness::new(10, 1));
+
+        let patches = vec![DecisionVarPatch::new(ri(0), DecisionVar::unassigned())]; // no-op
+        let delta = crate::state::terminal::delta::TerminalDelta::empty();
+
+        let plan = Plan::new_delta(patches, delta, 7, 0); // mismatched cost delta
+        st.apply_plan(plan);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic]
+    fn test_apply_plan_terminal_delta_error_debug_panics() {
+        let base = vec![berth(1, 0, 100)];
+        let term = TerminalOccupancy::new(&base);
+        let dv = DecisionVarVec::from(vec![DecisionVar::unassigned()]);
+        let mut st = SolverState::new(dv, term.clone(), Fitness::new(0, 1));
+
+        // Create an invalid delta by taking a snapshot of berth 1 and
+        // releasing an interval that isn't occupied in the snapshot.
+        let mut occ = term.berth(BerthIndex(1)).cloned().expect("exists");
+        // Release [0,5) which is not occupied → should error when applied
+        occ.release(iv(0, 5))
+            .expect_err("release on free interval must error");
+        // But we have a mutated copy with an illegal state; feed it as an update
+        let delta =
+            crate::state::terminal::delta::TerminalDelta::from_updates(vec![(BerthIndex(1), occ)]);
+
+        let plan = Plan::new_delta(Vec::new(), delta, 0, 0);
+        st.apply_plan(plan); // debug_assert!(res.is_ok()) panics
     }
 }

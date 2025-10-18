@@ -19,91 +19,100 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::state::{
-    berth::berthocc::{BerthOccupancy, BerthRead, BerthWrite},
-    terminal::{
-        delta::TerminalDelta,
-        err::{BerthIdentifierNotFoundError, TerminalApplyError, TerminalUpdateError},
+use crate::{
+    model::index::BerthIndex,
+    state::{
+        berth::{
+            berthocc::{BerthOccupancy, BerthRead, BerthWrite},
+            err::{BerthApplyError, BerthUpdateError},
+        },
+        terminal::delta::TerminalDelta,
     },
 };
 use berth_alloc_core::prelude::TimeInterval;
 use berth_alloc_model::prelude::*;
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FreeBerth<'b, T: Copy + Ord> {
+
+pub struct FreeBerth<T: Copy + Ord> {
     interval: TimeInterval<T>,
-    berth: &'b Berth<T>,
+    berth_index: BerthIndex,
 }
 
-impl<'b, T: Copy + Ord> FreeBerth<'b, T> {
-    fn new(interval: TimeInterval<T>, berth: &'b Berth<T>) -> Self {
-        Self { interval, berth }
+impl<T: Copy + Ord> FreeBerth<T> {
+    #[inline]
+    pub fn new(interval: TimeInterval<T>, berth_index: BerthIndex) -> Self {
+        Self {
+            interval,
+            berth_index,
+        }
     }
-
+    #[inline]
     pub fn interval(&self) -> TimeInterval<T> {
         self.interval
     }
-
-    pub fn berth(&self) -> &'b Berth<T> {
-        self.berth
+    #[inline]
+    pub fn berth_index(&self) -> BerthIndex {
+        self.berth_index
     }
 }
 
 pub trait TerminalRead<'b, T: Copy + Ord> {
     fn berths(&self) -> &[BerthOccupancy<'b, T>];
-    fn berth(&self, id: BerthIdentifier) -> Option<&BerthOccupancy<'b, T>>;
+    fn berths_len(&self) -> usize;
+    fn berth(&self, idx: BerthIndex) -> Option<&BerthOccupancy<'b, T>>;
+
+    fn iter_free_intervals_for_berths_in_slice<'a>(
+        &'a self,
+        berths: &'a [BerthIndex],
+        window: TimeInterval<T>,
+    ) -> impl Iterator<Item = FreeBerth<T>> + 'a;
 
     fn iter_free_intervals_for_berths_in<'a, I>(
         &'a self,
         berths: I,
         window: TimeInterval<T>,
-    ) -> impl Iterator<Item = FreeBerth<'b, T>> + 'a
+    ) -> impl Iterator<Item = FreeBerth<T>> + 'a
     where
-        T: 'b,
-        I: IntoIterator<Item = BerthIdentifier>,
-        'b: 'a,
-        <I as IntoIterator>::IntoIter: 'a;
+        I: IntoIterator<Item = BerthIndex> + 'a;
 }
 
 pub trait TerminalWrite<'b, T: Copy + Ord>: TerminalRead<'b, T> {
     fn occupy(
         &mut self,
-        berth_id: BerthIdentifier,
+        idx: BerthIndex,
         interval: TimeInterval<T>,
-    ) -> Result<(), TerminalUpdateError<T>>;
+    ) -> Result<(), BerthUpdateError<T>>;
 
     fn release(
         &mut self,
-        berth_id: BerthIdentifier,
+        idx: BerthIndex,
         interval: TimeInterval<T>,
-    ) -> Result<(), TerminalUpdateError<T>>;
+    ) -> Result<(), BerthUpdateError<T>>;
 
-    fn apply_delta(&mut self, delta: TerminalDelta<'b, T>) -> Result<(), TerminalApplyError<T>>;
+    fn berth_mut(&mut self, index: BerthIndex) -> Option<&mut BerthOccupancy<'b, T>>;
+
+    fn apply_delta(&mut self, delta: TerminalDelta<'b, T>) -> Result<(), BerthApplyError<T>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalOccupancy<'b, T: Copy + Ord> {
     berths: Vec<BerthOccupancy<'b, T>>,
-    index_map: HashMap<BerthIdentifier, usize>,
 }
 
 impl<'b, T: Copy + Ord> TerminalOccupancy<'b, T> {
+    #[inline]
+    pub fn from_slice(berths: &'b [Berth<T>]) -> Self {
+        Self::new(berths)
+    }
+
+    #[inline]
     pub fn new<I>(berths: I) -> Self
     where
         I: IntoIterator<Item = &'b Berth<T>>,
     {
         let berths_occ: Vec<_> = berths.into_iter().map(BerthOccupancy::new).collect();
-        let index_map = berths_occ
-            .iter()
-            .enumerate()
-            .map(|(i, occ)| (occ.berth().id(), i))
-            .collect();
-
-        Self {
-            berths: berths_occ,
-            index_map,
-        }
+        Self { berths: berths_occ }
     }
 }
 
@@ -117,32 +126,44 @@ where
     }
 
     #[inline]
-    fn berth(&self, id: BerthIdentifier) -> Option<&BerthOccupancy<'b, T>> {
-        self.index_map.get(&id).map(|&i| &self.berths[i])
+    fn berth(&self, index: BerthIndex) -> Option<&BerthOccupancy<'b, T>> {
+        self.berths.get(index.get())
     }
 
     fn iter_free_intervals_for_berths_in<'a, I>(
         &'a self,
         berths: I,
         window: TimeInterval<T>,
-    ) -> impl Iterator<Item = FreeBerth<'b, T>> + 'a
+    ) -> impl Iterator<Item = FreeBerth<T>> + 'a
     where
-        I: IntoIterator<Item = BerthIdentifier>,
-        'b: 'a,
-        <I as IntoIterator>::IntoIter: 'a,
+        I: IntoIterator<Item = BerthIndex> + 'a,
     {
-        let occs = &self.berths;
-        let index_map = &self.index_map;
-
         berths
             .into_iter()
-            .filter_map(move |id| index_map.get(&id).copied())
-            .flat_map(move |ix| {
-                let berth_ref = occs[ix].berth();
-                occs[ix]
-                    .iter_free_intervals_in(window)
-                    .map(move |iv| FreeBerth::new(iv, berth_ref))
+            .filter_map(|ix| self.berth(ix).map(move |occ| (ix, occ)))
+            .flat_map(move |(ix, occ)| {
+                occ.iter_free_intervals_in(window)
+                    .map(move |iv| FreeBerth::new(iv, ix))
             })
+    }
+
+    fn iter_free_intervals_for_berths_in_slice<'a>(
+        &'a self,
+        berths: &'a [BerthIndex],
+        window: TimeInterval<T>,
+    ) -> impl Iterator<Item = FreeBerth<T>> + 'a {
+        berths
+            .iter()
+            .filter_map(|ix| self.berth(*ix).map(|occ| (ix, occ)))
+            .flat_map(move |(ix, occ)| {
+                occ.iter_free_intervals_in(window)
+                    .map(move |iv| FreeBerth::new(iv, *ix))
+            })
+    }
+
+    #[inline]
+    fn berths_len(&self) -> usize {
+        self.berths.len()
     }
 }
 
@@ -153,60 +174,40 @@ where
     #[inline]
     fn occupy(
         &mut self,
-        berth_id: BerthIdentifier,
+        berth_index: BerthIndex,
         interval: TimeInterval<T>,
-    ) -> Result<(), TerminalUpdateError<T>> {
-        let ix = self
-            .index_map
-            .get(&berth_id)
-            .copied()
-            .ok_or_else(|| BerthIdentifierNotFoundError::new(berth_id))?;
+    ) -> Result<(), BerthUpdateError<T>> {
+        let index = berth_index.get();
+        debug_assert!(index < self.berths.len());
 
-        let occ = self
-            .berths
-            .get_mut(ix)
-            .ok_or_else(|| BerthIdentifierNotFoundError::new(berth_id))?;
-
-        occ.occupy(interval).map_err(Into::into)
+        self.berths[index].occupy(interval)
     }
 
     #[inline]
     fn release(
         &mut self,
-        berth_id: BerthIdentifier,
+        idx: BerthIndex,
         interval: TimeInterval<T>,
-    ) -> Result<(), TerminalUpdateError<T>> {
-        let ix = self
-            .index_map
-            .get(&berth_id)
-            .copied()
-            .ok_or_else(|| BerthIdentifierNotFoundError::new(berth_id))?;
+    ) -> Result<(), BerthUpdateError<T>> {
+        let index = idx.get();
+        debug_assert!(index < self.berths.len());
 
-        let occ = self
-            .berths
-            .get_mut(ix)
-            .ok_or_else(|| BerthIdentifierNotFoundError::new(berth_id))?;
-
-        occ.release(interval).map_err(Into::into)
+        self.berths[index].release(interval)
     }
 
     #[inline]
-    fn apply_delta(&mut self, delta: TerminalDelta<'b, T>) -> Result<(), TerminalApplyError<T>> {
-        for (id, free) in delta.into_iter() {
-            let ix = self
-                .index_map
-                .get(&id)
-                .copied()
-                .ok_or_else(|| BerthIdentifierNotFoundError::new(id))?;
+    fn apply_delta(&mut self, delta: TerminalDelta<'b, T>) -> Result<(), BerthApplyError<T>> {
+        for (berth_index, free) in delta.into_iter() {
+            let index = berth_index.get();
+            debug_assert!(index < self.berths.len());
 
-            let bocc = self
-                .berths
-                .get_mut(ix)
-                .ok_or_else(|| BerthIdentifierNotFoundError::new(id))?;
-
-            bocc.apply(free)?;
+            self.berths[index].apply(free)?;
         }
         Ok(())
+    }
+
+    fn berth_mut(&mut self, index: BerthIndex) -> Option<&mut BerthOccupancy<'b, T>> {
+        self.berths.get_mut(index.get())
     }
 }
 
@@ -227,14 +228,18 @@ mod tests {
     fn bid(n: u32) -> BerthIdentifier {
         BerthIdentifier::new(n)
     }
+    #[inline]
+    fn bi(n: usize) -> BerthIndex {
+        BerthIndex::new(n)
+    }
 
     fn mk_berths() -> Vec<Berth<i64>> {
         vec![
-            // id:1 windows: [0,10), [20,30)
+            // index 0 (id:1): windows: [0,10), [20,30)
             Berth::from_windows(bid(1), vec![iv(0, 10), iv(20, 30)]),
-            // id:2 windows: [5,15)
+            // index 1 (id:2): windows: [5,15)
             Berth::from_windows(bid(2), vec![iv(5, 15)]),
-            // id:3 windows: [-10,-5), [40,50)
+            // index 2 (id:3): windows: [-10,-5), [40,50)
             Berth::from_windows(bid(3), vec![iv(-10, -5), iv(40, 50)]),
         ]
     }
@@ -245,22 +250,22 @@ mod tests {
         let term = TerminalOccupancy::new(&base);
 
         assert_eq!(term.berths().len(), base.len());
-        for b in &base {
-            let got = term.berth(b.id()).expect("berth id must exist");
-            // same id exposed back out
-            assert_eq!(got.berth().id(), b.id());
+        for i in 0..base.len() {
+            let got = term.berth(bi(i)).expect("berth index must exist");
+            // The underlying berth is the one we inserted at that index
+            assert_eq!(got.berth().id(), base[i].id());
         }
     }
 
     #[test]
-    fn iter_free_across_selected_ids() {
+    fn iter_free_across_selected_indices() {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
-        // Select berth 1 then 3 (by id), expect concatenation of their free windows
-        let ids = [bid(1), bid(3)];
+        // Select indices 0 then 2, expect concatenation of their free windows in that order
+        let idxs = [bi(0), bi(2)];
         let v: Vec<_> = term
-            .iter_free_intervals_for_berths_in(ids, iv(-20, 60))
+            .iter_free_intervals_for_berths_in(idxs, iv(-20, 60))
             .map(|fb| fb.interval())
             .collect();
         assert_eq!(v, vec![iv(0, 10), iv(20, 30), iv(-10, -5), iv(40, 50)]);
@@ -271,10 +276,9 @@ mod tests {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
-        // Window [8,25) clamps berth 1’s [0,10) to [8,10) and [20,30) to [20,25)
-        let ids = [bid(1)];
+        // Window [8,25) clamps index 0’s [0,10) to [8,10) and [20,30) to [20,25)
         let v: Vec<_> = term
-            .iter_free_intervals_for_berths_in(ids, iv(8, 25))
+            .iter_free_intervals_for_berths_in([bi(0)], iv(8, 25))
             .map(|fb| fb.interval())
             .collect();
         assert_eq!(v, vec![iv(8, 10), iv(20, 25)]);
@@ -285,9 +289,8 @@ mod tests {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
-        let ids = [bid(1), bid(2), bid(3)];
         assert!(
-            term.iter_free_intervals_for_berths_in(ids, iv(10, 10))
+            term.iter_free_intervals_for_berths_in([bi(0), bi(1), bi(2)], iv(10, 10))
                 .next()
                 .is_none()
         );
@@ -298,20 +301,20 @@ mod tests {
         let base = vec![Berth::from_windows(bid(10), vec![iv(0, 10)])];
         let mut term = TerminalOccupancy::new(&base);
 
-        // Occupy [3,7) on berth 10.
-        term.occupy(bid(10), iv(3, 7)).unwrap();
+        // Occupy [3,7) on index 0.
+        term.occupy(bi(0), iv(3, 7)).unwrap();
 
         // Now free must be [0,3) and [7,10)
         let v: Vec<_> = term
-            .iter_free_intervals_for_berths_in([bid(10)], iv(0, 10))
+            .iter_free_intervals_for_berths_in([bi(0)], iv(0, 10))
             .map(|fb| fb.interval())
             .collect();
         assert_eq!(v, vec![iv(0, 3), iv(7, 10)]);
 
         // Release [5,8) — merges with the [7,10) tail, yielding [5,10)
-        term.release(bid(10), iv(5, 8)).unwrap();
+        term.release(bi(0), iv(5, 8)).unwrap();
         let v2: Vec<_> = term
-            .iter_free_intervals_for_berths_in([bid(10)], iv(0, 10))
+            .iter_free_intervals_for_berths_in([bi(0)], iv(0, 10))
             .map(|fb| fb.interval())
             .collect();
         assert_eq!(v2, vec![iv(0, 3), iv(5, 10)]);
@@ -322,7 +325,7 @@ mod tests {
         let base = vec![Berth::from_windows(bid(20), vec![iv(0, 10)])];
         let mut term = TerminalOccupancy::new(&base);
 
-        let err = term.occupy(bid(20), iv(9, 15)).unwrap_err();
+        let err = term.occupy(bi(0), iv(9, 15)).unwrap_err();
         let s = err.to_string().to_lowercase();
         assert!(
             s.contains("outside"),
@@ -335,7 +338,7 @@ mod tests {
         let base = vec![Berth::from_windows(bid(21), vec![iv(10, 20)])];
         let mut term = TerminalOccupancy::new(&base);
 
-        let err = term.release(bid(21), iv(0, 25)).unwrap_err();
+        let err = term.release(bi(0), iv(0, 25)).unwrap_err();
         let s = err.to_string().to_lowercase();
         assert!(
             s.contains("outside"),
@@ -348,25 +351,20 @@ mod tests {
         let base = vec![Berth::from_windows(bid(30), vec![iv(0, 10)])];
         let mut term = TerminalOccupancy::new(&base);
 
-        term.occupy(bid(30), iv(2, 6)).unwrap();
-        let err = term.occupy(bid(30), iv(4, 8)).unwrap_err();
+        term.occupy(bi(0), iv(2, 6)).unwrap();
+        let err = term.occupy(bi(0), iv(4, 8)).unwrap_err();
         let s = err.to_string().to_lowercase();
         assert!(s.contains("not free"), "expected not-free error, got: {s}");
     }
 
     #[test]
-    fn unknown_berth_id_is_error_for_mutations() {
+    #[should_panic]
+    fn unknown_index_panics_on_mutations() {
         let base = mk_berths();
         let mut term = TerminalOccupancy::new(&base);
 
-        // ID 999 doesn’t exist.
-        let err1 = term.occupy(bid(999), iv(0, 1)).unwrap_err();
-        let err2 = term.release(bid(999), iv(0, 1)).unwrap_err();
-
-        let s1 = err1.to_string().to_lowercase();
-        let s2 = err2.to_string().to_lowercase();
-        assert!(s1.contains("not found"), "expected not-found; got: {s1}");
-        assert!(s2.contains("not found"), "expected not-found; got: {s2}");
+        // Index 999 doesn’t exist — current implementation will panic on OOB.
+        let _ = term.occupy(bi(999), iv(0, 1)).unwrap_err();
     }
 
     #[test]
@@ -374,29 +372,29 @@ mod tests {
         let base = mk_berths();
         let mut term = TerminalOccupancy::new(&base);
 
-        // Occupy berth 2 fully.
-        term.occupy(bid(2), iv(5, 15)).unwrap();
+        // Occupy index 1 fully ([5,15) for that berth).
+        term.occupy(bi(1), iv(5, 15)).unwrap();
 
-        // Berth 1 remains intact.
+        // Index 0 remains intact.
+        let v0: Vec<_> = term
+            .iter_free_intervals_for_berths_in([bi(0)], iv(-100, 100))
+            .map(|fb| fb.interval())
+            .collect();
+        assert_eq!(v0, vec![iv(0, 10), iv(20, 30)]);
+
+        // Index 1 becomes empty within its window.
         let v1: Vec<_> = term
-            .iter_free_intervals_for_berths_in([bid(1)], iv(-100, 100))
+            .iter_free_intervals_for_berths_in([bi(1)], iv(-100, 100))
             .map(|fb| fb.interval())
             .collect();
-        assert_eq!(v1, vec![iv(0, 10), iv(20, 30)]);
+        assert!(v1.is_empty());
 
-        // Berth 2 becomes empty within its window.
+        // Index 2 remains intact.
         let v2: Vec<_> = term
-            .iter_free_intervals_for_berths_in([bid(2)], iv(-100, 100))
+            .iter_free_intervals_for_berths_in([bi(2)], iv(-100, 100))
             .map(|fb| fb.interval())
             .collect();
-        assert!(v2.is_empty());
-
-        // Berth 3 remains intact.
-        let v3: Vec<_> = term
-            .iter_free_intervals_for_berths_in([bid(3)], iv(-100, 100))
-            .map(|fb| fb.interval())
-            .collect();
-        assert_eq!(v3, vec![iv(-10, -5), iv(40, 50)]);
+        assert_eq!(v2, vec![iv(-10, -5), iv(40, 50)]);
     }
 
     #[test]
@@ -405,29 +403,29 @@ mod tests {
         let mut term = TerminalOccupancy::new(&base);
 
         // Occupy and release empty interval should both be Ok and change nothing.
-        term.occupy(bid(77), iv(5, 5)).unwrap();
-        term.release(bid(77), iv(7, 7)).unwrap();
+        term.occupy(bi(0), iv(5, 5)).unwrap();
+        term.release(bi(0), iv(7, 7)).unwrap();
 
         let v: Vec<_> = term
-            .iter_free_intervals_for_berths_in([bid(77)], iv(0, 10))
+            .iter_free_intervals_for_berths_in([bi(0)], iv(0, 10))
             .map(|fb| fb.interval())
             .collect();
         assert_eq!(v, vec![iv(0, 10)]);
     }
 
     #[test]
-    fn iter_free_mixed_order_ids_yields_concatenated_per_id() {
+    fn iter_free_mixed_order_indices_yields_concatenated() {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
-        // Note the mixed order: 3, 1, 2 – by id
-        let ids = [bid(3), bid(1), bid(2)];
+        // Note the mixed order: 2, 0, 1 – by index
+        let idxs = [bi(2), bi(0), bi(1)];
         let v: Vec<_> = term
-            .iter_free_intervals_for_berths_in(ids, iv(-20, 60))
+            .iter_free_intervals_for_berths_in(idxs, iv(-20, 60))
             .map(|fb| fb.interval())
             .collect();
 
-        // Expect windows from 3, then 1, then 2.
+        // Expect windows from idx2, then idx0, then idx1.
         assert_eq!(
             v,
             vec![iv(-10, -5), iv(40, 50), iv(0, 10), iv(20, 30), iv(5, 15)]
@@ -435,31 +433,31 @@ mod tests {
     }
 
     #[test]
-    fn iter_free_ids_respects_order_and_window() {
+    fn iter_free_indices_respects_order_and_window() {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
-        // order: 3, 1, 999 (unknown), 2
-        let ids = [bid(3), bid(1), bid(999), bid(2)];
+        // order: 2, 0, (skip unknown), 1
+        let idxs = [bi(2), bi(0), bi(1)];
         let v: Vec<_> = term
-            .iter_free_intervals_for_berths_in(ids, iv(-20, 60))
-            .map(|fb| (fb.berth().id(), fb.interval()))
+            .iter_free_intervals_for_berths_in(idxs, iv(-20, 60))
+            .map(|fb| (fb.berth_index(), fb.interval()))
             .collect();
 
         assert_eq!(
             v,
             vec![
-                (bid(3), iv(-10, -5)),
-                (bid(3), iv(40, 50)),
-                (bid(1), iv(0, 10)),
-                (bid(1), iv(20, 30)),
-                (bid(2), iv(5, 15)),
+                (bi(2), iv(-10, -5)),
+                (bi(2), iv(40, 50)),
+                (bi(0), iv(0, 10)),
+                (bi(0), iv(20, 30)),
+                (bi(1), iv(5, 15)),
             ]
         );
 
-        // clamp check
+        // clamp check for a single index
         let v2: Vec<_> = term
-            .iter_free_intervals_for_berths_in([bid(1)], iv(8, 25))
+            .iter_free_intervals_for_berths_in([bi(0)], iv(8, 25))
             .map(|fb| fb.interval())
             .collect();
         assert_eq!(v2, vec![iv(8, 10), iv(20, 25)]);

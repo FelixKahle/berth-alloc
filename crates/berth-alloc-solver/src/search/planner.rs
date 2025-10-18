@@ -20,81 +20,54 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use berth_alloc_core::prelude::{Cost, TimeInterval, TimePoint};
-use berth_alloc_model::{
-    common::FlexibleKind,
-    prelude::{Berth, Request},
-    problem::{
-        asg::{AssignmentRef, AssignmentView},
-        req::RequestView,
-    },
-};
 use num_traits::Zero;
 use num_traits::{CheckedAdd, CheckedSub};
 use std::ops::Mul;
 
 use crate::{
-    search::err::{BerthNotFreeError, ProposeAssignmentError, ProposeUnassignmentError},
+    model::{
+        index::{BerthIndex, RequestIndex},
+        solver_model::SolverModel,
+    },
+    search::err::{
+        BerthNotFreeError, NotAllowedOnBerthError, NotAssignedError, ProposeAssignmentError,
+        ProposeUnassignmentError,
+    },
     state::{
-        plan::Plan,
-        registry::ledger::Ledger,
-        solver_state::SolverState,
+        decisionvar::{Decision, DecisionVar, DecisionVarVec},
+        plan::{DecisionVarPatch, Plan},
+        solver_state::{SolverState, SolverStateView},
         terminal::{
-            err::BerthIdentifierNotFoundError,
             sandbox::TerminalSandbox,
-            terminalocc::{TerminalOccupancy, TerminalRead},
+            terminalocc::{FreeBerth, TerminalOccupancy, TerminalRead},
         },
     },
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FreeBerth<'p, T: Copy + Ord> {
-    interval: TimeInterval<T>,
-    berth: &'p Berth<T>,
-}
-
-impl<'p, T: Copy + Ord> FreeBerth<'p, T> {
-    #[inline]
-    pub fn new(interval: TimeInterval<T>, berth: &'p Berth<T>) -> Self {
-        Self { interval, berth }
-    }
-
-    #[inline]
-    pub fn interval(&self) -> &TimeInterval<T> {
-        &self.interval
-    }
-
-    #[inline]
-    pub fn berth(&self) -> &'p Berth<T> {
-        self.berth
-    }
-}
-
-impl<'p, T: Copy + Ord + std::fmt::Display> std::fmt::Display for FreeBerth<'p, T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "FreeBerth(berth: {}, interval: {})",
-            self.berth.id(),
-            self.interval
-        )
-    }
-}
-
 #[derive(Debug, Clone)]
-pub struct PlanExplorer<'pb, 'p, T: Copy + Ord> {
-    ledger: &'pb Ledger<'p, T>,
+pub struct PlanExplorer<'pb, 'm, 'p, T: Copy + Ord> {
+    solver_model: &'m SolverModel<'p, T>,
+    decision_vars: &'pb [DecisionVar<T>],
     sandbox: &'pb TerminalSandbox<'p, T>,
 }
 
-impl<'pb, 'p, T: Copy + Ord> PlanExplorer<'pb, 'p, T> {
+impl<'pb, 'm, 'p, T: Copy + Ord> PlanExplorer<'pb, 'm, 'p, T> {
     #[inline]
-    pub fn new(ledger: &'pb Ledger<'p, T>, sandbox: &'pb TerminalSandbox<'p, T>) -> Self {
-        Self { ledger, sandbox }
+    pub fn new(
+        solver_model: &'m SolverModel<'p, T>,
+        decision_vars: &'pb [DecisionVar<T>],
+        sandbox: &'pb TerminalSandbox<'p, T>,
+    ) -> Self {
+        Self {
+            solver_model,
+            decision_vars,
+            sandbox,
+        }
     }
 
     #[inline]
-    pub fn ledger(&self) -> &'pb Ledger<'p, T> {
-        self.ledger
+    pub fn decision_vars(&self) -> &'pb [DecisionVar<T>] {
+        self.decision_vars
     }
 
     #[inline]
@@ -103,74 +76,100 @@ impl<'pb, 'p, T: Copy + Ord> PlanExplorer<'pb, 'p, T> {
     }
 
     #[inline]
-    pub fn iter_free_for<R>(&self, req: &'pb R) -> impl Iterator<Item = FreeBerth<'p, T>> + 'pb
+    pub fn iter_free_for(
+        &self,
+        request_index: RequestIndex,
+    ) -> impl Iterator<Item = FreeBerth<T>> + 'pb
     where
         T: CheckedAdd + CheckedSub,
-        R: RequestView<T> + ?Sized,
+        'm: 'pb, // m lives at least as long as pb; the model will outlive the builder
     {
-        let window = req.feasible_window();
-        let allowed = req.iter_allowed_berths_ids();
+        let window = self.solver_model.feasible_interval(request_index);
+        let allowed = self.solver_model.allowed_berth_indices(request_index);
+
         self.sandbox
             .inner()
-            .iter_free_intervals_for_berths_in(allowed, window)
-            .map(|fb| FreeBerth::new(fb.interval(), fb.berth()))
+            .iter_free_intervals_for_berths_in_slice(allowed, window)
     }
 
     #[inline]
-    pub fn iter_unassigned_requests(&self) -> impl Iterator<Item = &'p Request<FlexibleKind, T>>
+    pub fn iter_unassigned(&self) -> impl Iterator<Item = RequestIndex>
     where
         T: CheckedAdd + CheckedSub,
     {
-        self.ledger.iter_unassigned_requests()
+        self.decision_vars()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, dv)| {
+                if !dv.is_assigned() {
+                    Some(RequestIndex::new(idx))
+                } else {
+                    None
+                }
+            })
     }
 
     #[inline]
-    pub fn iter_assigned_requests(&self) -> impl Iterator<Item = &'p Request<FlexibleKind, T>>
+    pub fn iter_assigned_requests(&self) -> impl Iterator<Item = RequestIndex>
     where
         T: CheckedAdd + CheckedSub,
     {
-        self.ledger.iter_assigned_requests()
+        self.decision_vars()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, dv)| {
+                if dv.is_assigned() {
+                    Some(RequestIndex::new(idx))
+                } else {
+                    None
+                }
+            })
     }
 
     #[inline]
-    pub fn iter_assignments(
-        &self,
-    ) -> impl Iterator<Item = &AssignmentRef<'p, 'p, FlexibleKind, T>> {
-        self.ledger.iter_assignments()
+    pub fn iter_assignments(&self) -> impl Iterator<Item = &DecisionVar<T>> {
+        self.decision_vars().iter().filter(|dv| dv.is_assigned())
     }
 
     #[inline]
     pub fn peek_cost(
         &self,
-        request: &'p Request<FlexibleKind, T>,
+        request: RequestIndex,
         start_time: TimePoint<T>,
-        free_berth: &FreeBerth<'p, T>,
+        berth_index: BerthIndex,
     ) -> Option<Cost>
     where
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
-        let berth = free_berth.berth();
-        let asg = AssignmentRef::new(request, berth, start_time).ok()?;
-        Some(asg.cost())
+        self.solver_model
+            .cost_of_assignment(request, berth_index, start_time)
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct PlanBuilder<'p, T: Copy + Ord> {
-    ledger: Ledger<'p, T>,
+pub struct PlanBuilder<'m, 'p, T: Copy + Ord> {
+    solver_model: &'m SolverModel<'p, T>,
+    decision_vars: DecisionVarVec<T>,
     sandbox: TerminalSandbox<'p, T>,
+    patches: Vec<DecisionVarPatch<T>>,
     delta_cost: Cost,
     delta_unassigned: i32,
 }
 
-impl<'p, T: Copy + Ord> PlanBuilder<'p, T> {
+impl<'m, 'p, T: Copy + Ord> PlanBuilder<'m, 'p, T> {
     #[inline]
-    pub fn new(ledger: Ledger<'p, T>, terminal: TerminalOccupancy<'p, T>) -> Self {
+    pub fn new(
+        solver_model: &'m SolverModel<'p, T>,
+        decision_vars: DecisionVarVec<T>,
+        terminal: TerminalOccupancy<'p, T>,
+    ) -> Self {
         Self {
-            ledger,
+            solver_model,
+            decision_vars,
             sandbox: TerminalSandbox::new(terminal),
             delta_cost: Cost::zero(),
             delta_unassigned: 0,
+            patches: Vec::with_capacity(32),
         }
     }
 
@@ -185,8 +184,8 @@ impl<'p, T: Copy + Ord> PlanBuilder<'p, T> {
     }
 
     #[inline]
-    pub fn ledger(&self) -> &Ledger<'p, T> {
-        &self.ledger
+    pub fn decision_vars(&self) -> &DecisionVarVec<T> {
+        &self.decision_vars
     }
 
     #[inline]
@@ -197,72 +196,123 @@ impl<'p, T: Copy + Ord> PlanBuilder<'p, T> {
     #[inline]
     pub fn propose_assignment(
         &mut self,
-        request: &'p Request<FlexibleKind, T>,
+        request: RequestIndex,
         start_time: TimePoint<T>,
-        free_berth: &FreeBerth<'p, T>,
-    ) -> Result<AssignmentRef<'p, 'p, FlexibleKind, T>, ProposeAssignmentError<T>>
+        free_berth: &FreeBerth<T>,
+    ) -> Result<(), ProposeAssignmentError<T>>
     where
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
-        let berth = free_berth.berth();
-        let free_iv = free_berth.interval();
-        let asg = AssignmentRef::new(request, berth, start_time)?;
-        let asg_iv = asg.interval();
+        let cost = self
+            .solver_model
+            .cost_of_assignment(request, free_berth.berth_index(), start_time)
+            .ok_or_else(|| {
+                ProposeAssignmentError::NotAllowedOnBerth(NotAllowedOnBerthError::new(
+                    request,
+                    free_berth.berth_index(),
+                ))
+            })?;
 
-        if !free_iv.contains_interval(&asg_iv) {
-            return Err(ProposeAssignmentError::NotFree(BerthNotFreeError::new(
-                berth.id(),
-                asg_iv,
-                *free_iv,
-            )));
+        let processing_time = self
+            .solver_model
+            .processing_time(request, free_berth.berth_index())
+            .ok_or_else(|| {
+                ProposeAssignmentError::NotAllowedOnBerth(NotAllowedOnBerthError::new(
+                    request,
+                    free_berth.berth_index(),
+                ))
+            })?;
+
+        let end_time = start_time + processing_time;
+        let asg_iv = TimeInterval::new(start_time, end_time);
+
+        if !free_berth.interval().contains_interval(&asg_iv) {
+            return Err(ProposeAssignmentError::BerthNotFree(
+                BerthNotFreeError::new(free_berth.berth_index(), asg_iv, free_berth.interval()),
+            ));
         }
 
-        let asg = self
-            .ledger
-            .commit_assignment(request, berth, start_time)
-            .map_err(ProposeAssignmentError::from)?;
-
         self.sandbox
-            .occupy(berth.id(), asg_iv)
+            .occupy(free_berth.berth_index(), asg_iv)
             .map_err(ProposeAssignmentError::from)?;
 
-        self.delta_cost += asg.cost();
+        self.delta_cost += cost;
         self.delta_unassigned -= 1;
 
-        Ok(asg)
+        let assigned = DecisionVar::Assigned(Decision {
+            berth_index: free_berth.berth_index(),
+            start_time,
+        });
+        self.decision_vars[request] = assigned;
+        self.patches.push(DecisionVarPatch::new(request, assigned));
+
+        Ok(())
     }
 
     #[inline]
     pub fn propose_unassignment(
         &mut self,
-        asg: &AssignmentRef<'p, 'p, FlexibleKind, T>,
-    ) -> Result<FreeBerth<'p, T>, ProposeUnassignmentError<T>>
+        request: RequestIndex,
+    ) -> Result<FreeBerth<T>, ProposeUnassignmentError<T>>
     where
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
-        let id = asg.berth().id();
-        let iv = asg.interval();
+        let dv = match self.decision_vars[request] {
+            DecisionVar::Unassigned => {
+                return Err(ProposeUnassignmentError::NotAssigned(
+                    NotAssignedError::new(request),
+                ));
+            }
+            DecisionVar::Assigned(decision) => decision,
+        };
 
-        self.ledger
-            .uncommit_assignment(asg)
-            .map_err(ProposeUnassignmentError::from)?;
+        let iv = match self
+            .solver_model
+            .interval(request, dv.berth_index, dv.start_time)
+        {
+            Some(interval) => interval,
+            None => {
+                return Err(ProposeUnassignmentError::NotAllowedOnBerth(
+                    NotAllowedOnBerthError::new(request, dv.berth_index),
+                ));
+            }
+        };
+
+        let cost =
+            match self
+                .solver_model
+                .cost_of_assignment(request, dv.berth_index, dv.start_time)
+            {
+                Some(cost) => cost,
+                None => {
+                    return Err(ProposeUnassignmentError::NotAllowedOnBerth(
+                        NotAllowedOnBerthError::new(request, dv.berth_index),
+                    ));
+                }
+            };
+
         self.sandbox
-            .release(id, iv)
+            .release(dv.berth_index, iv)
             .map_err(ProposeUnassignmentError::from)?;
 
-        self.delta_cost -= asg.cost();
+        self.delta_cost -= cost;
         self.delta_unassigned += 1;
 
-        Ok(FreeBerth::new(iv, asg.berth()))
+        self.decision_vars[request] = DecisionVar::Unassigned;
+        self.patches
+            .push(DecisionVarPatch::new(request, DecisionVar::Unassigned));
+
+        Ok(FreeBerth::new(iv, dv.berth_index))
     }
 
     #[inline]
     pub fn with_explorer<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(&PlanExplorer<'_, 'p, T>) -> R,
+        F: FnOnce(&PlanExplorer<'_, 'm, 'p, T>) -> R,
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
-        let explorer: PlanExplorer<'_, 'p, T> = PlanExplorer::new(&self.ledger, &self.sandbox);
+        let explorer: PlanExplorer<'_, 'm, 'p, T> =
+            PlanExplorer::new(self.solver_model, &self.decision_vars, &self.sandbox);
         f(&explorer)
     }
 
@@ -275,38 +325,38 @@ impl<'p, T: Copy + Ord> PlanBuilder<'p, T> {
     #[inline]
     pub fn peek_cost(
         &self,
-        request: &'p Request<FlexibleKind, T>,
+        request: RequestIndex,
         start_time: TimePoint<T>,
-        free_berth: &FreeBerth<'p, T>,
+        free_berth: &FreeBerth<T>,
     ) -> Option<Cost>
     where
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
-        let berth = free_berth.berth();
-        let asg = AssignmentRef::new(request, berth, start_time).ok()?;
-        Some(asg.cost())
+        self.solver_model
+            .cost_of_assignment(request, free_berth.berth_index(), start_time)
     }
 
     #[inline]
-    fn finalize(self) -> Result<Plan<'p, T>, BerthIdentifierNotFoundError> {
-        Ok(Plan::new_delta(
-            self.ledger,
-            self.sandbox.delta()?,
+    fn finalize(self) -> Plan<'p, T> {
+        Plan::new_delta(
+            self.patches,
+            self.sandbox.delta(),
             self.delta_cost,
             self.delta_unassigned,
-        ))
+        )
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct PlanningContext<'s, 'p, T: Copy + Ord> {
+pub struct PlanningContext<'s, 'm, 'p, T: Copy + Ord> {
+    model: &'m SolverModel<'p, T>,
     state: &'s SolverState<'p, T>,
 }
 
-impl<'s, 'p, T: Copy + Ord> PlanningContext<'s, 'p, T> {
+impl<'s, 'm, 'p, T: Copy + Ord> PlanningContext<'s, 'm, 'p, T> {
     #[inline]
-    pub fn new(state: &'s SolverState<'p, T>) -> Self {
-        Self { state }
+    pub fn new(model: &'m SolverModel<'p, T>, state: &'s SolverState<'p, T>) -> Self {
+        Self { model, state }
     }
 
     pub fn state(&self) -> &'s SolverState<'p, T> {
@@ -315,15 +365,16 @@ impl<'s, 'p, T: Copy + Ord> PlanningContext<'s, 'p, T> {
 
     // Build a plan using a closure to configure the builder.
     #[inline]
-    pub fn with_builder<F>(&self, f: F) -> Result<Plan<'p, T>, BerthIdentifierNotFoundError>
+    pub fn with_builder<F>(&self, f: F) -> Plan<'p, T>
     where
-        F: FnOnce(&mut PlanBuilder<'p, T>),
+        F: FnOnce(&mut PlanBuilder<'m, 'p, T>),
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
         // For now we do not use specialized overlays. Just the cloned ledger and terminal,
         // so proposals can be made on them independently from the master state.
         let mut pb = PlanBuilder::new(
-            self.state.ledger().clone(),
+            self.model,
+            self.state().decision_variables().into(),
             self.state.terminal_occupancy().clone(),
         );
         f(&mut pb);
@@ -331,18 +382,21 @@ impl<'s, 'p, T: Copy + Ord> PlanningContext<'s, 'p, T> {
     }
 
     #[inline]
-    pub fn builder(&self) -> PlanBuilder<'p, T>
+    pub fn builder(&self) -> PlanBuilder<'m, 'p, T>
     where
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
         PlanBuilder::new(
-            self.state.ledger().clone(),
+            self.model,
+            self.state().decision_variables().into(),
             self.state.terminal_occupancy().clone(),
         )
     }
 }
 
-impl<'s, 'p, T: Copy + Ord + std::fmt::Display> std::fmt::Display for PlanningContext<'s, 'p, T> {
+impl<'s, 'm, 'p, T: Copy + Ord + std::fmt::Display> std::fmt::Display
+    for PlanningContext<'s, 'm, 'p, T>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "PlanningContext(state: {})", self.state)
     }
@@ -350,9 +404,14 @@ impl<'s, 'p, T: Copy + Ord + std::fmt::Display> std::fmt::Display for PlanningCo
 
 #[cfg(test)]
 mod tests {
-    use crate::state::berth::berthocc::BerthRead;
-
     use super::*;
+    use crate::{
+        model::solver_model::SolverModel,
+        state::{
+            berth::berthocc::BerthRead,
+            decisionvar::{DecisionVar, DecisionVarVec},
+        },
+    };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
     use berth_alloc_model::prelude::*;
     use std::collections::BTreeMap;
@@ -405,93 +464,103 @@ mod tests {
         Problem::new(berths, fixed, flex).unwrap()
     }
 
-    fn mk_occ<'b>(berths: &'b [Berth<i64>]) -> TerminalOccupancy<'b, i64> {
+    fn mk_occ<'b, I>(berths: I) -> TerminalOccupancy<'b, i64>
+    where
+        I: IntoIterator<Item = &'b Berth<i64>>,
+    {
         TerminalOccupancy::new(berths)
     }
 
     #[test]
     fn test_plan_builder_propose_assignment_and_finalize() {
         let prob = problem_one_berth_two_flex();
-        let base = vec![berth(1, 0, 1000)];
+        let model = SolverModel::try_from(&prob).expect("model ok");
 
-        let ledger = Ledger::new(&prob);
-        let term = mk_occ(&base);
-        let mut pb = PlanBuilder::new(ledger, term);
+        // terminal from the problem's berths
+        let term = mk_occ(prob.berths().iter());
 
-        let req1 = prob.flexible_requests().get(rid(1)).unwrap();
-        let b1 = prob.berths().get(bid(1)).unwrap();
+        // two requests → two DVs (both unassigned)
+        let dv = DecisionVarVec::from(vec![
+            DecisionVar::unassigned();
+            model.flexible_requests_len()
+        ]);
+        let mut pb = PlanBuilder::new(&model, dv, term);
 
-        // Free interval across full availability
-        let free = FreeBerth::new(iv(0, 1000), b1);
+        // request index for rid(1) and berth index for bid(1)
+        let r_ix = model.index_manager().request_index(rid(1)).unwrap();
+        let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
 
-        // Propose assignment of r1 at t=0
-        let asg = pb
-            .propose_assignment(req1, tp(0), &free)
+        // take a free slot on that berth within the feasible window
+        let free = pb
+            .sandbox()
+            .inner()
+            .iter_free_intervals_for_berths_in([b_ix], model.feasible_interval(r_ix))
+            .next()
+            .expect("free slot exists");
+
+        // assign at t=0
+        pb.propose_assignment(r_ix, tp(0), &free)
             .expect("propose assignment should succeed");
 
-        // Ledger mutated
-        assert_eq!(pb.ledger().iter_assignments().count(), 1);
-        assert_eq!(
-            pb.ledger().iter_assigned_requests().next().unwrap().id(),
-            rid(1)
-        );
-
-        // Sandbox mutated: [0,10) now occupied on b1
-        let occ = pb.sandbox().inner().berth(bid(1)).expect("b1 exists");
+        // sandbox reflects occupancy [0, pt)
+        let pt = model.processing_time(r_ix, b_ix).expect("pt defined");
+        let asg_iv = iv(0, pt.value());
+        let occ = pb.sandbox().inner().berth(b_ix).expect("berth exists");
         assert!(
-            !occ.is_free(asg.interval()),
-            "assigned interval must be occupied"
+            !occ.is_free(asg_iv),
+            "assigned interval must be occupied in sandbox"
         );
 
-        // Deltas tracked
+        // deltas tracked
         assert!(pb.delta_cost() > 0, "delta_cost should increase");
-        assert_eq!(
-            pb.delta_unassigned(),
-            -1,
-            "one assignment lowers unassigned by 1"
-        );
+        assert_eq!(pb.delta_unassigned(), -1, "unassigned should drop by 1");
 
-        // Finalize plan
-        let plan = pb.finalize().expect("finalize should succeed");
+        // finalize: patches and terminal delta produced
+        let plan = pb.finalize();
         assert!(plan.delta_cost > 0);
         assert_eq!(plan.delta_unassigned, -1);
         assert!(
             !plan.terminal_delta.is_empty(),
             "delta must carry touched berth"
         );
+        assert_eq!(plan.decision_var_patches.len(), 1, "one DV patch expected");
     }
 
     #[test]
     fn test_plan_builder_propose_unassignment_roundtrip() {
         let prob = problem_one_berth_two_flex();
-        let base = vec![berth(1, 0, 1000)];
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
 
-        let ledger = Ledger::new(&prob);
-        let term = mk_occ(&base);
-        let mut pb = PlanBuilder::new(ledger, term);
+        let dv = DecisionVarVec::from(vec![
+            DecisionVar::unassigned();
+            model.flexible_requests_len()
+        ]);
+        let mut pb = PlanBuilder::new(&model, dv, term);
 
-        let req1 = prob.flexible_requests().get(rid(1)).unwrap();
-        let b1 = prob.berths().get(bid(1)).unwrap();
-        let free = FreeBerth::new(iv(0, 1000), b1);
+        let r_ix = model.index_manager().request_index(rid(1)).unwrap();
+        let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
 
-        let asg = pb
-            .propose_assignment(req1, tp(0), &free)
+        let free = pb
+            .sandbox()
+            .inner()
+            .iter_free_intervals_for_berths_in([b_ix], model.feasible_interval(r_ix))
+            .next()
+            .unwrap();
+
+        pb.propose_assignment(r_ix, tp(0), &free)
             .expect("assign ok");
-        assert_eq!(pb.ledger().iter_assignments().count(), 1);
 
-        // Now unassign
-        let fb = pb
-            .propose_unassignment(&asg)
-            .expect("unassignment should succeed");
+        // unassign the same request
+        let fb = pb.propose_unassignment(r_ix).expect("unassign ok");
 
-        // Ledger back to zero assignments
-        assert_eq!(pb.ledger().iter_assignments().count(), 0);
+        // returned free berth equals the assignment interval
+        let pt = model.processing_time(r_ix, b_ix).unwrap();
+        let expected = iv(0, pt.value());
+        assert_eq!(fb.interval(), expected);
+        assert_eq!(fb.berth_index(), b_ix);
 
-        // Returned free berth interval should equal the assignment interval
-        assert_eq!(fb.interval(), &asg.interval());
-        assert_eq!(fb.berth().id(), asg.berth().id());
-
-        // Delta accounting returns to zero
+        // deltas return to zero
         assert_eq!(pb.delta_unassigned(), 0);
         assert_eq!(pb.delta_cost(), 0);
     }
@@ -499,95 +568,120 @@ mod tests {
     #[test]
     fn test_plan_explorer_iterators_reflect_builder_state() {
         let prob = problem_one_berth_two_flex();
-        let base = vec![berth(1, 0, 1000)];
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
 
-        let ledger = Ledger::new(&prob);
-        let term = mk_occ(&base);
-        let mut pb = PlanBuilder::new(ledger, term);
+        let dv = DecisionVarVec::from(vec![
+            DecisionVar::unassigned();
+            model.flexible_requests_len()
+        ]);
+        let mut pb = PlanBuilder::new(&model, dv, term);
 
-        // Initially: 2 unassigned, 0 assigned
+        // initially: all unassigned
         pb.with_explorer(|ex| {
-            assert_eq!(ex.iter_unassigned_requests().count(), 2);
+            assert_eq!(ex.iter_unassigned().count(), model.flexible_requests_len());
             assert_eq!(ex.iter_assigned_requests().count(), 0);
 
-            // For r1, we should see at least one free interval on allowed berth in window
-            let r1 = ex
-                .iter_unassigned_requests()
-                .find(|r| r.id() == rid(1))
-                .unwrap();
-            assert!(ex.iter_free_for(r1).next().is_some());
+            let r_ix = model.index_manager().request_index(rid(1)).unwrap();
+            assert!(ex.iter_free_for(r_ix).next().is_some());
         });
 
-        // Assign r1
-        let r1 = prob.flexible_requests().get(rid(1)).unwrap();
-        let b1 = prob.berths().get(bid(1)).unwrap();
-        let free = FreeBerth::new(iv(0, 1000), b1);
-        pb.propose_assignment(r1, tp(0), &free).expect("assign ok");
+        // assign one
+        let r_ix = model.index_manager().request_index(rid(1)).unwrap();
+        let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
+        let free = pb
+            .sandbox()
+            .inner()
+            .iter_free_intervals_for_berths_in([b_ix], model.feasible_interval(r_ix))
+            .next()
+            .unwrap();
+        pb.propose_assignment(r_ix, tp(0), &free)
+            .expect("assign ok");
 
-        // Now: 1 unassigned, 1 assigned
+        // now: one assigned, one unassigned
         pb.with_explorer(|ex| {
-            assert_eq!(ex.iter_unassigned_requests().count(), 1);
+            assert_eq!(
+                ex.iter_unassigned().count(),
+                model.flexible_requests_len() - 1
+            );
             assert_eq!(ex.iter_assigned_requests().count(), 1);
-            // iter_assignments surfaces the one assignment
             assert_eq!(ex.iter_assignments().count(), 1);
         });
     }
 
     #[test]
     fn test_planning_context_with_builder_isolated_from_master() {
+        use crate::state::fitness::Fitness;
+        use crate::state::solver_state::SolverState;
+
         let prob = problem_one_berth_two_flex();
-        let base = vec![berth(1, 0, 1000)];
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
 
-        // Build a solver state
-        let ledger = Ledger::new(&prob);
-        let term = mk_occ(&base);
-        let state = SolverState::new(ledger, term);
+        let dv = DecisionVarVec::from(vec![
+            DecisionVar::unassigned();
+            model.flexible_requests_len()
+        ]);
+        let fit = Fitness::new(0, model.flexible_requests_len());
+        let state = SolverState::new(dv, term, fit);
 
-        // Context over the state
-        let ctx = PlanningContext::new(&state);
+        let ctx = PlanningContext::new(&model, &state);
 
-        // Build a plan that assigns r1
-        let plan = ctx
-            .with_builder(|pb| {
-                let r1 = prob.flexible_requests().get(rid(1)).unwrap();
-                let b1 = prob.berths().get(bid(1)).unwrap();
-                let free = FreeBerth::new(iv(0, 1000), b1);
-                pb.propose_assignment(r1, tp(0), &free).expect("assign ok");
-            })
-            .expect("plan finalize ok");
+        let plan = ctx.with_builder(|pb| {
+            let r_ix = model.index_manager().request_index(rid(1)).unwrap();
+            let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
+            let free = pb
+                .sandbox()
+                .inner()
+                .iter_free_intervals_for_berths_in([b_ix], model.feasible_interval(r_ix))
+                .next()
+                .unwrap();
+            pb.propose_assignment(r_ix, tp(0), &free)
+                .expect("assign ok");
+        });
 
-        // Master state remains unchanged (no assignments)
-        assert_eq!(state.ledger().iter_assignments().count(), 0);
+        // master state remains unchanged
+        assert_eq!(
+            state
+                .decision_variables()
+                .iter()
+                .filter(|dv| dv.is_assigned())
+                .count(),
+            0
+        );
 
-        // Plan carries a mutated ledger with one assignment
-        assert_eq!(plan.ledger.iter_assignments().count(), 1);
-        assert_eq!(plan.delta_unassigned, -1);
-        assert!(plan.delta_cost > 0);
+        // plan carries patches and terminal delta
+        assert_eq!(plan.decision_var_patches.len(), 1);
         assert!(!plan.terminal_delta.is_empty());
+        assert!(plan.delta_cost > 0);
+        assert_eq!(plan.delta_unassigned, -1);
     }
 
     #[test]
     fn test_propose_assignment_not_free_error() {
         let prob = problem_one_berth_two_flex();
-        let base = vec![berth(1, 0, 1000)];
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
 
-        let ledger = Ledger::new(&prob);
-        let term = mk_occ(&base);
-        let mut pb = PlanBuilder::new(ledger, term);
+        let dv = DecisionVarVec::from(vec![
+            DecisionVar::unassigned();
+            model.flexible_requests_len()
+        ]);
+        let mut pb = PlanBuilder::new(&model, dv, term);
 
-        let r1 = prob.flexible_requests().get(rid(1)).unwrap();
-        let b1 = prob.berths().get(bid(1)).unwrap();
+        let r_ix = model.index_manager().request_index(rid(1)).unwrap();
+        let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
 
-        // Construct a "free berth" interval that is smaller than the assignment window,
-        // guaranteeing NotFree before any sandbox/ledger mutation.
-        let narrow = FreeBerth::new(iv(5, 7), b1);
+        // Make an artificially narrow "free" window that can't contain the assignment
+        let narrow = FreeBerth::new(iv(5, 7), b_ix);
 
-        let err = pb.propose_assignment(r1, tp(0), &narrow).unwrap_err();
-        let s = err.to_string().to_lowercase();
-        assert!(s.contains("not free"), "expected NotFree error, got: {s}");
+        let err = pb.propose_assignment(r_ix, tp(0), &narrow).unwrap_err();
+        match err {
+            ProposeAssignmentError::BerthNotFree(_) => {}
+            other => panic!("expected BerthNotFree, got: {other:?}"),
+        }
 
-        // No mutations occurred
-        assert_eq!(pb.ledger().iter_assignments().count(), 0);
+        // No deltas applied
         assert_eq!(pb.delta_unassigned(), 0);
         assert_eq!(pb.delta_cost(), 0);
     }

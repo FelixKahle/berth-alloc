@@ -19,21 +19,27 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::state::berth::berthocc::BerthOccupancy;
-use berth_alloc_model::prelude::BerthIdentifier;
+use crate::{model::index::BerthIndex, state::berth::berthocc::BerthOccupancy};
 
 #[derive(Debug, Clone)]
 pub struct TerminalDelta<'b, T: Copy + Ord> {
-    updates: Vec<(BerthIdentifier, BerthOccupancy<'b, T>)>,
+    updates: Vec<(BerthIndex, BerthOccupancy<'b, T>)>,
 }
 
 impl<'b, T: Copy + Ord> TerminalDelta<'b, T> {
     #[inline]
-    pub fn from_updates(updates: Vec<(BerthIdentifier, BerthOccupancy<'b, T>)>) -> Self {
+    pub fn from_updates(updates: Vec<(BerthIndex, BerthOccupancy<'b, T>)>) -> Self {
         Self { updates }
     }
 
-    pub fn updates(&self) -> &[(BerthIdentifier, BerthOccupancy<'b, T>)] {
+    #[inline]
+    pub fn empty() -> Self {
+        Self {
+            updates: Vec::new(),
+        }
+    }
+
+    pub fn updates(&self) -> &[(BerthIndex, BerthOccupancy<'b, T>)] {
         &self.updates
     }
 
@@ -53,7 +59,7 @@ impl<'b, T: Copy + Ord> Default for TerminalDelta<'b, T> {
 }
 
 impl<'b, T: Copy + Ord> IntoIterator for TerminalDelta<'b, T> {
-    type Item = (BerthIdentifier, BerthOccupancy<'b, T>);
+    type Item = (BerthIndex, BerthOccupancy<'b, T>);
     type IntoIter = std::vec::IntoIter<Self::Item>;
 
     #[inline]

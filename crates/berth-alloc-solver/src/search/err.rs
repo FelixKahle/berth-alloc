@@ -20,33 +20,32 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use berth_alloc_core::prelude::TimeInterval;
-use berth_alloc_model::{prelude::BerthIdentifier, problem::err::AssignmentError};
 
-use crate::state::{
-    registry::err::{LedgerCommitError, LedgerUncomitError},
-    terminal::err::TerminalUpdateError,
+use crate::{
+    model::index::{BerthIndex, RequestIndex},
+    state::berth::err::BerthUpdateError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BerthNotFreeError<T> {
-    id: BerthIdentifier,
+    index: BerthIndex,
     requested: TimeInterval<T>,
     available: TimeInterval<T>,
 }
 
 impl<T> BerthNotFreeError<T> {
     #[inline]
-    pub fn new(id: BerthIdentifier, requested: TimeInterval<T>, actual: TimeInterval<T>) -> Self {
+    pub fn new(index: BerthIndex, requested: TimeInterval<T>, actual: TimeInterval<T>) -> Self {
         Self {
-            id,
+            index,
             requested,
             available: actual,
         }
     }
 
     #[inline]
-    pub fn id(&self) -> BerthIdentifier {
-        self.id
+    pub fn berth_index(&self) -> BerthIndex {
+        self.index
     }
 
     #[inline]
@@ -74,81 +73,152 @@ where
         write!(
             f,
             "Berth {} not free for requested {} (available window: {})",
-            self.id, self.requested, self.available
+            self.index, self.requested, self.available
         )
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NotAllowedOnBerthError {
+    request_index: RequestIndex,
+    berth_index: BerthIndex,
+}
+
+impl NotAllowedOnBerthError {
+    #[inline]
+    pub fn new(request_index: RequestIndex, berth_index: BerthIndex) -> Self {
+        Self {
+            request_index,
+            berth_index,
+        }
+    }
+
+    #[inline]
+    pub fn request_index(&self) -> RequestIndex {
+        self.request_index
+    }
+
+    #[inline]
+    pub fn berth_index(&self) -> BerthIndex {
+        self.berth_index
+    }
+}
+
+impl std::fmt::Display for NotAllowedOnBerthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Request {} is not allowed on berth {}",
+            self.request_index, self.berth_index
+        )
+    }
+}
+
+impl std::error::Error for NotAllowedOnBerthError {}
 
 impl<T: std::fmt::Debug + std::fmt::Display> std::error::Error for BerthNotFreeError<T> {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProposeAssignmentError<T> {
-    Ledger(LedgerCommitError<T>),
-    Terminal(TerminalUpdateError<T>),
-    NotFree(BerthNotFreeError<T>),
+    Berth(BerthUpdateError<T>),
+    NotAllowedOnBerth(NotAllowedOnBerthError),
+    BerthNotFree(BerthNotFreeError<T>),
 }
 
-impl<T: std::fmt::Display> std::fmt::Display for ProposeAssignmentError<T> {
+impl<T: std::fmt::Debug + std::fmt::Display> std::fmt::Display for ProposeAssignmentError<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProposeAssignmentError::Ledger(e) => write!(f, "{}", e),
-            ProposeAssignmentError::Terminal(e) => write!(f, "{}", e),
-            ProposeAssignmentError::NotFree(e) => write!(f, "{}", e),
+            ProposeAssignmentError::Berth(e) => write!(f, "{}", e),
+            ProposeAssignmentError::NotAllowedOnBerth(e) => {
+                write!(f, "{}", e)
+            }
+            ProposeAssignmentError::BerthNotFree(e) => {
+                write!(f, "{}", e)
+            }
         }
     }
 }
 
 impl<T: std::fmt::Debug + std::fmt::Display> std::error::Error for ProposeAssignmentError<T> {}
 
-impl<T> From<LedgerCommitError<T>> for ProposeAssignmentError<T> {
-    fn from(err: LedgerCommitError<T>) -> Self {
-        ProposeAssignmentError::Ledger(err)
+impl<T> From<BerthUpdateError<T>> for ProposeAssignmentError<T> {
+    fn from(err: BerthUpdateError<T>) -> Self {
+        ProposeAssignmentError::Berth(err)
     }
 }
 
-impl<T> From<TerminalUpdateError<T>> for ProposeAssignmentError<T> {
-    fn from(err: TerminalUpdateError<T>) -> Self {
-        ProposeAssignmentError::Terminal(err)
+impl<T> From<NotAllowedOnBerthError> for ProposeAssignmentError<T> {
+    fn from(err: NotAllowedOnBerthError) -> Self {
+        ProposeAssignmentError::NotAllowedOnBerth(err)
     }
 }
 
 impl<T> From<BerthNotFreeError<T>> for ProposeAssignmentError<T> {
     fn from(err: BerthNotFreeError<T>) -> Self {
-        ProposeAssignmentError::NotFree(err)
-    }
-}
-
-impl<T> From<AssignmentError<T>> for ProposeAssignmentError<T> {
-    fn from(err: AssignmentError<T>) -> Self {
-        ProposeAssignmentError::Ledger(LedgerCommitError::from(err))
+        ProposeAssignmentError::BerthNotFree(err)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ProposeUnassignmentError<T> {
-    Ledger(LedgerUncomitError),
-    Terminal(TerminalUpdateError<T>),
+pub struct NotAssignedError {
+    request_index: RequestIndex,
 }
 
-impl<T: std::fmt::Display> std::fmt::Display for ProposeUnassignmentError<T> {
+impl NotAssignedError {
+    #[inline]
+    pub fn new(request_index: RequestIndex) -> Self {
+        Self { request_index }
+    }
+
+    #[inline]
+    pub fn request_index(&self) -> RequestIndex {
+        self.request_index
+    }
+}
+
+impl std::fmt::Display for NotAssignedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Request {} is not assigned", self.request_index)
+    }
+}
+
+impl std::error::Error for NotAssignedError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ProposeUnassignmentError<T> {
+    NotAssigned(NotAssignedError),
+    Berth(BerthUpdateError<T>),
+    NotAllowedOnBerth(NotAllowedOnBerthError),
+}
+
+impl<T: std::fmt::Debug + std::fmt::Display> std::fmt::Display for ProposeUnassignmentError<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProposeUnassignmentError::Ledger(e) => write!(f, "{}", e),
-            ProposeUnassignmentError::Terminal(e) => write!(f, "{}", e),
+            ProposeUnassignmentError::NotAssigned(e) => write!(f, "{}", e),
+            ProposeUnassignmentError::Berth(e) => write!(f, "{}", e),
+            ProposeUnassignmentError::NotAllowedOnBerth(e) => {
+                write!(f, "{}", e)
+            }
         }
     }
 }
 
 impl<T: std::fmt::Debug + std::fmt::Display> std::error::Error for ProposeUnassignmentError<T> {}
 
-impl<T> From<LedgerUncomitError> for ProposeUnassignmentError<T> {
-    fn from(err: LedgerUncomitError) -> Self {
-        ProposeUnassignmentError::Ledger(err)
+impl<T> From<NotAssignedError> for ProposeUnassignmentError<T> {
+    fn from(err: NotAssignedError) -> Self {
+        ProposeUnassignmentError::NotAssigned(err)
     }
 }
 
-impl<T> From<TerminalUpdateError<T>> for ProposeUnassignmentError<T> {
-    fn from(err: TerminalUpdateError<T>) -> Self {
-        ProposeUnassignmentError::Terminal(err)
+impl<T> From<BerthUpdateError<T>> for ProposeUnassignmentError<T> {
+    fn from(err: BerthUpdateError<T>) -> Self {
+        ProposeUnassignmentError::Berth(err)
+    }
+}
+
+impl<T> From<NotAllowedOnBerthError> for ProposeUnassignmentError<T> {
+    fn from(err: NotAllowedOnBerthError) -> Self {
+        ProposeUnassignmentError::NotAllowedOnBerth(err)
     }
 }

@@ -28,7 +28,7 @@ use crate::{
     },
     state::berth::berthocc::{BerthOccupancy, BerthRead, BerthWrite},
 };
-use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval};
+use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval, TimePoint};
 use berth_alloc_model::{
     prelude::Problem,
     problem::{asg::AssignmentView, req::RequestView},
@@ -44,6 +44,7 @@ pub struct SolverModel<'problem, T: Copy + Ord> {
     berths_len: usize,                           // B
     requests_len: usize,                         // R
     calendars: Vec<BerthCalendar<T>>,            // len = B
+    allowed_berth_indices: Vec<Vec<BerthIndex>>, // len = R
     problem: &'problem Problem<T>,               // reference to original problem
 }
 
@@ -53,14 +54,42 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
         &self.weights
     }
 
+    pub fn weight(&self, req: RequestIndex) -> Cost {
+        let index = req.get();
+        debug_assert!(index < self.weights.len());
+
+        self.weights[index]
+    }
+
     #[inline]
     pub fn feasible_intervals(&self) -> &[TimeInterval<T>] {
         &self.feasible_intervals
     }
 
     #[inline]
+    pub fn feasible_interval(&self, req: RequestIndex) -> TimeInterval<T> {
+        let index = req.get();
+        debug_assert!(index < self.feasible_intervals.len());
+
+        self.feasible_intervals[index]
+    }
+
+    #[inline]
+    pub fn arrival_time(&self, req: RequestIndex) -> TimePoint<T> {
+        self.feasible_interval(req).start()
+    }
+
+    #[inline]
     pub fn processing_times(&self) -> &[Option<TimeDelta<T>>] {
         &self.processing_times
+    }
+
+    #[inline]
+    pub fn processing_time(&self, req: RequestIndex, berth: BerthIndex) -> Option<TimeDelta<T>> {
+        let index = self.flat_index(req, berth);
+        debug_assert!(index < self.processing_times.len());
+
+        self.processing_times[index]
     }
 
     #[inline(always)]
@@ -69,17 +98,6 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
         debug_assert!(berth.0 < self.berths_len);
 
         req.0 * self.berths_len + berth.0
-    }
-
-    #[inline]
-    pub fn processing_time(
-        &self,
-        req: RequestIndex,
-        berth: BerthIndex,
-    ) -> Option<Option<TimeDelta<T>>> {
-        self.processing_times
-            .get(self.flat_index(req, berth))
-            .copied()
     }
 
     #[inline]
@@ -108,6 +126,65 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
     }
 
     #[inline]
+    pub fn interval(
+        &self,
+        req: RequestIndex,
+        berth: BerthIndex,
+        start_time: TimePoint<T>,
+    ) -> Option<TimeInterval<T>> {
+        let processing_time = self.processing_time(req, berth)?;
+        Some(TimeInterval::new(start_time, start_time + processing_time))
+    }
+
+    #[inline]
+    pub fn allowed_berth_indices(&self, req: RequestIndex) -> &[BerthIndex] {
+        let index = req.get();
+        debug_assert!(index < self.allowed_berth_indices.len());
+
+        self.allowed_berth_indices[index].as_slice()
+    }
+
+    #[inline]
+    pub fn waiting_time(
+        &self,
+        req: RequestIndex,
+        start_time: TimePoint<T>,
+    ) -> Option<TimeDelta<T>> {
+        let arrival_time = self.arrival_time(req);
+
+        if start_time < arrival_time {
+            return None;
+        }
+
+        Some(start_time - arrival_time)
+    }
+
+    pub fn turnaround_time(
+        &self,
+        req: RequestIndex,
+        berth: BerthIndex,
+        start_time: TimePoint<T>,
+    ) -> Option<TimeDelta<T>> {
+        let processing_time = self.processing_time(req, berth)?;
+        Some(processing_time + self.waiting_time(req, start_time)?)
+    }
+
+    #[inline]
+    pub fn cost_of_assignment(
+        &self,
+        req: RequestIndex,
+        berth: BerthIndex,
+        start_time: TimePoint<T>,
+    ) -> Option<Cost>
+    where
+        T: Into<Cost>,
+    {
+        let weight = self.weight(req);
+        let turnaround_time = self.turnaround_time(req, berth, start_time)?;
+        Some(weight.saturating_mul(turnaround_time.value().into()))
+    }
+
+    #[inline]
     pub fn problem(&self) -> &'problem Problem<T> {
         self.problem
     }
@@ -123,6 +200,7 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
         let mut weights = Vec::with_capacity(requests_len);
         let mut feasible_intervals = Vec::with_capacity(requests_len);
         let mut processing_times = vec![None; requests_len * berths_len];
+        let mut allowed_berth_indices: Vec<Vec<BerthIndex>> = Vec::with_capacity(requests_len);
 
         for ri_u in 0..requests_len {
             let ri = RequestIndex(ri_u);
@@ -137,6 +215,9 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
             weights.push(rq.weight());
             feasible_intervals.push(rq.feasible_window());
 
+            // collect allowed berth indices for this request
+            let mut allowed_for_req: Vec<BerthIndex> = Vec::new();
+
             for (&bid, &dt) in rq.processing_times().iter() {
                 let bi = index_manager.berth_index(bid).ok_or_else(|| {
                     SolverModelBuildError::BerthNotFound(
@@ -145,7 +226,12 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
                 })?;
                 let flat = ri_u * berths_len + bi.0;
                 processing_times[flat] = Some(dt);
+                allowed_for_req.push(bi);
             }
+
+            // keep indices in ascending order for determinism
+            allowed_for_req.sort_by_key(|b| b.0);
+            allowed_berth_indices.push(allowed_for_req);
         }
 
         let mut baseline_occupancies = Vec::with_capacity(berths_len);
@@ -178,6 +264,7 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
 
         Ok(SolverModel {
             index_manager,
+            allowed_berth_indices,
             weights,
             feasible_intervals,
             processing_times,
@@ -328,12 +415,12 @@ mod tests {
 
         // Processing times matrix (R x B) via accessor:
         // rid 10: [None, Some(4)] because only berth 2 is present
-        assert_eq!(m.processing_time(ri(0), bi(0)), Some(None));
-        assert_eq!(m.processing_time(ri(0), bi(1)), Some(Some(td(4))));
+        assert_eq!(m.processing_time(ri(0), bi(0)), None);
+        assert_eq!(m.processing_time(ri(0), bi(1)), Some(td(4)));
 
         // rid 20: [Some(5), Some(9)]
-        assert_eq!(m.processing_time(ri(1), bi(0)), Some(Some(td(5))));
-        assert_eq!(m.processing_time(ri(1), bi(1)), Some(Some(td(9))));
+        assert_eq!(m.processing_time(ri(1), bi(0)), Some(td(5)));
+        assert_eq!(m.processing_time(ri(1), bi(1)), Some(td(9)));
     }
 
     #[test]

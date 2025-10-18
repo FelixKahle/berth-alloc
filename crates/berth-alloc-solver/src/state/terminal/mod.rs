@@ -20,6 +20,5 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 pub mod delta;
-pub mod err;
 pub mod sandbox;
 pub mod terminalocc;
