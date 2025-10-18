@@ -23,10 +23,12 @@ use crate::{
     core::numeric::SolveNumeric,
     engine::{
         greedy_opening::GreedyOpening,
+        ils,
         opening::OpeningStrategy,
         search::{SearchContext, SearchStrategy},
         shared_incumbent::SharedIncumbent,
     },
+    model::{err::SolverModelBuildError, solver_model::SolverModel},
     state::solver_state::SolverStateView,
 };
 use berth_alloc_model::{
@@ -50,8 +52,10 @@ impl Default for SolverEngineConfig {
     #[inline]
     fn default() -> Self {
         Self {
-            num_workers: 4,
-            time_limit: std::time::Duration::from_secs(10),
+            num_workers: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+            time_limit: std::time::Duration::from_secs(30),
         }
     }
 }
@@ -62,7 +66,8 @@ where
     T: Copy + Ord,
     S: OpeningStrategy<T>,
 {
-    SolutionError(SolutionError),
+    SolverModel(SolverModelBuildError),
+    Solution(SolutionError),
     NoStrategies,
     OpeningFailed(S::Error),
 }
@@ -74,7 +79,7 @@ where
 {
     #[inline]
     fn from(err: SolutionError) -> Self {
-        EngineError::SolutionError(err)
+        EngineError::Solution(err)
     }
 }
 
@@ -85,10 +90,29 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EngineError::SolutionError(err) => write!(f, "Solution error: {}", err),
+            EngineError::Solution(err) => write!(f, "Solution error: {}", err),
             EngineError::NoStrategies => write!(f, "No search strategies provided"),
             EngineError::OpeningFailed(err) => write!(f, "Opening strategy failed: {:?}", err),
+            EngineError::SolverModel(err) => write!(f, "Solver model build error: {}", err),
         }
+    }
+}
+
+impl<T, S> std::error::Error for EngineError<T, S>
+where
+    T: Copy + Ord + std::fmt::Debug + std::fmt::Display,
+    S: OpeningStrategy<T> + std::fmt::Debug,
+{
+}
+
+impl<T, S> From<SolverModelBuildError> for EngineError<T, S>
+where
+    T: Copy + Ord,
+    S: OpeningStrategy<T>,
+{
+    #[inline]
+    fn from(err: SolverModelBuildError) -> Self {
+        EngineError::SolverModel(err)
     }
 }
 
@@ -123,15 +147,22 @@ where
         &mut self,
         problem: &'p Problem<T>,
     ) -> Result<Option<SolutionRef<'p, T>>, EngineError<T, GreedyOpening<T>>> {
+        let model: SolverModel<'p, T> = SolverModel::from_problem(problem)?;
+
         // Opening on the main thread
         let initial_state = self
             .opening
-            .build(problem)
+            .build(&model)
             .map_err(EngineError::OpeningFailed)?;
         let shared_incumbent = SharedIncumbent::new(initial_state);
 
         if self.strategies.is_empty() {
-            return Err(EngineError::NoStrategies);
+            let n = self.config.num_workers.max(1);
+            for _ in 0..n {
+                // Build an ILS that uses the model’s proximity map (neighbors already wired in ils_strategy)
+                let ils = ils::ils_strategy::<T, ChaCha8Rng>(&model);
+                self.strategies.push(Box::new(ils));
+            }
         }
 
         let deadline = Instant::now() + self.config.time_limit;
@@ -142,6 +173,7 @@ where
         let inc_ref = &shared_incumbent;
         let stop_ref = &stop;
         let problem_ref = problem;
+        let model_ref = &model;
 
         std::thread::scope(|scope| {
             let mut seeder = rand::rng();
@@ -162,15 +194,16 @@ where
 
                 scope.spawn(move || {
                     let rng = ChaCha8Rng::seed_from_u64(worker_seed);
-                    let context = SearchContext::new(problem_ref, inc_ref, stop_ref, rng);
-                    strategy.run(&context);
+                    let mut context =
+                        SearchContext::new(problem_ref, model_ref, inc_ref, stop_ref, rng);
+                    strategy.run(&mut context);
                 });
             }
         });
 
         let best = shared_incumbent.snapshot();
         if best.is_feasible() {
-            let sol: SolutionRef<'p, T> = best.try_into()?;
+            let sol: SolutionRef<'p, T> = best.into_solution(&model)?;
             Ok(Some(sol))
         } else {
             Ok(None)
@@ -189,7 +222,7 @@ where
 impl<T> Default for SolverEngineBuilder<T>
 where
     T: SolveNumeric,
- {
+{
     fn default() -> Self {
         Self::new()
     }
@@ -318,7 +351,7 @@ mod tests {
             "DummyStrategy"
         }
 
-        fn run<'e, 'p>(&mut self, _context: &SearchContext<'e, 'p, i64, ChaCha8Rng>) {
+        fn run<'e, 'm, 'p>(&mut self, _context: &mut SearchContext<'e, 'm, 'p, i64, ChaCha8Rng>) {
             std::thread::sleep(self.sleep_time);
         }
     }
@@ -337,18 +370,6 @@ mod tests {
         }
 
         builder.build()
-    }
-
-    #[test]
-    fn test_solve_errors_when_no_strategies() {
-        let prob = problem_feasible_two_flex();
-        let mut engine = engine_with_strategies(1, 0, 50);
-
-        let res = engine.solve(&prob);
-        match res {
-            Err(EngineError::NoStrategies) => {}
-            other => panic!("expected NoStrategies, got: {:?}", other),
-        }
     }
 
     #[test]

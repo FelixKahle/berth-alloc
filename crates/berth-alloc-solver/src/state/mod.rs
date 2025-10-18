@@ -23,6 +23,5 @@ pub mod berth;
 pub mod decisionvar;
 pub mod fitness;
 pub mod plan;
-pub mod registry;
 pub mod solver_state;
 pub mod terminal;

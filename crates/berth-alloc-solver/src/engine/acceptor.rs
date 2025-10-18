@@ -18,3 +18,63 @@
 // LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+use crate::state::fitness::Fitness;
+
+pub trait Acceptor {
+    fn name(&self) -> &str;
+    fn accept(&self, current: &Fitness, new: &Fitness) -> bool;
+}
+
+impl std::fmt::Display for dyn Acceptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct StrictlyBetterAcceptor;
+
+impl Acceptor for StrictlyBetterAcceptor {
+    fn name(&self) -> &str {
+        "StrictlyBetterAcceptor"
+    }
+
+    fn accept(&self, current: &Fitness, new: &Fitness) -> bool {
+        new < current
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct LexStrictAcceptor;
+impl Acceptor for LexStrictAcceptor {
+    fn name(&self) -> &str {
+        "LexStrictAcceptor"
+    }
+    fn accept(&self, cur: &Fitness, cand: &Fitness) -> bool {
+        (cand.unassigned_requests < cur.unassigned_requests)
+            || (cand.unassigned_requests == cur.unassigned_requests && cand.cost < cur.cost)
+    }
+}
+
+/// For repair vs baseline: allow any strict drop in unassigned, and when
+/// unassigned is equal, require a strict cost drop (no plateaus).
+#[derive(Debug, Default, Clone)]
+pub struct RepairAcceptor;
+impl Acceptor for RepairAcceptor {
+    fn name(&self) -> &str {
+        "RepairAcceptor"
+    }
+    fn accept(&self, cur: &Fitness, cand: &Fitness) -> bool {
+        (cand.unassigned_requests < cur.unassigned_requests)
+            || (cand.unassigned_requests == cur.unassigned_requests && cand.cost < cur.cost)
+    }
+}
+
+#[cfg(test)]
+mod static_assertions {
+    use super::*;
+    use ::static_assertions::assert_obj_safe;
+
+    assert_obj_safe!(Acceptor);
+}

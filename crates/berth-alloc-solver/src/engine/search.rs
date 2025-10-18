@@ -19,27 +19,30 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::engine::shared_incumbent::SharedIncumbent;
+use crate::{engine::shared_incumbent::SharedIncumbent, model::solver_model::SolverModel};
 use berth_alloc_model::prelude::Problem;
 use std::sync::atomic::AtomicBool;
 
 #[derive(Clone)]
-pub struct SearchContext<'e, 'p, T: Copy + Ord, R: rand::Rng> {
+pub struct SearchContext<'e, 'm, 'p, T: Copy + Ord, R: rand::Rng> {
     problem: &'p Problem<T>,
+    model: &'m SolverModel<'p, T>,
     shared_incumbent: &'e SharedIncumbent<'p, T>,
     stop: &'e AtomicBool,
     rng: R,
 }
 
-impl<'e, 'p, T: Copy + Ord, R: rand::Rng> SearchContext<'e, 'p, T, R> {
+impl<'e, 'm, 'p, T: Copy + Ord, R: rand::Rng> SearchContext<'e, 'm, 'p, T, R> {
     pub fn new(
         problem: &'p Problem<T>,
+        model: &'m SolverModel<'p, T>,
         shared_incumbent: &'e SharedIncumbent<'p, T>,
         stop: &'e AtomicBool,
         rng: R,
     ) -> Self {
         Self {
             problem,
+            model,
             shared_incumbent,
             stop,
             rng,
@@ -48,6 +51,10 @@ impl<'e, 'p, T: Copy + Ord, R: rand::Rng> SearchContext<'e, 'p, T, R> {
 
     pub fn problem(&self) -> &'p Problem<T> {
         self.problem
+    }
+
+    pub fn model(&self) -> &'m SolverModel<'p, T> {
+        self.model
     }
 
     pub fn shared_incumbent(&self) -> &'e SharedIncumbent<'p, T> {
@@ -63,10 +70,11 @@ impl<'e, 'p, T: Copy + Ord, R: rand::Rng> SearchContext<'e, 'p, T, R> {
     }
 }
 
-impl<'e, 'p, T: Copy + Ord, R: rand::Rng> std::fmt::Debug for SearchContext<'e, 'p, T, R> {
+impl<'e, 'm, 'p, T: Copy + Ord, R: rand::Rng> std::fmt::Debug for SearchContext<'e, 'm, 'p, T, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SearcherContext")
             .field("problem", &"Problem { .. }")
+            .field("model", &"SolverModel { .. }")
             .field("shared_incumbent", &"SharedIncumbent { .. }")
             .field("stop", &self.stop)
             .field("rng", &"Rng { .. }")
@@ -81,5 +89,5 @@ where
 {
     fn name(&self) -> &str;
 
-    fn run<'e, 'p>(&mut self, context: &SearchContext<'e, 'p, T, R>);
+    fn run<'e, 'm, 'p>(&mut self, context: &mut SearchContext<'e, 'm, 'p, T, R>);
 }

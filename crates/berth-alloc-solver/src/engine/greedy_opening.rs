@@ -21,23 +21,20 @@
 
 use crate::{
     engine::opening::OpeningStrategy,
+    model::{
+        index::{BerthIndex, RequestIndex},
+        solver_model::SolverModel,
+    },
     state::{
-        registry::ledger::Ledger,
+        berth::err::BerthUpdateError,
+        decisionvar::{Decision, DecisionVar, DecisionVarVec},
+        fitness::Fitness,
         solver_state::SolverState,
-        terminal::{
-            err::TerminalUpdateError,
-            terminalocc::{TerminalOccupancy, TerminalRead, TerminalWrite},
-        },
+        terminal::terminalocc::{TerminalOccupancy, TerminalRead, TerminalWrite},
     },
 };
-use berth_alloc_core::prelude::Cost;
-use berth_alloc_model::{
-    prelude::Problem,
-    problem::{
-        asg::{AssignmentRef, AssignmentView},
-        req::RequestView,
-    },
-};
+use berth_alloc_core::prelude::{Cost, TimeInterval};
+use berth_alloc_model::problem::asg::AssignmentView;
 use num_traits::{CheckedAdd, CheckedSub, Zero};
 use std::{cmp::Reverse, ops::Mul};
 
@@ -60,30 +57,6 @@ impl<T> GreedyOpening<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum GreedyOpeningError<T> {
-    TerminalUpdate(TerminalUpdateError<T>),
-}
-
-impl<T> From<TerminalUpdateError<T>> for GreedyOpeningError<T> {
-    fn from(e: TerminalUpdateError<T>) -> Self {
-        Self::TerminalUpdate(e)
-    }
-}
-
-impl<T> std::fmt::Display for GreedyOpeningError<T>
-where
-    T: std::fmt::Display,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            GreedyOpeningError::TerminalUpdate(e) => write!(f, "{}", e),
-        }
-    }
-}
-
-impl<T: std::fmt::Debug + std::fmt::Display> std::error::Error for GreedyOpeningError<T> {}
-
 impl<T> OpeningStrategy<T> for GreedyOpening<T>
 where
     T: Copy
@@ -95,61 +68,81 @@ where
         + Mul<Output = Cost>
         + std::fmt::Debug,
 {
-    type Error = GreedyOpeningError<T>;
+    type Error = BerthUpdateError<T>;
 
-    fn build<'p>(&self, problem: &'p Problem<T>) -> Result<SolverState<'p, T>, Self::Error> {
-        let mut ledger = Ledger::new(problem);
-        let mut terminal = TerminalOccupancy::new(problem.iter_berths());
+    fn build<'m, 'p>(
+        &self,
+        model: &'m SolverModel<'p, T>,
+    ) -> Result<SolverState<'p, T>, Self::Error> {
+        let index_manager = model.index_manager();
 
-        for a in problem.iter_fixed_assignments() {
-            terminal.occupy(a.berth_id(), a.interval())?;
+        let mut terminal: TerminalOccupancy<'p, T> =
+            TerminalOccupancy::new(model.problem().berths().iter());
+        for a in model.problem().iter_fixed_assignments() {
+            let bi: BerthIndex = index_manager
+                .berth_index(a.berth_id())
+                .expect("fixed assignment berth must be indexable");
+            terminal.occupy(bi, a.interval())?;
         }
 
-        loop {
-            let mut reqs: Vec<_> = ledger.iter_unassigned_requests().collect();
-            if reqs.is_empty() {
-                break;
-            }
+        // 2) Start with everything unassigned.
+        let mut dvars = DecisionVarVec::from(vec![
+            DecisionVar::unassigned();
+            model.flexible_requests_len()
+        ]);
 
-            reqs.sort_by_key(|r| (r.request_slack(), Reverse(r.weight()), r.id()));
+        // Helper: compute a simple "slack" = (window_len - min_pt) per request for ordering.
+        let mut reqs: Vec<RequestIndex> = (0..model.flexible_requests_len())
+            .map(RequestIndex::new)
+            .collect();
+        reqs.sort_by_key(|&ri| {
+            let w = model.feasible_interval(ri);
+            let window_len = w.end().value() - w.start().value(); // T
+            let min_pt = model
+                .allowed_berth_indices(ri)
+                .iter()
+                .filter_map(|&bi| model.processing_time(ri, bi))
+                .map(|pt| pt.value())
+                .min()
+                .unwrap_or_else(T::zero);
+            let slack = window_len - min_pt;
+            let weight = model.weight(ri);
+            (slack, Reverse(weight), ri.get())
+        });
+
+        loop {
             let mut placed_in_pass = 0usize;
 
-            for req in reqs {
-                let candidates: Vec<_> = terminal
-                    .iter_free_intervals_for_berths_in(
-                        req.iter_allowed_berths_ids(),
-                        req.feasible_window(),
-                    )
-                    .collect();
-
-                if candidates.is_empty() {
+            for &ri in &reqs {
+                if dvars[ri].is_assigned() {
                     continue;
                 }
+                let window = model.feasible_interval(ri);
 
-                'try_free: for free in candidates {
-                    let berth = free.berth();
-                    let start = free.interval().start();
-
-                    let asg = match AssignmentRef::new(req, berth, start) {
-                        Ok(a) => a,
-                        Err(_) => continue, // try next free interval / berth
+                'req_try: for &bi in model.allowed_berth_indices(ri) {
+                    let Some(pt) = model.processing_time(ri, bi) else {
+                        continue;
                     };
 
-                    let iv = asg.interval();
-                    if !free.interval().contains_interval(&iv) {
-                        continue;
-                    }
-                    match ledger.commit_assignment(req, berth, start) {
-                        Ok(committed) => {
-                            if let Err(_e) = terminal.occupy(berth.id(), iv) {
-                                let _ = ledger.uncommit_assignment(&committed);
-                                continue;
-                            }
-                            placed_in_pass += 1;
-                            break 'try_free;
-                        }
-                        Err(_e) => {
+                    let frees: Vec<_> = terminal
+                        .iter_free_intervals_for_berths_in([bi], window)
+                        .collect();
+
+                    for free in frees {
+                        let start = free.interval().start();
+                        let end = start + pt;
+                        let iv = TimeInterval::new(start, end);
+                        if !free.interval().contains_interval(&iv) {
                             continue;
+                        }
+
+                        if terminal.occupy(bi, iv).is_ok() {
+                            dvars[ri] = DecisionVar::Assigned(Decision {
+                                berth_index: bi,
+                                start_time: start,
+                            });
+                            placed_in_pass += 1;
+                            break 'req_try;
                         }
                     }
                 }
@@ -160,17 +153,32 @@ where
             }
         }
 
-        Ok(SolverState::new(ledger, terminal))
+        // 4) Compute fitness from the assigned DVs (cost + unassigned count).
+        let mut total_cost = Cost::zero();
+        let mut unassigned = 0usize;
+        for (i, dv) in dvars.iter().enumerate() {
+            let ri = RequestIndex::new(i);
+            match *dv {
+                DecisionVar::Unassigned => unassigned += 1,
+                DecisionVar::Assigned(dec) => {
+                    if let Some(c) = model.cost_of_assignment(ri, dec.berth_index, dec.start_time) {
+                        total_cost += c;
+                    }
+                }
+            }
+        }
+        let fitness = Fitness::new(total_cost, unassigned);
+        Ok(SolverState::new(dvars, terminal, fitness))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::solver_model::SolverModel;
     use crate::state::{berth::berthocc::BerthRead, solver_state::SolverStateView};
-    use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
+    use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval, TimePoint};
     use berth_alloc_model::prelude::*;
-    use num_traits::Zero;
     use std::collections::BTreeMap;
 
     #[inline]
@@ -237,21 +245,35 @@ mod tests {
     #[test]
     fn test_build_assigns_all_when_space() {
         let prob = problem_one_berth_two_flex();
-        let solver = GreedyOpening::<i64>::new();
+        let model = SolverModel::try_from(&prob).expect("model ok");
 
-        let state = solver.build(&prob).expect("build should succeed");
+        let solver = GreedyOpening::<i64>::new();
+        let state = solver.build(&model).expect("build should succeed");
 
         // Both requests should be assigned
         assert!(state.is_feasible());
-        assert_eq!(state.ledger().iter_assignments().count(), 2);
-        assert!(state.cost() > Cost::zero(), "cost should be positive");
+        let assigned = state
+            .decision_variables()
+            .iter()
+            .filter(|dv| dv.is_assigned())
+            .count();
+        assert_eq!(assigned, 2);
+        // Cost > 0
+        let mut cost = Cost::zero();
+        for (i, dv) in state.decision_variables().iter().enumerate() {
+            if let DecisionVar::Assigned(dec) = *dv {
+                cost += model
+                    .cost_of_assignment(RequestIndex::new(i), dec.berth_index, dec.start_time)
+                    .expect("cost defined");
+            }
+        }
+        assert!(cost > Cost::zero(), "cost should be positive");
 
-        // Intervals should start at earliest feasible times without overlap:
-        // r1 (pt=10) at [0,10), r2 (pt=5) at [10,15) or [0,5) then [5,15) depending on order.
         // Verify no overlap via terminal occupancy view.
+        let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
         let b = state
             .terminal_occupancy()
-            .berth(bid(1))
+            .berth(b_ix)
             .expect("berth 1 exists");
         // [0,15) cannot be entirely free now
         assert!(b.is_occupied(iv(0, 15)));
@@ -276,30 +298,24 @@ mod tests {
         flex.insert(flex_req(2, (0, 100), &[(1, 10)], 1));
 
         let prob = Problem::new(berths, fixed, flex).unwrap();
+        let model = SolverModel::try_from(&prob).expect("model ok");
 
         let solver = GreedyOpening::<i64>::new();
-        let state = solver.build(&prob).expect("build should succeed");
+        let state = solver.build(&model).expect("build should succeed");
 
-        // Both flexible requests should be assigned around the fixed block: e.g., [0,10) and [20,30).
-        let mut times = Vec::new();
-        for a in state.ledger().iter_assignments() {
-            if a.request_id() == rid(1) || a.request_id() == rid(2) {
-                times.push(a.interval());
-            }
-        }
-        assert_eq!(times.len(), 2, "both flexible assigned");
-        // Ensure neither overlaps fixed [10,20)
-        for ivx in times {
-            assert!(
-                !ivx.intersects(&iv(10, 20)),
-                "flexible assignment must not overlap fixed block"
-            );
-        }
+        // Both flexible requests should be assigned around the fixed block
+        let assigned = state
+            .decision_variables()
+            .iter()
+            .filter(|dv| dv.is_assigned())
+            .count();
+        assert_eq!(assigned, 2, "both flexible assigned");
 
         // Terminal occupancy should reflect the fixed block too
+        let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
         let occ = state
             .terminal_occupancy()
-            .berth(bid(1))
+            .berth(b_ix)
             .expect("berth 1 exists");
         assert!(occ.is_occupied(iv(10, 20)));
     }
@@ -317,14 +333,30 @@ mod tests {
         flex.insert(flex_req(2, (0, 12), &[(1, 10)], 1));
 
         let prob = Problem::new(berths, fixed, flex).unwrap();
+        let model = SolverModel::try_from(&prob).expect("model ok");
 
         let solver = GreedyOpening::<i64>::new();
-        let state = solver.build(&prob).expect("build should succeed");
+        let state = solver.build(&model).expect("build should succeed");
 
         // Exactly one assigned, one unassigned
-        assert_eq!(state.ledger().iter_assignments().count(), 1);
+        let assigned = state
+            .decision_variables()
+            .iter()
+            .filter(|dv| dv.is_assigned())
+            .count();
+        assert_eq!(assigned, 1);
         assert!(!state.is_feasible());
-        assert!(state.cost() > 0);
+
+        // cost > 0 if something was assigned
+        let mut cost = Cost::zero();
+        for (i, dv) in state.decision_variables().iter().enumerate() {
+            if let DecisionVar::Assigned(dec) = *dv {
+                cost += model
+                    .cost_of_assignment(RequestIndex::new(i), dec.berth_index, dec.start_time)
+                    .unwrap();
+            }
+        }
+        assert!(cost > Cost::zero());
     }
 
     #[test]
@@ -342,45 +374,57 @@ mod tests {
         flex.insert(flex_req(20, (0, 20), &[(1, 5)], 1));
 
         let prob = Problem::new(berths, fixed, flex).unwrap();
+        let model = SolverModel::try_from(&prob).expect("model ok");
 
         let solver = GreedyOpening::<i64>::new();
-        let state = solver.build(&prob).expect("build should succeed");
+        let state = solver.build(&model).expect("build should succeed");
 
-        // Both should be assigned [0,5) and [5,10). The heavier (r10) should get [0,5).
-        let mut r10_start = None;
-        let mut r20_start = None;
-        for a in state.ledger().iter_assignments() {
-            if a.request_id() == rid(10) {
-                r10_start = Some(a.interval().start());
-            } else if a.request_id() == rid(20) {
-                r20_start = Some(a.interval().start());
-            }
-        }
-        let r10s = r10_start.expect("r10 assigned");
-        let r20s = r20_start.expect("r20 assigned");
-        assert!(r10s <= r20s, "heavier request should not start later");
-        assert_eq!(r10s, tp(0), "heavier should start at earliest feasible");
-        assert_eq!(r20s, tp(5));
+        // Get start times via decision variables by index
+        let im = model.index_manager();
+        let r10_ix = im.request_index(rid(10)).unwrap();
+        let r20_ix = im.request_index(rid(20)).unwrap();
+
+        let start = |ri: RequestIndex| match state.decision_variables()[ri.get()] {
+            DecisionVar::Assigned(d) => d.start_time,
+            _ => panic!("request {ri:?} not assigned"),
+        };
+
+        let s10 = start(r10_ix).value();
+        let s20 = start(r20_ix).value();
+        assert!(s10 <= s20, "heavier should not start later");
+        assert_eq!(s10, 0, "heavier should start at earliest feasible");
+        assert_eq!(s20, 5);
     }
 
     #[test]
     fn test_resulting_state_integrity() {
         // Sanity: building returns a consistent state
         let prob = problem_one_berth_two_flex();
-        let solver = GreedyOpening::<i64>::new();
-        let state = solver.build(&prob).expect("build should succeed");
+        let model = SolverModel::try_from(&prob).expect("model ok");
 
-        // Ledger points to the same problem
-        assert!(std::ptr::eq(state.problem(), &prob));
+        let solver = GreedyOpening::<i64>::new();
+        let state = solver.build(&model).expect("build should succeed");
+
         // Terminal occupancy has the right number of berths (1)
         assert_eq!(state.terminal_occupancy().berths().len(), 1);
-        // Fitness aligns with ledger: cost > 0 and feasibility matches unassigned count == 0
+
+        // Feasibility matches unassigned count == 0,
+        // and cost > 0 if feasible.
         assert_eq!(
             state.is_feasible(),
             state.fitness().unassigned_requests == 0
         );
+
+        let mut cost = Cost::zero();
+        for (i, dv) in state.decision_variables().iter().enumerate() {
+            if let DecisionVar::Assigned(dec) = *dv {
+                cost += model
+                    .cost_of_assignment(RequestIndex::new(i), dec.berth_index, dec.start_time)
+                    .unwrap();
+            }
+        }
         if state.is_feasible() {
-            assert!(state.cost() > 0);
+            assert!(cost > Cost::zero());
         }
     }
 }

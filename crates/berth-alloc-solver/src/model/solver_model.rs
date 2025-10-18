@@ -25,12 +25,13 @@ use crate::{
         err::{MissingRequestError, SolverModelBuildError},
         index::{BerthIndex, RequestIndex},
         index_manager::SolverIndexManager,
+        neighborhood::{ProximityMap, ProximityMapConfig},
     },
     state::berth::berthocc::{BerthOccupancy, BerthRead, BerthWrite},
 };
 use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval, TimePoint};
 use berth_alloc_model::{
-    prelude::Problem,
+    prelude::{Berth, Problem},
     problem::{asg::AssignmentView, req::RequestView},
 };
 use num_traits::{CheckedAdd, CheckedSub, Zero};
@@ -44,7 +45,9 @@ pub struct SolverModel<'problem, T: Copy + Ord> {
     berths_len: usize,                           // B
     requests_len: usize,                         // R
     calendars: Vec<BerthCalendar<T>>,            // len = B
+    berths: Vec<Berth<T>>,                       // len = B
     allowed_berth_indices: Vec<Vec<BerthIndex>>, // len = R
+    proximity_map: ProximityMap,                 // Neighborhood info
     problem: &'problem Problem<T>,               // reference to original problem
 }
 
@@ -121,6 +124,19 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
     }
 
     #[inline]
+    pub fn berths(&self) -> &[Berth<T>] {
+        &self.berths
+    }
+
+    #[inline]
+    pub fn berth(&self, berth: BerthIndex) -> &Berth<T> {
+        let index = berth.get();
+        debug_assert!(index < self.berths_len());
+
+        &self.berths[index]
+    }
+
+    #[inline]
     pub fn calendar_for_berth(&self, berth: BerthIndex) -> Option<&BerthCalendar<T>> {
         self.calendars.get(berth.0)
     }
@@ -189,7 +205,15 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
         self.problem
     }
 
-    pub fn from_problem(p: &'problem Problem<T>) -> Result<Self, SolverModelBuildError>
+    #[inline]
+    pub fn proximity_map(&self) -> &ProximityMap {
+        &self.proximity_map
+    }
+
+    pub fn from_problem_with_proximity_map_config(
+        p: &'problem Problem<T>,
+        proximity_map_config: ProximityMapConfig,
+    ) -> Result<Self, SolverModelBuildError>
     where
         T: Copy + Ord + CheckedAdd + CheckedSub + Zero + std::fmt::Debug,
     {
@@ -201,6 +225,7 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
         let mut feasible_intervals = Vec::with_capacity(requests_len);
         let mut processing_times = vec![None; requests_len * berths_len];
         let mut allowed_berth_indices: Vec<Vec<BerthIndex>> = Vec::with_capacity(requests_len);
+        let mut berths = Vec::with_capacity(berths_len);
 
         for ri_u in 0..requests_len {
             let ri = RequestIndex(ri_u);
@@ -244,6 +269,7 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
                 .get(bid)
                 .expect("berth id from manager must exist in Problem");
             baseline_occupancies.push(BerthOccupancy::new(berth_ref));
+            berths.push(berth_ref.clone());
         }
         for a in p.iter_fixed_assignments() {
             let bid = a.berth_id();
@@ -262,6 +288,13 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
             .map(BerthCalendar::new)
             .collect();
 
+        let proximity_map = ProximityMap::from_lists(
+            &feasible_intervals,
+            &allowed_berth_indices,
+            berths_len,
+            proximity_map_config,
+        );
+
         Ok(SolverModel {
             index_manager,
             allowed_berth_indices,
@@ -271,8 +304,17 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
             berths_len,
             requests_len,
             calendars,
+            berths,
+            proximity_map,
             problem: p,
         })
+    }
+
+    pub fn from_problem(p: &'problem Problem<T>) -> Result<Self, SolverModelBuildError>
+    where
+        T: Copy + Ord + CheckedAdd + CheckedSub + Zero + std::fmt::Debug,
+    {
+        Self::from_problem_with_proximity_map_config(p, ProximityMapConfig::default())
     }
 }
 
@@ -296,6 +338,7 @@ mod tests {
         Assignment, Berth, BerthIdentifier, Problem, RequestIdentifier,
     };
     use berth_alloc_model::problem::builder::ProblemBuilder;
+    use berth_alloc_model::problem::loader::ProblemLoader;
     use berth_alloc_model::problem::req::Request;
     use std::collections::BTreeMap;
 
@@ -545,5 +588,75 @@ mod tests {
 
         // Berth 2 free intervals: [0,5), [15,30)
         assert_eq!(cal_b2.free_intervals(), &[iv(0, 5), iv(15, 30)]);
+    }
+
+    #[test]
+    fn test_load_all_instances_from_workspace_root_instances_folder_create_model() {
+        use std::fs;
+        use std::path::{Path, PathBuf};
+
+        // Find the nearest ancestor that contains an `instances/` directory.
+        fn find_instances_dir() -> Option<PathBuf> {
+            let mut cur: Option<&Path> = Some(Path::new(env!("CARGO_MANIFEST_DIR")));
+            while let Some(p) = cur {
+                let cand = p.join("instances");
+                if cand.is_dir() {
+                    return Some(cand);
+                }
+                cur = p.parent();
+            }
+            None
+        }
+
+        let inst_dir = find_instances_dir().expect(
+            "Could not find an `instances/` directory in any ancestor of CARGO_MANIFEST_DIR",
+        );
+
+        // Gather all .txt files (ignore subdirs/other files).
+        let mut files: Vec<PathBuf> = fs::read_dir(&inst_dir)
+            .expect("read_dir(instances) failed")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+                    && e.path().extension().map(|x| x == "txt").unwrap_or(false)
+            })
+            .map(|e| e.path())
+            .collect();
+
+        files.sort();
+
+        assert!(
+            !files.is_empty(),
+            "No .txt instance files found in {}",
+            inst_dir.display()
+        );
+
+        let loader = ProblemLoader::default();
+
+        for path in files {
+            eprintln!("Loading instance: {}", path.display());
+            let problem = loader
+                .from_path(&path)
+                .unwrap_or_else(|e| panic!("Failed to load {}: {e}", path.display()));
+
+            // Sanity checks: there should be at least one berth and one request in real instances.
+            assert!(
+                !problem.berths().is_empty(),
+                "No berths parsed in {}",
+                path.display()
+            );
+            assert!(
+                !problem.flexible_requests().is_empty(),
+                "No flexible requests parsed in {}",
+                path.display()
+            );
+
+            let model = SolverModel::try_from(&problem);
+            assert!(
+                model.is_ok(),
+                "SolverModel creation failed for {}",
+                path.display()
+            );
+        }
     }
 }

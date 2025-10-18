@@ -21,4 +21,5 @@
 
 pub mod err;
 pub mod operator;
+pub mod operator_library;
 pub mod planner;

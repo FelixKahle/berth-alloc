@@ -33,6 +33,8 @@ rangemap = "1.6.0"
 rand_chacha = "0.9.0"
 rayon = "1.11.0"
 parking_lot = "0.12.5"
+fx-hash = "0.1.0"
+fixedbitset = "0.5.7"
 
 [dependencies.tracing]
 version = "0.1.41"

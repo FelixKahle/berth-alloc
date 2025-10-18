@@ -19,42 +19,44 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::{search::planner::PlanningContext, state::plan::Plan};
-use berth_alloc_model::prelude::RequestIdentifier;
+use crate::{model::index::RequestIndex, search::planner::PlanningContext, state::plan::Plan};
+
+// Some operators can be restricted to "nearby" candidates via callbacks.
+// If none are provided, we revert to the full space (i.e., all berths / all slots).
+pub type NeighborFn = dyn Fn(RequestIndex) -> Vec<RequestIndex> + Send + Sync;
 
 pub trait Operator<T: Copy + Ord, R: rand::Rng>: Send + Sync {
     fn name(&self) -> &str;
-    fn propose<'s, 'm, 'p>(
+    fn propose<'b, 's, 'm, 'p>(
         &self,
-        context: &PlanningContext<'s, 'm, 'p, T>,
+        context: &mut PlanningContext<'b, 's, 'm, 'p, T>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>>;
 }
 
 pub trait LocalMoveOperator<T: Copy + Ord, R: rand::Rng>: Send + Sync {
     fn name(&self) -> &str;
-    fn propose<'s, 'm, 'p>(
+    fn propose<'b, 's, 'm, 'p>(
         &self,
-        ctx: &PlanningContext<'s, 'm, 'p, T>,
+        ctx: &mut PlanningContext<'b, 's, 'm, 'p, T>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>>;
 }
 
 pub trait DestroyOperator<T: Copy + Ord, R: rand::Rng>: Send + Sync {
     fn name(&self) -> &str;
-    fn select<'s, 'm, 'p>(
+    fn propose<'b, 's, 'm, 'p>(
         &self,
-        ctx: &PlanningContext<'s, 'm, 'p, T>,
+        ctx: &mut PlanningContext<'b, 's, 'm, 'p, T>,
         rng: &mut R,
-    ) -> Vec<RequestIdentifier>;
+    ) -> Option<Plan<'p, T>>;
 }
 
 pub trait RepairOperator<T: Copy + Ord, R: rand::Rng>: Send + Sync {
     fn name(&self) -> &str;
-    fn repair<'s, 'm, 'p>(
+    fn repair<'b, 's, 'm, 'p>(
         &self,
-        ctx: &PlanningContext<'s, 'm, 'p, T>,
-        removed: &[RequestIdentifier],
+        ctx: &mut PlanningContext<'b, 's, 'm, 'p, T>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>>;
 }

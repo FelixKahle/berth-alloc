@@ -95,9 +95,23 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cos
         #[cfg(debug_assertions)]
         let prev_unassigned = self.fitness.unassigned_requests;
 
+        // Apply DV patches and terminal delta first
         self.apply_decision_var_patches(plan.decision_var_patches);
         let res = self.terminal_occupancy.apply_delta(plan.terminal_delta);
         debug_assert!(res.is_ok(), "Failed to apply terminal delta: {:?}", res);
+
+        // Apply fitness deltas to keep the state consistent with the plan
+        self.fitness.cost += plan.delta_cost;
+
+        if plan.delta_unassigned != 0 {
+            // Use checked_add_signed to handle +/- deltas safely
+            let new_unassigned = self
+                .fitness
+                .unassigned_requests
+                .checked_add_signed(isize::try_from(plan.delta_unassigned).unwrap())
+                .expect("unassigned delta overflow");
+            self.fitness.unassigned_requests = new_unassigned;
+        }
 
         #[cfg(debug_assertions)]
         {
@@ -133,7 +147,7 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cos
     #[inline]
     pub fn into_solution(
         self,
-        solver_model: &'p SolverModel<'p, T>,
+        solver_model: &SolverModel<'p, T>,
     ) -> Result<SolutionRef<'p, T>, SolutionError>
     where
         T: std::fmt::Display + std::fmt::Debug,
@@ -154,7 +168,7 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cos
 
     pub fn make_flexible_assignments(
         &self,
-        solver_model: &'p SolverModel<'p, T>,
+        solver_model: &SolverModel<'p, T>,
     ) -> AssignmentContainer<FlexibleKind, T, AssignmentRef<'p, 'p, FlexibleKind, T>>
     where
         T: std::fmt::Display + std::fmt::Debug,
@@ -701,19 +715,26 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    #[should_panic]
-    fn test_apply_plan_cost_delta_mismatch_debug_panics() {
+    fn test_apply_plan_cost_delta_updates_fitness_debug() {
         let base = vec![berth(1, 0, 100)];
         let term = TerminalOccupancy::new(&base);
         let dv = DecisionVarVec::from(vec![DecisionVar::unassigned()]);
-        // fitness.cost = 10, but we'll claim delta_cost = +7 and not change fitness → panic
+        // fitness.cost = 10; we'll claim delta_cost = +7 (no-op patches)
         let mut st = SolverState::new(dv, term, Fitness::new(10, 1));
 
         let patches = vec![DecisionVarPatch::new(ri(0), DecisionVar::unassigned())]; // no-op
         let delta = crate::state::terminal::delta::TerminalDelta::empty();
 
-        let plan = Plan::new_delta(patches, delta, 7, 0); // mismatched cost delta
+        let plan = Plan::new_delta(patches, delta, 7, 0);
         st.apply_plan(plan);
+
+        // With apply_plan now applying fitness deltas, cost must update and unassigned remain unchanged
+        assert_eq!(st.fitness().cost, 17);
+        assert_eq!(st.fitness().unassigned_requests, 1);
+        assert!(matches!(
+            st.decision_variables()[0],
+            DecisionVar::Unassigned
+        ));
     }
 
     #[cfg(debug_assertions)]

@@ -34,6 +34,9 @@ pub trait SolveNumeric:
     + Into<Cost>
     + Mul<Self, Output = Cost>
     + std::fmt::Debug
+    + std::fmt::Display
+    + From<i32>
+    + 'static
 {
 }
 
@@ -48,5 +51,8 @@ impl<T> SolveNumeric for T where
         + Into<Cost>
         + Mul<Self, Output = Cost>
         + std::fmt::Debug
+        + std::fmt::Display
+        + From<i32>
+        + 'static
 {
 }

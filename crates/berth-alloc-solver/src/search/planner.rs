@@ -25,6 +25,7 @@ use num_traits::{CheckedAdd, CheckedSub};
 use std::ops::Mul;
 
 use crate::state::solver_state::SolverStateView;
+use crate::state::terminal::terminalocc::TerminalWrite;
 use crate::{
     model::{
         index::{BerthIndex, RequestIndex},
@@ -46,18 +47,18 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
-pub struct PlanExplorer<'pb, 'm, 'p, T: Copy + Ord> {
+pub struct PlanExplorer<'pb, 't, 'm, 'p, T: Copy + Ord> {
     solver_model: &'m SolverModel<'p, T>,
     decision_vars: &'pb [DecisionVar<T>],
-    sandbox: &'pb TerminalSandbox<'p, T>,
+    sandbox: &'pb TerminalSandbox<'t, 'p, T>,
 }
 
-impl<'pb, 'm, 'p, T: Copy + Ord> PlanExplorer<'pb, 'm, 'p, T> {
+impl<'pb, 't, 'm, 'p, T: Copy + Ord> PlanExplorer<'pb, 't, 'm, 'p, T> {
     #[inline]
     pub fn new(
         solver_model: &'m SolverModel<'p, T>,
         decision_vars: &'pb [DecisionVar<T>],
-        sandbox: &'pb TerminalSandbox<'p, T>,
+        sandbox: &'pb TerminalSandbox<'t, 'p, T>,
     ) -> Self {
         Self {
             solver_model,
@@ -72,7 +73,7 @@ impl<'pb, 'm, 'p, T: Copy + Ord> PlanExplorer<'pb, 'm, 'p, T> {
     }
 
     #[inline]
-    pub fn sandbox(&self) -> &'pb TerminalSandbox<'p, T> {
+    pub fn sandbox(&self) -> &'pb TerminalSandbox<'t, 'p, T> {
         self.sandbox
     }
 
@@ -148,26 +149,26 @@ impl<'pb, 'm, 'p, T: Copy + Ord> PlanExplorer<'pb, 'm, 'p, T> {
 }
 
 #[derive(Debug)]
-pub struct PlanBuilder<'b, 'm, 'p, T: Copy + Ord> {
+pub struct PlanBuilder<'b, 't, 'm, 'p, T: Copy + Ord> {
     solver_model: &'m SolverModel<'p, T>,
     decision_vars: &'b mut [DecisionVar<T>],
-    sandbox: TerminalSandbox<'p, T>,
+    sandbox: TerminalSandbox<'t, 'p, T>,
     patches: Vec<DecisionVarPatch<T>>,
     delta_cost: Cost,
     delta_unassigned: i32,
 }
 
-impl<'b, 'm, 'p, T: Copy + Ord> PlanBuilder<'b, 'm, 'p, T> {
+impl<'b, 't, 'm, 'p, T: Copy + Ord> PlanBuilder<'b, 't, 'm, 'p, T> {
     #[inline]
     pub fn new(
         solver_model: &'m SolverModel<'p, T>,
+        base_terminal: &'t TerminalOccupancy<'p, T>,
         decision_vars: &'b mut [DecisionVar<T>],
-        terminal: TerminalOccupancy<'p, T>,
     ) -> Self {
         Self {
             solver_model,
             decision_vars,
-            sandbox: TerminalSandbox::new(terminal),
+            sandbox: TerminalSandbox::new(base_terminal),
             delta_cost: Cost::zero(),
             delta_unassigned: 0,
             patches: Vec::with_capacity(32),
@@ -185,7 +186,7 @@ impl<'b, 'm, 'p, T: Copy + Ord> PlanBuilder<'b, 'm, 'p, T> {
     }
 
     #[inline]
-    pub fn sandbox(&self) -> &TerminalSandbox<'p, T> {
+    pub fn sandbox(&self) -> &TerminalSandbox<'t, 'p, T> {
         &self.sandbox
     }
 
@@ -304,10 +305,10 @@ impl<'b, 'm, 'p, T: Copy + Ord> PlanBuilder<'b, 'm, 'p, T> {
     #[inline]
     pub fn with_explorer<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(&PlanExplorer<'_, 'm, 'p, T>) -> R,
+        F: FnOnce(&PlanExplorer<'_, 't, 'm, 'p, T>) -> R,
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
-        let explorer: PlanExplorer<'_, 'm, 'p, T> =
+        let explorer: PlanExplorer<'_, 't, 'm, 'p, T> =
             PlanExplorer::new(self.solver_model, self.decision_vars, &self.sandbox);
         f(&explorer)
     }
@@ -333,7 +334,7 @@ impl<'b, 'm, 'p, T: Copy + Ord> PlanBuilder<'b, 'm, 'p, T> {
     }
 
     #[inline]
-    fn finalize(self) -> Plan<'p, T> {
+    pub fn finalize(self) -> Plan<'p, T> {
         Plan::new_delta(
             self.patches,
             self.sandbox.delta(),
@@ -344,60 +345,72 @@ impl<'b, 'm, 'p, T: Copy + Ord> PlanBuilder<'b, 'm, 'p, T> {
 }
 
 #[derive(Debug)]
-pub struct PlanningContext<'s, 'm, 'p, T: Copy + Ord> {
+pub struct PlanningContext<'b, 's, 'm, 'p, T: Copy + Ord> {
     model: &'m SolverModel<'p, T>,
     state: &'s SolverState<'p, T>,
+    buffer: &'b mut [DecisionVar<T>],
 }
 
-impl<'s, 'm, 'p, T: Copy + Ord> PlanningContext<'s, 'm, 'p, T> {
+impl<'b, 's, 'm, 'p, T: Copy + Ord> PlanningContext<'b, 's, 'm, 'p, T> {
     #[inline]
-    pub fn new(model: &'m SolverModel<'p, T>, state: &'s SolverState<'p, T>) -> Self {
-        Self { model, state }
+    pub fn new(
+        model: &'m SolverModel<'p, T>,
+        state: &'s SolverState<'p, T>,
+        buffer: &'b mut [DecisionVar<T>],
+    ) -> Self {
+        Self {
+            model,
+            state,
+            buffer,
+        }
     }
 
     pub fn state(&self) -> &'s SolverState<'p, T> {
         self.state
     }
 
+    pub fn model(&self) -> &'m SolverModel<'p, T> {
+        self.model
+    }
+
     // Build a plan using a closure to configure the builder.
     #[inline]
-    pub fn with_builder<'b, F>(&self, work_buffer: &'b mut [DecisionVar<T>], f: F) -> Plan<'p, T>
+    pub fn with_builder<F>(&mut self, f: F) -> Plan<'p, T>
     where
-        F: FnOnce(&mut PlanBuilder<'b, 'm, 'p, T>),
+        F: FnOnce(&mut PlanBuilder<'_, 's, 'm, 'p, T>),
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
         // Seed the work buffer with the current decision variables.
-        work_buffer.copy_from_slice(self.state.decision_variables());
+        self.buffer.copy_from_slice(self.state.decision_variables());
 
         // For now we do not use specialized overlays. Just the cloned ledger and terminal,
         // so proposals can be made on them independently from the master state.
         let mut pb = PlanBuilder::new(
             self.model,
-            work_buffer,
-            self.state.terminal_occupancy().clone(),
+            self.state.terminal_occupancy(),
+            self.buffer,
         );
         f(&mut pb);
         pb.finalize()
     }
 
     #[inline]
-    pub fn builder<'b>(&self, work_buffer: &'b mut [DecisionVar<T>]) -> PlanBuilder<'b, 'm, 'p, T>
+    pub fn builder(&mut self) -> PlanBuilder<'_, 's, 'm, 'p, T>
     where
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
         // Seed the work buffer with the current decision variables.
-        work_buffer.copy_from_slice(self.state.decision_variables());
-
+        self.buffer.copy_from_slice(self.state.decision_variables());
         PlanBuilder::new(
             self.model,
-            work_buffer,
-            self.state.terminal_occupancy().clone(),
+            self.state.terminal_occupancy(),
+            self.buffer,
         )
     }
 }
 
-impl<'s, 'm, 'p, T: Copy + Ord + std::fmt::Display> std::fmt::Display
-    for PlanningContext<'s, 'm, 'p, T>
+impl<'b, 's, 'm, 'p, T: Copy + Ord + std::fmt::Display> std::fmt::Display
+    for PlanningContext<'b, 's, 'm, 'p, T>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "PlanningContext(state: {})", self.state)
@@ -481,7 +494,7 @@ mod tests {
 
         // NEW: working buffer
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut pb = PlanBuilder::new(&model, work_buf.as_mut_slice(), term);
+        let mut pb = PlanBuilder::new(&model, &term, work_buf.as_mut_slice());
 
         let r_ix = model.index_manager().request_index(rid(1)).unwrap();
         let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
@@ -519,7 +532,7 @@ mod tests {
 
         // NEW: working buffer
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut pb = PlanBuilder::new(&model, work_buf.as_mut_slice(), term);
+        let mut pb = PlanBuilder::new(&model, &term, work_buf.as_mut_slice());
 
         let r_ix = model.index_manager().request_index(rid(1)).unwrap();
         let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
@@ -553,7 +566,7 @@ mod tests {
 
         // NEW: working buffer
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut pb = PlanBuilder::new(&model, work_buf.as_mut_slice(), term);
+        let mut pb = PlanBuilder::new(&model, &term, work_buf.as_mut_slice());
 
         pb.with_explorer(|ex| {
             assert_eq!(ex.iter_unassigned().count(), model.flexible_requests_len());
@@ -601,11 +614,11 @@ mod tests {
         let fit = Fitness::new(0, model.flexible_requests_len());
         let state = SolverState::new(dv, term, fit);
 
-        let ctx = PlanningContext::new(&model, &state);
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut ctx = PlanningContext::new(&model, &state, &mut work_buf);
 
         // NEW: provide a working buffer to the context
-        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let plan = ctx.with_builder(&mut work_buf, |pb| {
+        let plan = ctx.with_builder(|pb| {
             let r_ix = model.index_manager().request_index(rid(1)).unwrap();
             let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
             let free = pb
@@ -641,7 +654,7 @@ mod tests {
 
         // NEW: working buffer
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut pb = PlanBuilder::new(&model, work_buf.as_mut_slice(), term);
+        let mut pb = PlanBuilder::new(&model, &term, work_buf.as_mut_slice());
 
         let r_ix = model.index_manager().request_index(rid(1)).unwrap();
         let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
