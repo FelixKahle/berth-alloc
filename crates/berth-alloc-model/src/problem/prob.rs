@@ -20,6 +20,8 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::common::{FixedKind, FlexibleKind};
+use crate::prelude::Berth;
+use crate::problem::req::RequestView;
 use crate::problem::{
     asg::{Assignment, AssignmentContainer, AssignmentView},
     berth::BerthContainer,
@@ -32,7 +34,7 @@ use num_traits::{CheckedAdd, CheckedSub};
 pub struct Problem<T: Copy + Ord> {
     berths: BerthContainer<T>,
     fixed_assignments: AssignmentContainer<FixedKind, T, Assignment<FixedKind, T>>,
-    flexible_requests: RequestContainer<FlexibleKind, T>,
+    flexible_requests: RequestContainer<T, Request<FlexibleKind, T>>,
 }
 
 impl<T: Copy + Ord + CheckedAdd + CheckedSub> Problem<T> {
@@ -40,7 +42,7 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub> Problem<T> {
     pub fn new(
         berths: BerthContainer<T>,
         fixed_assignments: AssignmentContainer<FixedKind, T, Assignment<FixedKind, T>>,
-        flexible_requests: RequestContainer<FlexibleKind, T>,
+        flexible_requests: RequestContainer<T, Request<FlexibleKind, T>>,
     ) -> Result<Self, ProblemError> {
         // Every fixed assignment must reference a known berth
         for a in fixed_assignments.iter() {
@@ -77,6 +79,11 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub> Problem<T> {
     }
 
     #[inline]
+    pub fn iter_berths(&self) -> impl Iterator<Item = &Berth<T>> {
+        self.berths.iter()
+    }
+
+    #[inline]
     pub fn fixed_assignments(
         &self,
     ) -> &AssignmentContainer<FixedKind, T, Assignment<FixedKind, T>> {
@@ -84,7 +91,7 @@ impl<T: Copy + Ord + CheckedAdd + CheckedSub> Problem<T> {
     }
 
     #[inline]
-    pub fn flexible_requests(&self) -> &RequestContainer<FlexibleKind, T> {
+    pub fn flexible_requests(&self) -> &RequestContainer<T, Request<FlexibleKind, T>> {
         &self.flexible_requests
     }
 
@@ -201,7 +208,7 @@ mod tests {
     fn test_empty_everything_is_ok() {
         let berths = BerthContainer::<i64>::new();
         let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
-        let flex = RequestContainer::<FlexibleKind, i64>::new();
+        let flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
 
         let p = Problem::new(berths, fixed, flex).unwrap();
         assert_eq!(p.berths().iter().count(), 0);
@@ -222,7 +229,7 @@ mod tests {
 
         let f1 = req_flex(1, (0, 100), &[(1, 10)]);
         let f2 = req_flex(2, (50, 200), &[(2, 10)]);
-        let mut flex = RequestContainer::<FlexibleKind, i64>::new();
+        let mut flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
         flex.insert(f1);
         flex.insert(f2);
 
@@ -247,7 +254,7 @@ mod tests {
         let mut fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
         fixed.insert(a);
 
-        let flex = RequestContainer::<FlexibleKind, i64>::new();
+        let flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
 
         let err = Problem::new(berths, fixed, flex).unwrap_err();
         match err {
@@ -268,7 +275,7 @@ mod tests {
 
         // Flex request that references berth(1) in its processing-time map.
         let r = req_flex(7, (0, 100), &[(1, 5)]);
-        let mut flex = RequestContainer::<FlexibleKind, i64>::new();
+        let mut flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
         flex.insert(r);
 
         let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
@@ -301,7 +308,7 @@ mod tests {
         fixed.insert(a);
         fixed.insert(b);
 
-        let flex = RequestContainer::<FlexibleKind, i64>::new();
+        let flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
 
         let _ = Problem::new(berths, fixed, flex).unwrap();
     }
@@ -323,7 +330,7 @@ mod tests {
         fixed.insert(a);
         fixed.insert(b);
 
-        let flex = RequestContainer::<FlexibleKind, i64>::new();
+        let flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
 
         let _ = Problem::new(berths, fixed, flex).unwrap();
     }
@@ -346,7 +353,7 @@ mod tests {
         fixed.insert(a);
         fixed.insert(b);
 
-        let flex = RequestContainer::<FlexibleKind, i64>::new();
+        let flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
 
         let err = Problem::new(berths, fixed, flex).unwrap_err();
         match err {
@@ -378,7 +385,7 @@ mod tests {
         fixed.insert(a);
         fixed.insert(b);
 
-        let flex = RequestContainer::<FlexibleKind, i64>::new();
+        let flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
 
         let _ = Problem::new(berths, fixed, flex).unwrap();
     }
@@ -404,7 +411,7 @@ mod tests {
         let mut berths = BerthContainer::new();
         berths.insert(b1);
 
-        let flex = RequestContainer::<FlexibleKind, i64>::new();
+        let flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
 
         let err = Problem::new(berths, fixed, flex).unwrap_err();
         match err {
@@ -426,14 +433,14 @@ mod tests {
         for i in 0..10 {
             let rid_u = 100 + i;
             let start = i * 10;
-            let r = req_fixed(rid_u as u32, (0, 10_000), &[(1, 10)]);
-            fixed.insert(asg_fixed(&r, &b1, start));
+            let r = req_fixed(rid_u, (0, 10_000), &[(1, 10)]);
+            fixed.insert(asg_fixed(&r, &b1, start as i64));
         }
 
         let mut berths = BerthContainer::new();
         berths.insert(b1);
 
-        let flex = RequestContainer::<FlexibleKind, i64>::new();
+        let flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
 
         let _ = Problem::new(berths, fixed, flex).unwrap();
     }
@@ -456,7 +463,7 @@ mod tests {
         fixed.insert(a1);
         fixed.insert(a2);
 
-        let flex = RequestContainer::<FlexibleKind, i64>::new();
+        let flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
 
         let _ = Problem::new(berths, fixed, flex).unwrap();
     }
@@ -478,7 +485,7 @@ mod tests {
         fixed.insert(a0);
         fixed.insert(a1);
 
-        let flex = RequestContainer::<FlexibleKind, i64>::new();
+        let flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
 
         let _ = Problem::new(berths, fixed, flex).unwrap();
     }

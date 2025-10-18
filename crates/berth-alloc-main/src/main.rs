@@ -21,14 +21,7 @@
 
 use berth_alloc_model::prelude::{Problem, SolutionView};
 use berth_alloc_model::problem::loader::ProblemLoader;
-use berth_alloc_solver::{
-    framework::{
-        solver::{ConstructionSolver, Solver},
-        state::SolverStateView,
-    },
-    greedy::GreedySolver,
-    matheuristic::{config::MatheuristicConfig, engine::MatheuristicEngine, oplib},
-};
+use berth_alloc_solver::engine::solver_engine::SolverEngineBuilder;
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -46,7 +39,7 @@ fn find_instances_dir() -> Option<PathBuf> {
 }
 
 #[allow(dead_code)]
-fn instances() -> impl Iterator<Item = Problem<i64>> {
+fn instances() -> impl Iterator<Item = (Problem<i64>, String)> {
     let inst_dir = find_instances_dir()
         .expect("Could not find an `instances/` directory in any ancestor of CARGO_MANIFEST_DIR");
     let mut files: Vec<PathBuf> = std::fs::read_dir(&inst_dir)
@@ -62,7 +55,17 @@ fn instances() -> impl Iterator<Item = Problem<i64>> {
     files.sort();
     files.into_iter().filter_map(|f| {
         let loader = ProblemLoader::default();
-        loader.from_path(&f).ok()
+        match loader.from_path(&f) {
+            Ok(problem) => {
+                let name = f
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| f.to_string_lossy().into_owned());
+                Some((problem, name))
+            }
+            Err(_) => None,
+        }
     })
 }
 
@@ -70,7 +73,7 @@ fn instances() -> impl Iterator<Item = Problem<i64>> {
 fn enable_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_span_events(FmtSpan::ENTER | FmtSpan::EXIT | FmtSpan::CLOSE)
         .init();
@@ -79,55 +82,26 @@ fn enable_tracing() {
 fn main() {
     enable_tracing();
 
-    // Solve the f200x15-02.txt problem with both solvers
-    let inst_dir = find_instances_dir()
-        .expect("Could not find an `instances/` directory in any ancestor of CARGO_MANIFEST_DIR");
-    let f20015_02 = inst_dir.join("f200x15-02.txt");
-    let loader = ProblemLoader::default();
-    let problem = loader.from_path(&f20015_02);
-    let problem = match problem {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Failed to load problem from {}: {}", f20015_02.display(), e);
-            return;
+    for (problem, file) in instances().take(1) {
+        tracing::info!(
+            "Solving problem {} with {} berths and {} vessels",
+            file,
+            problem.berths().len(),
+            problem.flexible_requests().len()
+        );
+
+        let mut solver = SolverEngineBuilder::<i64>::default().build();
+        match solver.solve(&problem) {
+            Ok(Some(solution)) => {
+                tracing::info!(
+                    "Solver finished on problem {}: cost={}",
+                    file,
+                    solution.cost()
+                );
+            }
+            _ => {
+                tracing::error!("Solver failed on problem {}", file);
+            }
         }
-    };
-    println!("Loaded problem with {} requests", problem.request_count());
-    let solver_state = GreedySolver::<i64>::new()
-        .construct(&problem)
-        .expect("GreedySolver failed to construct a solution");
-    let feasible = solver_state.is_feasible();
-    let cost = solver_state.cost();
-
-    let construction_solver = GreedySolver::<i64>::new();
-    let mut meta_solver = MatheuristicEngine::with_defaults(
-        MatheuristicConfig::default(),
-        oplib::prelude::op_list::<i64>(&problem),
-        construction_solver,
-    );
-    let solution = meta_solver.solve(&problem).expect("MetaSolver failed");
-
-    // Print results
-
-    println!("============================================================");
-    println!("             Results for problem f200x15-02.txt             ");
-    println!("============================================================");
-
-    println!(
-        "GreedySolver produced a {} solution with cost {}",
-        if feasible { "feasible" } else { "infeasible" },
-        cost
-    );
-
-    println!(
-        "MatheuhuristicEngine produced {} solution{}",
-        if solution.is_some() {
-            "feasible"
-        } else {
-            "infeasible"
-        },
-        solution
-            .map(|s| format!(" with cost {}", s.cost()))
-            .unwrap_or_default()
-    );
+    }
 }

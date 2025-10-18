@@ -19,68 +19,56 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub trait IdentifierMarkerName: Copy {
-    const NAME: &'static str;
+use berth_alloc_model::{prelude::RequestIdentifier, problem::err::BerthNotFoundError};
+
+#[derive(Debug, Clone)]
+pub struct MissingRequestError {
+    id: RequestIdentifier,
 }
 
-#[repr(transparent)]
-#[must_use]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Identifier<I, U>(I, core::marker::PhantomData<U>);
-
-impl<I, U> Identifier<I, U> {
-    #[inline]
-    pub fn new(id: I) -> Self {
-        Self(id, core::marker::PhantomData)
+impl MissingRequestError {
+    pub fn new(id: RequestIdentifier) -> Self {
+        Self { id }
     }
 
-    #[inline]
-    pub fn value(&self) -> &I {
-        &self.0
-    }
-
-    #[inline]
-    pub fn into_inner(self) -> I {
-        self.0
+    pub fn id(&self) -> RequestIdentifier {
+        self.id
     }
 }
 
-impl<I, U> std::fmt::Display for Identifier<I, U>
-where
-    I: std::fmt::Display,
-    U: IdentifierMarkerName,
-{
+impl std::fmt::Display for MissingRequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}({})", U::NAME, self.0)
+        write!(f, "Request with ID {} is missing", self.id)
     }
 }
 
-pub trait Kind: Clone {
-    const NAME: &'static str;
+impl std::error::Error for MissingRequestError {}
+
+#[derive(Debug, Clone)]
+pub enum SolverModelBuildError {
+    MissingRequest(MissingRequestError),
+    BerthNotFound(BerthNotFoundError),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct FixedKind;
-
-impl Kind for FixedKind {
-    const NAME: &'static str = "Fixed";
-}
-
-impl std::fmt::Display for FixedKind {
+impl std::fmt::Display for SolverModelBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", Self::NAME)
+        match self {
+            SolverModelBuildError::MissingRequest(err) => write!(f, "{}", err),
+            SolverModelBuildError::BerthNotFound(err) => write!(f, "{}", err),
+        }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct FlexibleKind;
+impl std::error::Error for SolverModelBuildError {}
 
-impl Kind for FlexibleKind {
-    const NAME: &'static str = "Flexible";
+impl From<MissingRequestError> for SolverModelBuildError {
+    fn from(err: MissingRequestError) -> Self {
+        SolverModelBuildError::MissingRequest(err)
+    }
 }
 
-impl std::fmt::Display for FlexibleKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", Self::NAME)
+impl From<BerthNotFoundError> for SolverModelBuildError {
+    fn from(err: BerthNotFoundError) -> Self {
+        SolverModelBuildError::BerthNotFound(err)
     }
 }

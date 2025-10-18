@@ -19,8 +19,27 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod core;
-pub mod engine;
-pub mod model;
-pub mod search;
-pub mod state;
+use crate::model::{adjacency_mask::AdjacencyMask, neighbor_lists::NeighborLists};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeighborView {
+    lists: NeighborLists, // preds/succs as Vec<Vec<RequestIndex>>
+    mask: AdjacencyMask,  // bitset membership & fast ops
+}
+
+impl NeighborView {
+    #[inline]
+    pub fn new(lists: NeighborLists, mask: AdjacencyMask) -> Self {
+        Self { lists, mask }
+    }
+
+    #[inline]
+    pub fn lists(&self) -> &NeighborLists {
+        &self.lists
+    }
+
+    #[inline]
+    pub fn mask(&self) -> &AdjacencyMask {
+        &self.mask
+    }
+}

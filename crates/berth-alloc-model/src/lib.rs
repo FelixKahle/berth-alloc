@@ -37,5 +37,8 @@ pub mod prelude {
         req::{Request, RequestContainer, RequestIdentifier},
     };
     pub use crate::solution::{Solution, SolutionRef, SolutionView};
-    pub use crate::validation::{StateValidator, err::*};
+    pub use crate::validation::err::{
+        CrossValidationError, ExtraFlexibleAssignmentError, ExtraFlexibleRequestError,
+        RequestIdNotUniqueError,
+    };
 }

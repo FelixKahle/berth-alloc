@@ -27,7 +27,7 @@ use crate::{
             AssignmenStartsBeforeFeasibleWindowError, AssignmentEndsAfterFeasibleWindowError,
             AssignmentError, IncomatibleBerthError,
         },
-        req::{Request, RequestIdentifier},
+        req::{Request, RequestIdentifier, RequestView},
     },
 };
 use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval, TimePoint};
