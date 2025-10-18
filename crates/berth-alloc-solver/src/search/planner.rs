@@ -24,6 +24,7 @@ use num_traits::Zero;
 use num_traits::{CheckedAdd, CheckedSub};
 use std::ops::Mul;
 
+use crate::state::solver_state::SolverStateView;
 use crate::{
     model::{
         index::{BerthIndex, RequestIndex},
@@ -34,9 +35,9 @@ use crate::{
         ProposeUnassignmentError,
     },
     state::{
-        decisionvar::{Decision, DecisionVar, DecisionVarVec},
+        decisionvar::{Decision, DecisionVar},
         plan::{DecisionVarPatch, Plan},
-        solver_state::{SolverState, SolverStateView},
+        solver_state::SolverState,
         terminal::{
             sandbox::TerminalSandbox,
             terminalocc::{FreeBerth, TerminalOccupancy, TerminalRead},
@@ -146,21 +147,21 @@ impl<'pb, 'm, 'p, T: Copy + Ord> PlanExplorer<'pb, 'm, 'p, T> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PlanBuilder<'m, 'p, T: Copy + Ord> {
+#[derive(Debug)]
+pub struct PlanBuilder<'b, 'm, 'p, T: Copy + Ord> {
     solver_model: &'m SolverModel<'p, T>,
-    decision_vars: DecisionVarVec<T>,
+    decision_vars: &'b mut [DecisionVar<T>],
     sandbox: TerminalSandbox<'p, T>,
     patches: Vec<DecisionVarPatch<T>>,
     delta_cost: Cost,
     delta_unassigned: i32,
 }
 
-impl<'m, 'p, T: Copy + Ord> PlanBuilder<'m, 'p, T> {
+impl<'b, 'm, 'p, T: Copy + Ord> PlanBuilder<'b, 'm, 'p, T> {
     #[inline]
     pub fn new(
         solver_model: &'m SolverModel<'p, T>,
-        decision_vars: DecisionVarVec<T>,
+        decision_vars: &'b mut [DecisionVar<T>],
         terminal: TerminalOccupancy<'p, T>,
     ) -> Self {
         Self {
@@ -181,11 +182,6 @@ impl<'m, 'p, T: Copy + Ord> PlanBuilder<'m, 'p, T> {
     #[inline]
     pub fn delta_unassigned(&self) -> i32 {
         self.delta_unassigned
-    }
-
-    #[inline]
-    pub fn decision_vars(&self) -> &DecisionVarVec<T> {
-        &self.decision_vars
     }
 
     #[inline]
@@ -243,7 +239,7 @@ impl<'m, 'p, T: Copy + Ord> PlanBuilder<'m, 'p, T> {
             berth_index: free_berth.berth_index(),
             start_time,
         });
-        self.decision_vars[request] = assigned;
+        self.decision_vars[request.get()] = assigned;
         self.patches.push(DecisionVarPatch::new(request, assigned));
 
         Ok(())
@@ -257,7 +253,7 @@ impl<'m, 'p, T: Copy + Ord> PlanBuilder<'m, 'p, T> {
     where
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
-        let dv = match self.decision_vars[request] {
+        let dv = match self.decision_vars[request.get()] {
             DecisionVar::Unassigned => {
                 return Err(ProposeUnassignmentError::NotAssigned(
                     NotAssignedError::new(request),
@@ -298,7 +294,7 @@ impl<'m, 'p, T: Copy + Ord> PlanBuilder<'m, 'p, T> {
         self.delta_cost -= cost;
         self.delta_unassigned += 1;
 
-        self.decision_vars[request] = DecisionVar::Unassigned;
+        self.decision_vars[request.get()] = DecisionVar::Unassigned;
         self.patches
             .push(DecisionVarPatch::new(request, DecisionVar::Unassigned));
 
@@ -312,7 +308,7 @@ impl<'m, 'p, T: Copy + Ord> PlanBuilder<'m, 'p, T> {
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
         let explorer: PlanExplorer<'_, 'm, 'p, T> =
-            PlanExplorer::new(self.solver_model, &self.decision_vars, &self.sandbox);
+            PlanExplorer::new(self.solver_model, self.decision_vars, &self.sandbox);
         f(&explorer)
     }
 
@@ -347,7 +343,7 @@ impl<'m, 'p, T: Copy + Ord> PlanBuilder<'m, 'p, T> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PlanningContext<'s, 'm, 'p, T: Copy + Ord> {
     model: &'m SolverModel<'p, T>,
     state: &'s SolverState<'p, T>,
@@ -365,16 +361,19 @@ impl<'s, 'm, 'p, T: Copy + Ord> PlanningContext<'s, 'm, 'p, T> {
 
     // Build a plan using a closure to configure the builder.
     #[inline]
-    pub fn with_builder<F>(&self, f: F) -> Plan<'p, T>
+    pub fn with_builder<'b, F>(&self, work_buffer: &'b mut [DecisionVar<T>], f: F) -> Plan<'p, T>
     where
-        F: FnOnce(&mut PlanBuilder<'m, 'p, T>),
+        F: FnOnce(&mut PlanBuilder<'b, 'm, 'p, T>),
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
+        // Seed the work buffer with the current decision variables.
+        work_buffer.copy_from_slice(self.state.decision_variables());
+
         // For now we do not use specialized overlays. Just the cloned ledger and terminal,
         // so proposals can be made on them independently from the master state.
         let mut pb = PlanBuilder::new(
             self.model,
-            self.state().decision_variables().into(),
+            work_buffer,
             self.state.terminal_occupancy().clone(),
         );
         f(&mut pb);
@@ -382,13 +381,16 @@ impl<'s, 'm, 'p, T: Copy + Ord> PlanningContext<'s, 'm, 'p, T> {
     }
 
     #[inline]
-    pub fn builder(&self) -> PlanBuilder<'m, 'p, T>
+    pub fn builder<'b>(&self, work_buffer: &'b mut [DecisionVar<T>]) -> PlanBuilder<'b, 'm, 'p, T>
     where
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
+        // Seed the work buffer with the current decision variables.
+        work_buffer.copy_from_slice(self.state.decision_variables());
+
         PlanBuilder::new(
             self.model,
-            self.state().decision_variables().into(),
+            work_buffer,
             self.state.terminal_occupancy().clone(),
         )
     }
@@ -409,7 +411,7 @@ mod tests {
         model::solver_model::SolverModel,
         state::{
             berth::berthocc::BerthRead,
-            decisionvar::{DecisionVar, DecisionVarVec},
+            decisionvar::{DecisionVar, DecisionVarVec}, // keep DecisionVarVec for the context test
         },
     };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
@@ -457,7 +459,6 @@ mod tests {
         let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
 
         let mut flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
-        // r1 pt=10 on b1, r2 pt=5 on b1
         flex.insert(flex_req(1, (0, 200), &[(1, 10)], 1));
         flex.insert(flex_req(2, (0, 200), &[(1, 5)], 1));
 
@@ -476,21 +477,15 @@ mod tests {
         let prob = problem_one_berth_two_flex();
         let model = SolverModel::try_from(&prob).expect("model ok");
 
-        // terminal from the problem's berths
         let term = mk_occ(prob.berths().iter());
 
-        // two requests → two DVs (both unassigned)
-        let dv = DecisionVarVec::from(vec![
-            DecisionVar::unassigned();
-            model.flexible_requests_len()
-        ]);
-        let mut pb = PlanBuilder::new(&model, dv, term);
+        // NEW: working buffer
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut pb = PlanBuilder::new(&model, work_buf.as_mut_slice(), term);
 
-        // request index for rid(1) and berth index for bid(1)
         let r_ix = model.index_manager().request_index(rid(1)).unwrap();
         let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
 
-        // take a free slot on that berth within the feasible window
         let free = pb
             .sandbox()
             .inner()
@@ -498,32 +493,22 @@ mod tests {
             .next()
             .expect("free slot exists");
 
-        // assign at t=0
         pb.propose_assignment(r_ix, tp(0), &free)
             .expect("propose assignment should succeed");
 
-        // sandbox reflects occupancy [0, pt)
         let pt = model.processing_time(r_ix, b_ix).expect("pt defined");
         let asg_iv = iv(0, pt.value());
         let occ = pb.sandbox().inner().berth(b_ix).expect("berth exists");
-        assert!(
-            !occ.is_free(asg_iv),
-            "assigned interval must be occupied in sandbox"
-        );
+        assert!(!occ.is_free(asg_iv));
 
-        // deltas tracked
-        assert!(pb.delta_cost() > 0, "delta_cost should increase");
-        assert_eq!(pb.delta_unassigned(), -1, "unassigned should drop by 1");
+        assert!(pb.delta_cost() > 0);
+        assert_eq!(pb.delta_unassigned(), -1);
 
-        // finalize: patches and terminal delta produced
         let plan = pb.finalize();
         assert!(plan.delta_cost > 0);
         assert_eq!(plan.delta_unassigned, -1);
-        assert!(
-            !plan.terminal_delta.is_empty(),
-            "delta must carry touched berth"
-        );
-        assert_eq!(plan.decision_var_patches.len(), 1, "one DV patch expected");
+        assert!(!plan.terminal_delta.is_empty());
+        assert_eq!(plan.decision_var_patches.len(), 1);
     }
 
     #[test]
@@ -532,11 +517,9 @@ mod tests {
         let model = SolverModel::try_from(&prob).expect("model ok");
         let term = mk_occ(prob.berths().iter());
 
-        let dv = DecisionVarVec::from(vec![
-            DecisionVar::unassigned();
-            model.flexible_requests_len()
-        ]);
-        let mut pb = PlanBuilder::new(&model, dv, term);
+        // NEW: working buffer
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut pb = PlanBuilder::new(&model, work_buf.as_mut_slice(), term);
 
         let r_ix = model.index_manager().request_index(rid(1)).unwrap();
         let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
@@ -551,16 +534,13 @@ mod tests {
         pb.propose_assignment(r_ix, tp(0), &free)
             .expect("assign ok");
 
-        // unassign the same request
         let fb = pb.propose_unassignment(r_ix).expect("unassign ok");
 
-        // returned free berth equals the assignment interval
         let pt = model.processing_time(r_ix, b_ix).unwrap();
         let expected = iv(0, pt.value());
         assert_eq!(fb.interval(), expected);
         assert_eq!(fb.berth_index(), b_ix);
 
-        // deltas return to zero
         assert_eq!(pb.delta_unassigned(), 0);
         assert_eq!(pb.delta_cost(), 0);
     }
@@ -571,13 +551,10 @@ mod tests {
         let model = SolverModel::try_from(&prob).expect("model ok");
         let term = mk_occ(prob.berths().iter());
 
-        let dv = DecisionVarVec::from(vec![
-            DecisionVar::unassigned();
-            model.flexible_requests_len()
-        ]);
-        let mut pb = PlanBuilder::new(&model, dv, term);
+        // NEW: working buffer
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut pb = PlanBuilder::new(&model, work_buf.as_mut_slice(), term);
 
-        // initially: all unassigned
         pb.with_explorer(|ex| {
             assert_eq!(ex.iter_unassigned().count(), model.flexible_requests_len());
             assert_eq!(ex.iter_assigned_requests().count(), 0);
@@ -586,7 +563,6 @@ mod tests {
             assert!(ex.iter_free_for(r_ix).next().is_some());
         });
 
-        // assign one
         let r_ix = model.index_manager().request_index(rid(1)).unwrap();
         let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
         let free = pb
@@ -598,7 +574,6 @@ mod tests {
         pb.propose_assignment(r_ix, tp(0), &free)
             .expect("assign ok");
 
-        // now: one assigned, one unassigned
         pb.with_explorer(|ex| {
             assert_eq!(
                 ex.iter_unassigned().count(),
@@ -618,6 +593,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).expect("model ok");
         let term = mk_occ(prob.berths().iter());
 
+        // State still uses DecisionVarVec
         let dv = DecisionVarVec::from(vec![
             DecisionVar::unassigned();
             model.flexible_requests_len()
@@ -627,7 +603,9 @@ mod tests {
 
         let ctx = PlanningContext::new(&model, &state);
 
-        let plan = ctx.with_builder(|pb| {
+        // NEW: provide a working buffer to the context
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let plan = ctx.with_builder(&mut work_buf, |pb| {
             let r_ix = model.index_manager().request_index(rid(1)).unwrap();
             let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
             let free = pb
@@ -640,7 +618,6 @@ mod tests {
                 .expect("assign ok");
         });
 
-        // master state remains unchanged
         assert_eq!(
             state
                 .decision_variables()
@@ -650,7 +627,6 @@ mod tests {
             0
         );
 
-        // plan carries patches and terminal delta
         assert_eq!(plan.decision_var_patches.len(), 1);
         assert!(!plan.terminal_delta.is_empty());
         assert!(plan.delta_cost > 0);
@@ -663,16 +639,13 @@ mod tests {
         let model = SolverModel::try_from(&prob).expect("model ok");
         let term = mk_occ(prob.berths().iter());
 
-        let dv = DecisionVarVec::from(vec![
-            DecisionVar::unassigned();
-            model.flexible_requests_len()
-        ]);
-        let mut pb = PlanBuilder::new(&model, dv, term);
+        // NEW: working buffer
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut pb = PlanBuilder::new(&model, work_buf.as_mut_slice(), term);
 
         let r_ix = model.index_manager().request_index(rid(1)).unwrap();
         let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
 
-        // Make an artificially narrow "free" window that can't contain the assignment
         let narrow = FreeBerth::new(iv(5, 7), b_ix);
 
         let err = pb.propose_assignment(r_ix, tp(0), &narrow).unwrap_err();
@@ -681,7 +654,6 @@ mod tests {
             other => panic!("expected BerthNotFree, got: {other:?}"),
         }
 
-        // No deltas applied
         assert_eq!(pb.delta_unassigned(), 0);
         assert_eq!(pb.delta_cost(), 0);
     }
