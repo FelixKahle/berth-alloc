@@ -43,7 +43,7 @@ use crate::{
             },
             repair::{GreedyInsertion, KRegretInsertion, RandomizedGreedyInsertion},
         },
-        planner::PlanningContext,
+        planner::{DefaultCostEvaluator, PlanningContext},
     },
     state::solver_state::{SolverState, SolverStateView},
 };
@@ -63,9 +63,9 @@ where
     T: SolveNumeric,
     R: rand::Rng,
 {
-    destroy_ops: Vec<Box<dyn DestroyOperator<T, R>>>,
-    repair_ops: Vec<Box<dyn RepairOperator<T, R>>>,
-    local_ops: Vec<Box<dyn LocalMoveOperator<T, R>>>,
+    destroy_ops: Vec<Box<dyn DestroyOperator<T, DefaultCostEvaluator, R>>>,
+    repair_ops: Vec<Box<dyn RepairOperator<T, DefaultCostEvaluator, R>>>,
+    local_ops: Vec<Box<dyn LocalMoveOperator<T, DefaultCostEvaluator, R>>>,
 
     local_acceptor: LexStrictAcceptor, // Phase A
     repair_acceptor: RepairAcceptor,   // Phase C
@@ -114,17 +114,26 @@ where
         }
     }
 
-    pub fn with_destroy_op(mut self, op: Box<dyn DestroyOperator<T, R>>) -> Self {
+    pub fn with_destroy_op(
+        mut self,
+        op: Box<dyn DestroyOperator<T, DefaultCostEvaluator, R>>,
+    ) -> Self {
         self.destroy_ops.push(op);
         self
     }
 
-    pub fn with_repair_op(mut self, op: Box<dyn RepairOperator<T, R>>) -> Self {
+    pub fn with_repair_op(
+        mut self,
+        op: Box<dyn RepairOperator<T, DefaultCostEvaluator, R>>,
+    ) -> Self {
         self.repair_ops.push(op);
         self
     }
 
-    pub fn with_local_op(mut self, op: Box<dyn LocalMoveOperator<T, R>>) -> Self {
+    pub fn with_local_op(
+        mut self,
+        op: Box<dyn LocalMoveOperator<T, DefaultCostEvaluator, R>>,
+    ) -> Self {
         self.local_ops.push(op);
         self
     }
@@ -222,7 +231,7 @@ where
         "Iterated Local Search"
     }
 
-    #[tracing::instrument(name = "ILS Search", skip(self, context))]
+    #[tracing::instrument(level = "debug", name = "ILS Search", skip(self, context))]
     fn run<'e, 'm, 'p>(&mut self, context: &mut SearchContext<'e, 'm, 'p, T, R>) {
         let model = context.model();
         let stop = context.stop();
@@ -281,7 +290,12 @@ where
                 for &i in &order {
                     let op = &self.local_ops[i];
 
-                    let mut pc = PlanningContext::new(model, &current, dv_buf.as_mut_slice());
+                    let mut pc = PlanningContext::new(
+                        model,
+                        &current,
+                        &DefaultCostEvaluator,
+                        dv_buf.as_mut_slice(),
+                    );
                     if let Some(plan) = op.propose(&mut pc, context.rng()) {
                         let mut tmp = current.clone();
                         tmp.apply_plan(plan);
@@ -325,7 +339,12 @@ where
                     };
                     let d = &self.destroy_ops[idx];
 
-                    let mut pc = PlanningContext::new(model, &current, dv_buf.as_mut_slice());
+                    let mut pc = PlanningContext::new(
+                        model,
+                        &current,
+                        &DefaultCostEvaluator,
+                        dv_buf.as_mut_slice(),
+                    );
                     if let Some(plan) = d.propose(&mut pc, context.rng()) {
                         current.apply_plan(plan);
                         destroyed = true;
@@ -347,7 +366,12 @@ where
                     }
 
                     let mut temp = current.clone();
-                    let mut pc = PlanningContext::new(model, &temp, dv_buf.as_mut_slice());
+                    let mut pc = PlanningContext::new(
+                        model,
+                        &temp,
+                        &DefaultCostEvaluator,
+                        dv_buf.as_mut_slice(),
+                    );
                     if let Some(plan) = r.repair(&mut pc, context.rng()) {
                         temp.apply_plan(plan);
 
@@ -444,6 +468,11 @@ where
                 .with_neighbors(neighbors_any.clone()),
         ))
         // Shaw relatedness (temporal + berth penalty)
+        // time band around seed interval
+        .with_destroy_op(Box::new(
+            TimeWindowBandDestroy::<T>::new(0.30..=0.50, 1.4..=1.8, TimeDelta::new(12.into()))
+                .with_neighbors(neighbors_any),
+        ))
         .with_destroy_op(Box::new(
             ShawRelatedDestroy::new(
                 0.20..=0.40, // ratio
@@ -457,11 +486,6 @@ where
         // contiguous block on a berth
         .with_destroy_op(Box::new(
             StringBlockDestroy::new(0.25..=0.45).with_alpha(1.4..=2.0),
-        ))
-        // time band around seed interval
-        .with_destroy_op(Box::new(
-            TimeWindowBandDestroy::<T>::new(0.30..=0.50, 1.4..=1.8, TimeDelta::new(12.into()))
-                .with_neighbors(neighbors_any),
         ))
         // -------------------------- Phase C: Repair operators -------------------------
         .with_repair_op(Box::new(KRegretInsertion::new(4..=4))) // keep k=4 deterministically

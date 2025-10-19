@@ -22,11 +22,14 @@
 use crate::{
     core::numeric::SolveNumeric,
     engine::{
+        gls,
         greedy_opening::GreedyOpening,
         ils,
         opening::OpeningStrategy,
+        sa,
         search::{SearchContext, SearchStrategy},
         shared_incumbent::SharedIncumbent,
+        tabu,
     },
     model::{err::SolverModelBuildError, solver_model::SolverModel},
     state::solver_state::SolverStateView,
@@ -158,10 +161,25 @@ where
 
         if self.strategies.is_empty() {
             let n = self.config.num_workers.max(1);
-            for _ in 0..n {
-                // Build an ILS that uses the model’s proximity map (neighbors already wired in ils_strategy)
-                let ils = ils::ils_strategy::<T, ChaCha8Rng>(&model);
-                self.strategies.push(Box::new(ils));
+            for i in 0..n {
+                match i % 4 {
+                    0 => {
+                        let ils = ils::ils_strategy::<T, ChaCha8Rng>(&model);
+                        self.strategies.push(Box::new(ils));
+                    }
+                    1 => {
+                        let tabu = tabu::tabu_strategy::<T, ChaCha8Rng>(&model);
+                        self.strategies.push(Box::new(tabu));
+                    }
+                    2 => {
+                        let sa = sa::sa_strategy::<T, ChaCha8Rng>(&model);
+                        self.strategies.push(Box::new(sa));
+                    }
+                    _ => {
+                        let ils = gls::gls_strategy::<T, ChaCha8Rng>(&model);
+                        self.strategies.push(Box::new(ils));
+                    }
+                }
             }
         }
 

@@ -23,7 +23,7 @@ use crate::{
     model::index::RequestIndex,
     search::{
         operator::RepairOperator,
-        planner::{PlanBuilder, PlanExplorer, PlanningContext},
+        planner::{CostEvaluator, PlanBuilder, PlanExplorer, PlanningContext},
     },
     state::{plan::Plan, terminal::terminalocc::FreeBerth},
 };
@@ -62,13 +62,14 @@ fn randomized_greedy_index<R: Rng>(len: usize, greediness_alpha: f64, rng: &mut 
 /// Count coarse feasible insertion “slots” for request `request_index` using the explorer:
 /// number of free intervals that can host at least one feasible start.
 #[inline]
-fn count_feasible_positions_ex<T>(
-    plan_explorer: &PlanExplorer<'_, '_, '_, '_, T>,
+fn count_feasible_positions_ex<T, C>(
+    plan_explorer: &PlanExplorer<'_, '_, '_, '_, '_, T, C>,
     model: &crate::model::solver_model::SolverModel<'_, T>,
     request_index: RequestIndex,
 ) -> usize
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
+    C: CostEvaluator<T>,
 {
     plan_explorer
         .iter_free_for(request_index)
@@ -88,13 +89,14 @@ where
 /// Best (lowest-cost) insertion for `request_index` right now via explorer.
 /// Returns `(FreeBerth, start, cost)` for the *earliest* feasible start in each free interval.
 #[inline]
-fn best_insertion_for_request_ex<T>(
-    plan_explorer: &PlanExplorer<'_, '_, '_, '_, T>,
+fn best_insertion_for_request_ex<T, C>(
+    plan_explorer: &PlanExplorer<'_, '_, '_, '_, '_, T, C>,
     model: &crate::model::solver_model::SolverModel<'_, T>,
     request_index: RequestIndex,
 ) -> Option<(FreeBerth<T>, TimePoint<T>, Cost)>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>,
+    C: CostEvaluator<T>,
 {
     let mut best_triplet: Option<(Cost, FreeBerth<T>, TimePoint<T>)> = None;
 
@@ -149,22 +151,23 @@ impl RandomizedGreedyInsertion {
     }
 }
 
-impl<T, R> RepairOperator<T, R> for RandomizedGreedyInsertion
+impl<T, C, R> RepairOperator<T, C, R> for RandomizedGreedyInsertion
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>,
+    C: CostEvaluator<T>,
     R: Rng,
 {
     fn name(&self) -> &str {
         "RandomizedGreedyInsertion"
     }
 
-    fn repair<'b, 's, 'm, 'p>(
+    fn repair<'b, 'c, 's, 'm, 'p>(
         &self,
-        planning_context: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        planning_context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
         let solver_model = planning_context.model();
-        let mut plan_builder: PlanBuilder<'_, 's, 'm, 'p, T> = planning_context.builder();
+        let mut plan_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = planning_context.builder();
 
         // Sample α once for this repair phase to keep behavior coherent within a step.
         let sampled_greediness_alpha: f64 = rng.random_range(self.greediness_alpha_range.clone());
@@ -251,22 +254,23 @@ impl KRegretInsertion {
     }
 }
 
-impl<T, R> RepairOperator<T, R> for KRegretInsertion
+impl<T, C, R> RepairOperator<T, C, R> for KRegretInsertion
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>,
+    C: CostEvaluator<T>,
     R: Rng,
 {
     fn name(&self) -> &str {
         "KRegretInsertion"
     }
 
-    fn repair<'b, 's, 'm, 'p>(
+    fn repair<'b, 'c, 's, 'm, 'p>(
         &self,
-        planning_context: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        planning_context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
         let solver_model = planning_context.model();
-        let mut plan_builder: PlanBuilder<'_, 's, 'm, 'p, T> = planning_context.builder();
+        let mut plan_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = planning_context.builder();
 
         // Sample k once for this repair phase.
         let sampled_k: usize = rng.random_range(self.k_choice_range.clone());
@@ -377,18 +381,19 @@ where
 #[derive(Clone, Debug)]
 pub struct GreedyInsertion;
 
-impl<T, R> RepairOperator<T, R> for GreedyInsertion
+impl<T, C, R> RepairOperator<T, C, R> for GreedyInsertion
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>,
+    C: CostEvaluator<T>,
     R: Rng,
 {
     fn name(&self) -> &str {
         "GreedyInsertion"
     }
 
-    fn repair<'b, 's, 'm, 'p>(
+    fn repair<'b, 'c, 's, 'm, 'p>(
         &self,
-        planning_context: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        planning_context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         _rng: &mut R,
     ) -> Option<Plan<'p, T>> {
         let solver_model = planning_context.model();
@@ -453,18 +458,19 @@ where
 #[derive(Clone, Debug)]
 pub struct EarliestWindowInsertion;
 
-impl<T, R> RepairOperator<T, R> for EarliestWindowInsertion
+impl<T, C, R> RepairOperator<T, C, R> for EarliestWindowInsertion
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>,
+    C: CostEvaluator<T>,
     R: Rng,
 {
     fn name(&self) -> &str {
         "EarliestWindowInsertion"
     }
 
-    fn repair<'b, 's, 'm, 'p>(
+    fn repair<'b, 'c, 's, 'm, 'p>(
         &self,
-        planning_context: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        planning_context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         _rng: &mut R,
     ) -> Option<Plan<'p, T>> {
         let solver_model = planning_context.model();
@@ -504,7 +510,7 @@ mod tests {
     use super::*;
     use crate::{
         model::solver_model::SolverModel,
-        search::planner::PlanningContext,
+        search::planner::{DefaultCostEvaluator, PlanningContext},
         state::{
             decisionvar::{DecisionVar, DecisionVarVec},
             fitness::Fitness,
@@ -574,12 +580,13 @@ mod tests {
         SolverState::new(dv, term, fit)
     }
 
-    fn make_ctx<'b, 's, 'm, 'p>(
+    fn make_ctx<'b, 'c, 's, 'm, 'p>(
         model: &'m SolverModel<'p, i64>,
+        cost_evaluator: &'c DefaultCostEvaluator,
         state: &'s SolverState<'p, i64>,
         buffer: &'b mut [DecisionVar<i64>],
-    ) -> PlanningContext<'b, 's, 'm, 'p, i64> {
-        PlanningContext::new(model, state, buffer)
+    ) -> PlanningContext<'b, 'c, 's, 'm, 'p, i64, DefaultCostEvaluator> {
+        PlanningContext::new(model, state, cost_evaluator, buffer)
     }
 
     #[test]
@@ -588,7 +595,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_unassigned_state(&model);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(1337);
 
         let op = RandomizedGreedyInsertion::new(1.6..=2.2);
@@ -604,7 +611,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_unassigned_state(&model);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(4242);
 
         let op = KRegretInsertion::new(2..=3);
@@ -626,7 +633,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_unassigned_state(&model);
         let mut buffer = vec![DecisionVar::unassigned(); 2];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(1);
 
         let op = GreedyInsertion;
@@ -651,7 +658,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_unassigned_state(&model);
         let mut buffer = vec![DecisionVar::unassigned(); 3];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(1);
 
         let op = EarliestWindowInsertion;
@@ -680,7 +687,7 @@ mod tests {
         let state = SolverState::new(dv, term, fit);
 
         let mut buffer = vec![DecisionVar::unassigned(); 2];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(7);
 
         assert!(

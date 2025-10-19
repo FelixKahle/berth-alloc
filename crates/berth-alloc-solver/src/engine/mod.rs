@@ -20,10 +20,13 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 pub mod acceptor;
+pub mod gls;
 pub mod greedy_opening;
 pub mod ils;
 pub mod neighbors;
 pub mod opening;
+pub mod sa;
 pub mod search;
 pub mod shared_incumbent;
 pub mod solver_engine;
+pub mod tabu;

@@ -18,6 +18,10 @@
 # LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-[build]
-rustflags = ["-C", "target-cpu=native"]
+#
+[target.aarch64-apple-darwin]
+rustflags = [
+  "-Lnative=/opt/homebrew/opt/libomp/lib",
+  "-Clink-arg=-L/opt/homebrew/opt/libomp/lib",
+  "-Clink-arg=-Wl,-rpath,/opt/homebrew/opt/libomp/lib",
+]
