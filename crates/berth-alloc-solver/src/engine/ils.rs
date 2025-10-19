@@ -41,6 +41,7 @@ use crate::{
                 CrossExchangeAcrossBerths, OrOptBlockRelocate, RelocateSingleBest,
                 ShiftEarlierOnSameBerth, SwapPairSameBerth,
             },
+            math::{MatheuristicRepair, MipBlockReoptimize},
             repair::{GreedyInsertion, KRegretInsertion, RandomizedGreedyInsertion},
         },
         planner::PlanningContext,
@@ -437,6 +438,17 @@ where
         .with_destroy_op(Box::new(
             WorstCostDestroy::new(0.20..=0.40).with_neighbors(neighbors_direct_competitors.clone()),
         ))
+        .with_local_op(Box::new(MipBlockReoptimize::same_berth(
+            2..=5,  // block length k
+            3..=6,  // candidate starts per free interval
+            6..=10, // max candidates per request
+        )))
+        // (B) across-all-berths block reopt — heavier, keep caps tighter
+        .with_local_op(Box::new(MipBlockReoptimize::across_all_berths(
+            2..=4, // k a bit smaller across berths
+            2..=4, // fewer starts per interval
+            4..=8, // tighter cap per request
+        )))
         // time cluster around long job
         .with_destroy_op(Box::new(
             TimeClusterDestroy::<T>::new(0.20..=0.35, TimeDelta::new(24.into()))
@@ -444,6 +456,11 @@ where
                 .with_neighbors(neighbors_any.clone()),
         ))
         // Shaw relatedness (temporal + berth penalty)
+        // time band around seed interval
+        .with_destroy_op(Box::new(
+            TimeWindowBandDestroy::<T>::new(0.30..=0.50, 1.4..=1.8, TimeDelta::new(12.into()))
+                .with_neighbors(neighbors_any),
+        ))
         .with_destroy_op(Box::new(
             ShawRelatedDestroy::new(
                 0.20..=0.40, // ratio
@@ -458,13 +475,9 @@ where
         .with_destroy_op(Box::new(
             StringBlockDestroy::new(0.25..=0.45).with_alpha(1.4..=2.0),
         ))
-        // time band around seed interval
-        .with_destroy_op(Box::new(
-            TimeWindowBandDestroy::<T>::new(0.30..=0.50, 1.4..=1.8, TimeDelta::new(12.into()))
-                .with_neighbors(neighbors_any),
-        ))
         // -------------------------- Phase C: Repair operators -------------------------
         .with_repair_op(Box::new(KRegretInsertion::new(4..=4))) // keep k=4 deterministically
         .with_repair_op(Box::new(RandomizedGreedyInsertion::new(1.6..=2.2)))
         .with_repair_op(Box::new(GreedyInsertion))
+        .with_repair_op(Box::new(MatheuristicRepair::new()))
 }

@@ -68,6 +68,11 @@ impl<'pb, 't, 'm, 'p, T: Copy + Ord> PlanExplorer<'pb, 't, 'm, 'p, T> {
     }
 
     #[inline]
+    pub fn model(&self) -> &'m SolverModel<'p, T> {
+        self.solver_model
+    }
+
+    #[inline]
     pub fn decision_vars(&self) -> &'pb [DecisionVar<T>] {
         self.decision_vars
     }
@@ -385,11 +390,7 @@ impl<'b, 's, 'm, 'p, T: Copy + Ord> PlanningContext<'b, 's, 'm, 'p, T> {
 
         // For now we do not use specialized overlays. Just the cloned ledger and terminal,
         // so proposals can be made on them independently from the master state.
-        let mut pb = PlanBuilder::new(
-            self.model,
-            self.state.terminal_occupancy(),
-            self.buffer,
-        );
+        let mut pb = PlanBuilder::new(self.model, self.state.terminal_occupancy(), self.buffer);
         f(&mut pb);
         pb.finalize()
     }
@@ -401,11 +402,7 @@ impl<'b, 's, 'm, 'p, T: Copy + Ord> PlanningContext<'b, 's, 'm, 'p, T> {
     {
         // Seed the work buffer with the current decision variables.
         self.buffer.copy_from_slice(self.state.decision_variables());
-        PlanBuilder::new(
-            self.model,
-            self.state.terminal_occupancy(),
-            self.buffer,
-        )
+        PlanBuilder::new(self.model, self.state.terminal_occupancy(), self.buffer)
     }
 }
 
