@@ -55,9 +55,7 @@ impl Default for SolverEngineConfig {
     #[inline]
     fn default() -> Self {
         Self {
-            num_workers: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
+            num_workers: 4,
             time_limit: std::time::Duration::from_secs(30),
         }
     }

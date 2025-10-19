@@ -1,3 +1,5 @@
+// crates/berth-alloc-solver/src/engine/gls.rs
+
 // Copyright (c) 2025 Felix Kahle.
 //
 // Permission is hereby granted, free of charge, to any person obtaining
@@ -22,7 +24,7 @@
 use crate::{
     core::numeric::SolveNumeric,
     engine::{
-        acceptor::{Acceptor, LexStrictAcceptor}, // <— true-objective acceptor
+        acceptor::{Acceptor, LexStrictAcceptor}, // true-objective acceptor
         search::{SearchContext, SearchStrategy},
     },
     model::{
@@ -195,6 +197,11 @@ where
     refetch_after_stale: usize, // 0 => disabled
     hard_refetch_every: usize,  // 0 => disabled
     hard_refetch_mode: HardRefetchMode,
+
+    // Reset / restart behavior (penalties are preserved across resets)
+    restart_on_publish: bool,
+    reset_on_refetch: bool,
+    kick_steps_on_reset: usize,
 }
 
 impl<T, R> Default for GuidedLocalSearchStrategy<T, R>
@@ -226,6 +233,9 @@ where
             refetch_after_stale: 128,
             hard_refetch_every: 0,
             hard_refetch_mode: HardRefetchMode::IfBetter,
+            restart_on_publish: true,
+            reset_on_refetch: true,
+            kick_steps_on_reset: 3,
         }
     }
 
@@ -256,6 +266,18 @@ where
         self.hard_refetch_mode = mode;
         self
     }
+    pub fn with_restart_on_publish(mut self, yes: bool) -> Self {
+        self.restart_on_publish = yes;
+        self
+    }
+    pub fn with_reset_on_refetch(mut self, yes: bool) -> Self {
+        self.reset_on_refetch = yes;
+        self
+    }
+    pub fn with_kick_steps_on_reset(mut self, k: usize) -> Self {
+        self.kick_steps_on_reset = k;
+        self
+    }
 
     #[inline]
     fn should_hard_refetch(&self, outer_rounds: usize) -> bool {
@@ -264,6 +286,7 @@ where
             && outer_rounds.is_multiple_of(self.hard_refetch_every)
     }
 
+    /// Periodic refetch; returns true if a refetch happened.
     #[inline]
     fn periodic_refetch<'e, 'm, 'p>(
         &self,
@@ -271,9 +294,9 @@ where
         best_true: &mut SolverState<'p, T>,
         context: &SearchContext<'e, 'm, 'p, T, R>,
         outer_rounds: usize,
-    ) {
+    ) -> bool {
         if !self.should_hard_refetch(outer_rounds) {
-            return;
+            return false;
         }
         let inc = context.shared_incumbent().peek();
         let do_fetch = match self.hard_refetch_mode {
@@ -295,9 +318,12 @@ where
             {
                 *best_true = snap;
             }
+            return true;
         }
+        false
     }
 
+    /// Staleness-triggered refetch; returns true if a refetch happened.
     #[inline]
     fn stale_refetch<'e, 'm, 'p>(
         &self,
@@ -331,42 +357,49 @@ where
         }
     }
 
-    /// Increase penalties on top-k highest-utility features using *base* costs.
-    fn pulse_increase_penalties<'m, 'p>(
-        &mut self,
-        model: &SolverModel<'m, T>,
-        current: &SolverState<'p, T>,
+    /// Reset local climb state around `current` and optionally apply a few random kick moves
+    /// using the *augmented* evaluator (penalties preserved).
+    fn reset_state<'m, 'p>(
+        &self,
+        model: &'m SolverModel<'p, T>,
+        rng: &mut R,
         dv_buf: &mut [DecisionVar<T>],
+        current: &mut SolverState<'p, T>,
+        stale_rounds: &mut usize,
+        label: &str,
     ) {
-        let base_eval = DefaultCostEvaluator;
-        let mut pc = PlanningContext::new(model, current, &base_eval, dv_buf);
+        *stale_rounds = 0;
 
-        let utils = pc.builder().with_explorer(|ex| {
-            let mut tmp: Vec<(FeatureKey, i64, i64)> = Vec::new();
-            for (i, dv) in ex.decision_vars().iter().enumerate() {
-                if let DecisionVar::Assigned(Decision {
-                    berth_index,
-                    start_time,
-                }) = *dv
-                    && let Some(base) = ex.peek_cost(RequestIndex::new(i), start_time, berth_index)
-                {
-                    let key = (i, berth_index.get());
-                    let p = *self.penalties.get(&key).unwrap_or(&0);
-                    // GLS proxy: utility = base_cost / (1 + penalty)
-                    let util = base / (1 + p) as Cost;
-                    tmp.push((key, util, p));
+        if self.kick_steps_on_reset > 0 {
+            let aug_eval = AugmentedCostEvaluator::new(
+                DefaultCostEvaluator,
+                self.penalties.clone(),
+                self.lambda as Cost,
+            );
+            for _ in 0..self.kick_steps_on_reset {
+                let mut order: Vec<usize> = (0..self.local_ops.len()).collect();
+                order.shuffle(rng);
+                let mut kicked = false;
+                for &oi in &order {
+                    let op = &self.local_ops[oi];
+                    let mut pc = PlanningContext::new(model, current, &aug_eval, dv_buf);
+                    if let Some(plan) = op.propose(&mut pc, rng) {
+                        current.apply_plan(plan);
+                        kicked = true;
+                        break;
+                    }
+                }
+                if !kicked {
+                    break;
                 }
             }
-            tmp.sort_by_key(|&(_, util, _)| -util); // descending
-            tmp
-        });
-
-        for (idx, (key, _, _)) in utils.into_iter().enumerate() {
-            if idx >= self.pulse_top_k {
-                break;
-            }
-            *self.penalties.entry(key).or_insert(0) += self.penalty_step;
         }
+
+        tracing::debug!(
+            "GLS: reset ({}) — staleness=0, kick_steps={}",
+            label,
+            self.kick_steps_on_reset
+        );
     }
 }
 
@@ -407,8 +440,19 @@ where
             }
             outer_rounds = outer_rounds.saturating_add(1);
 
-            // Periodic refetch (ILS-style), but keep penalties (learned structure).
-            self.periodic_refetch(&mut current, &mut best_true, context, outer_rounds);
+            // Periodic refetch (ILS-style). If we do refetch, optionally reset local climb.
+            if self.periodic_refetch(&mut current, &mut best_true, context, outer_rounds)
+                && self.reset_on_refetch
+            {
+                self.reset_state(
+                    model,
+                    context.rng(),
+                    dv_buf.as_mut_slice(),
+                    &mut current,
+                    &mut stale,
+                    "periodic-refetch",
+                );
+            }
 
             let mut accepted_any = false;
 
@@ -465,6 +509,19 @@ where
                             {
                                 best_true = current.clone();
                                 let _ = context.shared_incumbent().try_update(&best_true);
+
+                                // Restart around the just-published best, but KEEP penalties.
+                                if self.restart_on_publish {
+                                    current = best_true.clone();
+                                    self.reset_state(
+                                        model,
+                                        context.rng(),
+                                        dv_buf.as_mut_slice(),
+                                        &mut current,
+                                        &mut stale,
+                                        "publish",
+                                    );
+                                }
                             }
 
                             step_taken = true;
@@ -484,11 +541,52 @@ where
 
                 if stale >= self.stagnation_rounds_before_pulse {
                     // Pulse penalties on highest-utility features (computed on base cost).
-                    self.pulse_increase_penalties(model, &current, dv_buf.as_mut_slice());
+                    let base_eval = DefaultCostEvaluator;
+                    let mut pc =
+                        PlanningContext::new(model, &current, &base_eval, dv_buf.as_mut_slice());
+
+                    // Collect utilities and bump top-k penalties.
+                    let utils = pc.builder().with_explorer(|ex| {
+                        let mut tmp: Vec<(FeatureKey, i64)> = Vec::new();
+                        for (i, dv) in ex.decision_vars().iter().enumerate() {
+                            if let DecisionVar::Assigned(Decision {
+                                berth_index,
+                                start_time,
+                            }) = *dv
+                                && let Some(base) =
+                                    ex.peek_cost(RequestIndex::new(i), start_time, berth_index)
+                            {
+                                let key = (i, berth_index.get());
+                                let p = *self.penalties.get(&key).unwrap_or(&0);
+                                // GLS proxy: utility = base_cost / (1 + penalty)
+                                let util = base / (1 + p) as Cost;
+                                tmp.push((key, util));
+                            }
+                        }
+                        tmp.sort_by_key(|&(_, util)| -util); // descending
+                        tmp
+                    });
+
+                    for (idx, (key, _)) in utils.into_iter().enumerate() {
+                        if idx >= self.pulse_top_k {
+                            break;
+                        }
+                        *self.penalties.entry(key).or_insert(0) += self.penalty_step;
+                    }
+
                     stale = 0;
                     tracing::trace!("GLS: penalty pulse (top_k={})", self.pulse_top_k);
-                } else if self.stale_refetch(&mut current, &mut best_true, context, stale) {
-                    stale = 0;
+                } else if self.stale_refetch(&mut current, &mut best_true, context, stale)
+                    && self.reset_on_refetch
+                {
+                    self.reset_state(
+                        model,
+                        context.rng(),
+                        dv_buf.as_mut_slice(),
+                        &mut current,
+                        &mut stale,
+                        "stale-refetch",
+                    );
                 }
             } else {
                 stale = 0;
@@ -513,6 +611,9 @@ where
         .with_refetch_after_stale(128)
         .with_hard_refetch_every(0)
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
+        .with_restart_on_publish(true) // restart around new best (penalties kept)
+        .with_reset_on_refetch(true) // reset after refetch (penalties kept)
+        .with_kick_steps_on_reset(3) // small diversification after reset
         // Local improvement operators (evaluated on augmented costs)
         .with_local_op(Box::new(ShiftEarlierOnSameBerth {
             number_of_candidates_to_try_range: 8..=24,

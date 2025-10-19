@@ -1,3 +1,5 @@
+// crates/berth-alloc-solver/src/engine/tabu.rs
+
 // Copyright (c) 2025 Felix Kahle.
 //
 // Permission is hereby granted, free of charge, to any person obtaining
@@ -33,7 +35,7 @@ use crate::{
         },
         planner::{DefaultCostEvaluator, PlanningContext},
     },
-    state::{fitness::Fitness, plan::Plan, solver_state::SolverState},
+    state::{decisionvar::DecisionVar, fitness::Fitness, plan::Plan, solver_state::SolverState},
 };
 use rand::seq::SliceRandom;
 use std::{
@@ -84,6 +86,12 @@ impl Acceptor for EnergyAcceptor {
     }
 }
 
+/// Tabu Search with restart/reset mechanics:
+/// - Walkers explore using a tabu list and energy-ordered ranking.
+/// - True improvements (lexicographic) are published.
+/// - When we refetch a better shared incumbent or publish a better local best,
+///   we **reset** the search (clear tabu, optionally "kick" with a few random moves)
+///   to restart diversification around the new basin. This is the Tabu analogue of SA "reheat".
 pub struct TabuSearchStrategy<T, R>
 where
     T: SolveNumeric,
@@ -111,6 +119,14 @@ where
     refetch_after_stale: usize, // 0 => disabled
     hard_refetch_every: usize,  // 0 => disabled
     hard_refetch_mode: HardRefetchMode,
+
+    // --- Reset / Restart controls ---
+    // When we *publish* a new best (true objective), reset the search around it.
+    restart_on_publish: bool,
+    // When we *refetch* a shared incumbent, reset as well.
+    reset_on_refetch: bool,
+    // After a reset, perform this many random "kick" moves to diversify.
+    kick_steps_on_reset: usize,
 }
 
 impl<T, R> Default for TabuSearchStrategy<T, R>
@@ -139,6 +155,9 @@ where
             refetch_after_stale: 128,
             hard_refetch_every: 0,
             hard_refetch_mode: HardRefetchMode::IfBetter,
+            restart_on_publish: true,
+            reset_on_refetch: true,
+            kick_steps_on_reset: 3,
         }
     }
 
@@ -181,6 +200,24 @@ where
         self
     }
 
+    /// Restart (clear tabu & optionally kick) when a new local best is published.
+    pub fn with_restart_on_publish(mut self, yes: bool) -> Self {
+        self.restart_on_publish = yes;
+        self
+    }
+
+    /// Reset when refetching a shared incumbent.
+    pub fn with_reset_on_refetch(mut self, yes: bool) -> Self {
+        self.reset_on_refetch = yes;
+        self
+    }
+
+    /// Number of random kick steps performed after a reset.
+    pub fn with_kick_steps_on_reset(mut self, k: usize) -> Self {
+        self.kick_steps_on_reset = k;
+        self
+    }
+
     #[inline]
     fn sample_tenure(&self, rng: &mut R) -> usize {
         let lo = *self.tabu_tenure_rounds.start();
@@ -196,7 +233,54 @@ where
     fn should_hard_refetch(&self, outer_rounds: usize) -> bool {
         self.hard_refetch_every > 0
             && outer_rounds > 0
-            && outer_rounds.is_multiple_of(self.hard_refetch_every)
+            && (outer_rounds % self.hard_refetch_every == 0)
+    }
+
+    /// Helper: perform a reset (clear tabu, reset staleness) and optional random "kicks".
+    fn reset_state<'p>(
+        &self,
+        model: &crate::model::solver_model::SolverModel<'p, T>,
+        rng: &mut R,
+        dv_buf: &mut [DecisionVar<T>],
+        current: &mut SolverState<'p, T>,
+        last_best_current: &mut Fitness,
+        stale_rounds: &mut usize,
+        tabu_until: &mut HashMap<usize, usize>,
+        label: &str,
+    ) {
+        // Clear tabu and staleness accounting.
+        tabu_until.clear();
+        *last_best_current = current.fitness().clone();
+        *stale_rounds = 0;
+
+        // Optional "kicks": apply a few random feasible local moves
+        // (ignoring tabu/admissibility) to diversify around the new basin.
+        if self.kick_steps_on_reset > 0 {
+            for _ in 0..self.kick_steps_on_reset {
+                let mut order: Vec<usize> = (0..self.local_ops.len()).collect();
+                order.shuffle(rng);
+                let mut kicked = false;
+                for &oi in &order {
+                    let op = &self.local_ops[oi];
+                    let mut pc =
+                        PlanningContext::new(model, current, &DefaultCostEvaluator, dv_buf);
+                    if let Some(plan) = op.propose(&mut pc, rng) {
+                        current.apply_plan(plan);
+                        kicked = true;
+                        break;
+                    }
+                }
+                if !kicked {
+                    break;
+                }
+            }
+        }
+
+        tracing::debug!(
+            "Tabu: reset ({}) — cleared tabu, staleness reset, kick_steps={}",
+            label,
+            self.kick_steps_on_reset
+        );
     }
 }
 
@@ -225,7 +309,6 @@ where
         let mut current: SolverState<'p, T> = context.shared_incumbent().snapshot();
         let mut best_true: SolverState<'p, T> = current.clone();
 
-        use crate::state::decisionvar::DecisionVar;
         let mut dv_buf: Vec<DecisionVar<T>> =
             vec![DecisionVar::unassigned(); model.flexible_requests_len()];
 
@@ -275,6 +358,19 @@ where
                         best_true = snap;
                     }
                     last_best_current = current.fitness().clone();
+
+                    if self.reset_on_refetch {
+                        self.reset_state(
+                            model,
+                            context.rng(),
+                            dv_buf.as_mut_slice(),
+                            &mut current,
+                            &mut last_best_current,
+                            &mut stale_rounds,
+                            &mut tabu_until,
+                            "refetch",
+                        );
+                    }
                 }
             }
 
@@ -399,6 +495,22 @@ where
                 {
                     best_true = current.clone();
                     let _ = context.shared_incumbent().try_update(&best_true);
+
+                    // --- Restart around the newly published best (optional) ---
+                    if self.restart_on_publish {
+                        // Move walker to best basin and reset its memory to avoid bias.
+                        current = best_true.clone();
+                        self.reset_state(
+                            model,
+                            context.rng(),
+                            dv_buf.as_mut_slice(),
+                            &mut current,
+                            &mut last_best_current,
+                            &mut stale_rounds,
+                            &mut tabu_until,
+                            "publish",
+                        );
+                    }
                 }
 
                 // Track local improvement of the walker (for staleness) under TRUE objective.
@@ -434,8 +546,23 @@ where
                             best_true = snap;
                         }
                         last_best_current = current.fitness().clone();
+
+                        if self.reset_on_refetch {
+                            self.reset_state(
+                                model,
+                                context.rng(),
+                                dv_buf.as_mut_slice(),
+                                &mut current,
+                                &mut last_best_current,
+                                &mut stale_rounds,
+                                &mut tabu_until,
+                                "stale-refetch",
+                            );
+                        }
                     }
-                    stale_rounds = 0; // reset either way; keep exploring
+                    // If the incumbent wasn't better, we still reset staleness counter
+                    // to avoid immediate repeated refetches.
+                    stale_rounds = 0;
                 }
             }
         }
@@ -460,6 +587,9 @@ where
         .with_refetch_after_stale(128)
         .with_hard_refetch_every(0)
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
+        .with_restart_on_publish(true) // restart around new best
+        .with_reset_on_refetch(true) // reset after refetch to shared incumbent
+        .with_kick_steps_on_reset(3) // light diversification after each reset
         // Optional: tune BIG-M for walker ranking if desired
         // .with_big_m_for_walker(2_000_000_000)
         // Local improvement operators (true objective via DefaultCostEvaluator)

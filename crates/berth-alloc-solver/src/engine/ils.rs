@@ -491,4 +491,5 @@ where
         .with_repair_op(Box::new(KRegretInsertion::new(4..=4))) // keep k=4 deterministically
         .with_repair_op(Box::new(RandomizedGreedyInsertion::new(1.6..=2.2)))
         .with_repair_op(Box::new(GreedyInsertion))
+    //.with_repair_op(Box::new(MatheuristicRepair::new()))
 }

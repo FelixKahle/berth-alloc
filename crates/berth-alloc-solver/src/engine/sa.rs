@@ -1,4 +1,7 @@
+// src/search/strategy_sa.rs
+
 // Copyright (c) 2025 Felix Kahle.
+// MIT License
 //
 // Permission is hereby granted, free of charge, to any person obtaining
 // a copy of this software and associated documentation files (the
@@ -88,9 +91,13 @@ where
     T: SolveNumeric,
     R: rand::Rng,
 {
+    // Local search operators
     local_ops: Vec<Box<dyn LocalMoveOperator<T, DefaultCostEvaluator, R>>>,
+
+    // Temperature schedule
     temperature: f64,
-    cooling: f64, // e.g., 0.995
+    init_temperature: f64, // remember initial temp for reheating
+    cooling: f64,
     min_temperature: f64,
     steps_per_temp: usize,
 
@@ -102,6 +109,9 @@ where
     refetch_after_stale: usize, // epochs without global improvement before refetch; 0 => off
     hard_refetch_every: usize,  // every N epochs; 0 => off
     hard_refetch_mode: HardRefetchMode,
+
+    // Reheat control: 0.0 => disabled; 1.0 => reset to init_temperature; (0,1) => partial
+    reheat_factor: f64,
 }
 
 impl<T, R> Default for SimulatedAnnealingStrategy<T, R>
@@ -123,6 +133,7 @@ where
         Self {
             local_ops: Vec::new(),
             temperature: 1.0,
+            init_temperature: 1.0,
             cooling: 0.995,
             min_temperature: 1e-4,
             steps_per_temp: 256,
@@ -131,6 +142,7 @@ where
             refetch_after_stale: 0,
             hard_refetch_every: 0,
             hard_refetch_mode: HardRefetchMode::IfBetter,
+            reheat_factor: 1.0, // default: full reheat on refetch
         }
     }
 
@@ -141,32 +153,47 @@ where
         self.local_ops.push(op);
         self
     }
+
     pub fn with_init_temp(mut self, t0: f64) -> Self {
-        self.temperature = t0.max(1e-9);
+        let t = t0.max(1e-9);
+        self.temperature = t;
+        self.init_temperature = t;
         self
     }
+
     pub fn with_cooling(mut self, factor: f64) -> Self {
         self.cooling = factor;
         self
     }
+
     pub fn with_steps_per_temp(mut self, k: usize) -> Self {
         self.steps_per_temp = k.max(1);
         self
     }
+
     pub fn with_refetch_after_stale(mut self, epochs: usize) -> Self {
         self.refetch_after_stale = epochs;
         self
     }
+
     pub fn with_hard_refetch_every(mut self, epochs: usize) -> Self {
         self.hard_refetch_every = epochs;
         self
     }
+
     pub fn with_hard_refetch_mode(mut self, mode: HardRefetchMode) -> Self {
         self.hard_refetch_mode = mode;
         self
     }
+
     pub fn with_big_m_for_energy(mut self, big_m: i128) -> Self {
         self.sa_acceptor = self.sa_acceptor.clone().with_big_m(big_m);
+        self
+    }
+
+    /// 0.0 => no reheat; 1.0 => reset to initial temperature on refetch; (0,1) => partial reheat.
+    pub fn with_reheat_factor(mut self, f: f64) -> Self {
+        self.reheat_factor = f.clamp(0.0, 1.0);
         self
     }
 
@@ -179,7 +206,16 @@ where
 
     #[inline]
     fn should_hard_refetch(&self, epoch: usize) -> bool {
-        self.hard_refetch_every > 0 && epoch > 0 && epoch.is_multiple_of(self.hard_refetch_every)
+        self.hard_refetch_every > 0 && epoch > 0 && (epoch % self.hard_refetch_every == 0)
+    }
+
+    #[inline]
+    fn reheat(&self, temp: &mut f64) {
+        if self.reheat_factor > 0.0 {
+            let target = (self.init_temperature * self.reheat_factor).max(self.min_temperature);
+            // raise to at least target, but do not reduce temperature if already higher
+            *temp = temp.max(target);
+        }
     }
 }
 
@@ -219,14 +255,14 @@ where
             }
             epoch = epoch.saturating_add(1);
 
-            // Clamp effective temperature so tail behaves like hill-climbing
+            // Effective temperature: once below floor, behave like hill-climbing unless reheated.
             let t_eff = if temp < self.min_temperature {
                 self.min_temperature
             } else {
                 temp
             };
 
-            // Periodic hard refetch (sync threads).
+            // Periodic hard refetch (sync threads). Optionally reheat on refetch.
             if self.should_hard_refetch(epoch) {
                 let inc = context.shared_incumbent().peek();
                 let do_fetch = match self.hard_refetch_mode {
@@ -245,6 +281,10 @@ where
                     if self.true_acceptor.accept(best.fitness(), snap.fitness()) {
                         best = snap;
                     }
+                    // Reheat and clear staleness, since we jumped basins.
+                    self.reheat(&mut temp);
+                    stale_epochs_without_global_improve = 0;
+                    tracing::debug!("SA: refetch → reheat to T={}", temp);
                 }
             }
 
@@ -336,13 +376,16 @@ where
                         if self.true_acceptor.accept(best.fitness(), snap.fitness()) {
                             best = snap;
                         }
+                        // Reheat and clear staleness when refetching to a better basin.
+                        self.reheat(&mut temp);
+                        tracing::debug!("SA: stale-refetch → reheat to T={}", temp);
                     }
                     // Reset either way to avoid immediate refetch loop.
                     stale_epochs_without_global_improve = 0;
                 }
             }
 
-            // Cool down but clamp at the floor; keep looping until stop signal.
+            // Cool down but clamp at the floor; loop exits via stop signal.
             temp = (temp * self.cooling).max(self.min_temperature);
         }
 
@@ -365,6 +408,7 @@ where
         .with_refetch_after_stale(64)
         .with_hard_refetch_every(0)
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
+        .with_reheat_factor(1.0) // restart SA temperature on refetch
         // Local improvement operators (true objective via DefaultCostEvaluator)
         .with_local_op(Box::new(ShiftEarlierOnSameBerth {
             number_of_candidates_to_try_range: 8..=24,

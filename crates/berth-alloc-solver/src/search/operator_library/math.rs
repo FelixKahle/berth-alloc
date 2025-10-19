@@ -23,7 +23,7 @@ use crate::{
     model::index::{BerthIndex, RequestIndex},
     search::{
         operator::{LocalMoveOperator, RepairOperator},
-        planner::{PlanBuilder, PlanExplorer, PlanningContext},
+        planner::{CostEvaluator, PlanBuilder, PlanExplorer, PlanningContext},
     },
     state::{plan::Plan, terminal::terminalocc::FreeBerth},
 };
@@ -94,8 +94,8 @@ where
 }
 
 /// Enumerate candidate placements for a request using the current explorer snapshot.
-fn enumerate_candidates_for_request<'e, 'm, 'p, T>(
-    explorer: &PlanExplorer<'e, '_, 'm, 'p, T>,
+fn enumerate_candidates_for_request<'e, 'c, 'm, 'p, T, C>(
+    explorer: &PlanExplorer<'e, 'c, '_, 'm, 'p, T, C>,
     solver_model: &crate::model::solver_model::SolverModel<'m, T>,
     request_index: RequestIndex,
     number_of_candidate_starts_per_free_interval: usize,
@@ -103,6 +103,7 @@ fn enumerate_candidates_for_request<'e, 'm, 'p, T>(
 ) -> Vec<CandidatePlacement<T>>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>,
+    C: CostEvaluator<T>,
 {
     let mut out: Vec<CandidatePlacement<T>> = Vec::new();
 
@@ -449,18 +450,19 @@ impl MatheuristicRepair {
     }
 }
 
-impl<T, R> RepairOperator<T, R> for MatheuristicRepair
+impl<T, C, R> RepairOperator<T, C, R> for MatheuristicRepair
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost> + Send + Sync,
+    C: CostEvaluator<T>,
     R: Rng,
 {
     fn name(&self) -> &str {
         "MatheuristicRepair"
     }
 
-    fn repair<'b, 's, 'm, 'p>(
+    fn repair<'b, 'c, 's, 'm, 'p>(
         &self,
-        planning_context: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        planning_context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
         // Non-blocking gate: if the single HiGHS slot is busy, bail out immediately.
@@ -469,7 +471,7 @@ where
         }
 
         let solver_model = planning_context.model();
-        let mut builder: PlanBuilder<'_, 's, 'm, 'p, T> = planning_context.builder();
+        let mut builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = planning_context.builder();
 
         let max_unassigned =
             Self::sample_from_range(self.maximum_unassigned_to_optimize_range.clone(), rng);
@@ -602,18 +604,19 @@ impl MipBlockReoptimize {
     }
 }
 
-impl<T, R> LocalMoveOperator<T, R> for MipBlockReoptimize
+impl<T, C, R> LocalMoveOperator<T, C, R> for MipBlockReoptimize
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>,
+    C: CostEvaluator<T>,
     R: rand::Rng,
 {
     fn name(&self) -> &str {
         "MipBlockReoptimize"
     }
 
-    fn propose<'b, 's, 'm, 'p>(
+    fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
-        context: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
         use std::collections::{BTreeMap, HashMap};
@@ -681,7 +684,7 @@ where
 
         // pick a berth + contiguous block
         let model = context.model();
-        let seed: PlanBuilder<'_, 's, 'm, 'p, T> = context.builder();
+        let seed: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
 
         let by_berth = seed.with_explorer(|ex| {
             let mut map: BTreeMap<BerthIndex, Vec<(RequestIndex, TimePoint<T>)>> = BTreeMap::new();
@@ -733,7 +736,7 @@ where
         }
 
         // fresh builder: unassign block
-        let mut builder: PlanBuilder<'_, 's, 'm, 'p, T> = context.builder();
+        let mut builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
         for &ri in &block_req_indices {
             if builder.propose_unassignment(ri).is_err() {
                 return None;
@@ -778,11 +781,11 @@ where
                     let mut starts = gen_starts(iv.start(), iv.end(), pt, num_starts);
                     if let Some(&(obi, os)) = original.get(&ri)
                         && (!self.restrict_to_same_berth || bi == obi)
-                            && os >= iv.start()
-                            && os + pt <= iv.end()
-                        {
-                            starts.push(os);
-                        }
+                        && os >= iv.start()
+                        && os + pt <= iv.end()
+                    {
+                        starts.push(os);
+                    }
                     starts.sort();
                     starts.dedup();
 
@@ -973,7 +976,7 @@ mod tests {
     use super::*;
     use crate::{
         model::solver_model::SolverModel,
-        search::planner::PlanningContext,
+        search::planner::{DefaultCostEvaluator, PlanningContext},
         state::{
             decisionvar::{DecisionVar, DecisionVarVec},
             fitness::Fitness,
@@ -1041,12 +1044,13 @@ mod tests {
         SolverState::new(dv, term, fit)
     }
 
-    fn make_ctx<'b, 's, 'm, 'p>(
+    fn make_ctx<'b, 'c, 's, 'm, 'p>(
         model: &'m SolverModel<'p, i64>,
+        cost_eval: &'c DefaultCostEvaluator,
         state: &'s SolverState<'p, i64>,
         buffer: &'b mut [DecisionVar<i64>],
-    ) -> PlanningContext<'b, 's, 'm, 'p, i64> {
-        PlanningContext::new(model, state, buffer)
+    ) -> PlanningContext<'b, 'c, 's, 'm, 'p, i64, DefaultCostEvaluator> {
+        PlanningContext::new(model, state, cost_eval, buffer)
     }
 
     #[test]
@@ -1055,7 +1059,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_unassigned_state(&model);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(42);
 
         let op = MatheuristicRepair::new();
@@ -1074,7 +1078,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_unassigned_state(&model);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(7);
 
         let op = MatheuristicRepair::new();
