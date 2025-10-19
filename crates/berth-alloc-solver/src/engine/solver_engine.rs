@@ -58,7 +58,7 @@ impl Default for SolverEngineConfig {
             num_workers: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1),
-            time_limit: std::time::Duration::from_secs(60),
+            time_limit: std::time::Duration::from_secs(30),
         }
     }
 }

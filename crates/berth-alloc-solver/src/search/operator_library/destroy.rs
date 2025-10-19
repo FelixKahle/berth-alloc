@@ -23,7 +23,7 @@ use crate::{
     model::index::{BerthIndex, RequestIndex},
     search::{
         operator::{DestroyOperator, NeighborFn},
-        planner::{PlanBuilder, PlanExplorer, PlanningContext},
+        planner::{CostEvaluator, PlanBuilder, PlanExplorer, PlanningContext},
     },
     state::{
         decisionvar::{Decision, DecisionVar},
@@ -31,7 +31,7 @@ use crate::{
     },
 };
 use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval};
-use num_traits::{CheckedAdd, CheckedSub, Zero};
+use num_traits::{CheckedAdd, CheckedDiv, CheckedSub, FromPrimitive, Zero};
 use rand::{
     Rng,
     seq::{IteratorRandom, SliceRandom},
@@ -76,12 +76,13 @@ fn randomized_greedy_index<R: Rng>(length: usize, greediness_alpha: f64, rng: &m
 // ======================================================================
 
 #[inline]
-fn triples_from_explorer<'e, 'm, 'p, T>(
-    explorer: &PlanExplorer<'e, '_, 'm, 'p, T>,
+fn triples_from_explorer<'e, 'c, 'm, 'p, T, C>(
+    explorer: &PlanExplorer<'e, 'c, '_, 'm, 'p, T, C>,
     model: &crate::model::solver_model::SolverModel<'m, T>,
 ) -> Vec<(RequestIndex, BerthIndex, TimeInterval<T>)>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
+    C: CostEvaluator<T>,
 {
     let decision_vars = explorer.decision_vars();
     let mut out = Vec::new();
@@ -105,14 +106,15 @@ where
 }
 
 #[inline]
-fn neighborhood_triples_from_explorer<'e, 'm, 'p, T>(
-    explorer: &PlanExplorer<'e, '_, 'm, 'p, T>,
+fn neighborhood_triples_from_explorer<'e, 'c, 'm, 'p, T, C>(
+    explorer: &PlanExplorer<'e, 'c, '_, 'm, 'p, T, C>,
     model: &crate::model::solver_model::SolverModel<'m, T>,
     seed_request: RequestIndex,
     neighbor_cb: &NeighborFn,
 ) -> Vec<(RequestIndex, BerthIndex, TimeInterval<T>)>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
+    C: CostEvaluator<T>,
 {
     let decision_vars = explorer.decision_vars();
     let mut out = Vec::new();
@@ -167,18 +169,19 @@ impl RandomKRatioDestroy {
     }
 }
 
-impl<T, R> DestroyOperator<T, R> for RandomKRatioDestroy
+impl<T, C, R> DestroyOperator<T, C, R> for RandomKRatioDestroy
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + std::ops::Mul<Output = Cost>,
+    C: CostEvaluator<T>,
     R: Rng,
 {
     fn name(&self) -> &str {
         "RandomKRatioDestroy"
     }
 
-    fn propose<'b, 's, 'm, 'p>(
+    fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
-        ctx: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
         let sampled_ratio = sample_f64_inclusive(&self.ratio_range, rng);
@@ -187,7 +190,7 @@ where
         }
 
         let model = ctx.model();
-        let mut plan_builder: PlanBuilder<'_, 's, 'm, 'p, T> = ctx.builder();
+        let mut plan_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = ctx.builder();
 
         // Assigned indices from explorer snapshot
         let assigned_indices: Vec<RequestIndex> = plan_builder.with_explorer(|explorer| {
@@ -294,18 +297,19 @@ impl WorstCostDestroy {
     }
 }
 
-impl<T, R> DestroyOperator<T, R> for WorstCostDestroy
+impl<T, C, R> DestroyOperator<T, C, R> for WorstCostDestroy
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + std::ops::Mul<Output = Cost>,
+    C: CostEvaluator<T>,
     R: Rng,
 {
     fn name(&self) -> &str {
         "WorstCostDestroy"
     }
 
-    fn propose<'b, 's, 'm, 'p>(
+    fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
-        ctx: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
         let sampled_ratio = sample_f64_inclusive(&self.ratio_range, rng);
@@ -314,7 +318,7 @@ where
         }
 
         let model = ctx.model();
-        let mut plan_builder: PlanBuilder<'_, 's, 'm, 'p, T> = ctx.builder();
+        let mut plan_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = ctx.builder();
 
         // Global assigned indices (for target K and seed selection).
         let assigned_indices: Vec<RequestIndex> = plan_builder.with_explorer(|explorer| {
@@ -456,18 +460,19 @@ impl ShawRelatedDestroy {
     }
 }
 
-impl<T, R> DestroyOperator<T, R> for ShawRelatedDestroy
+impl<T, C, R> DestroyOperator<T, C, R> for ShawRelatedDestroy
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + std::ops::Mul<Output = Cost>,
+    C: CostEvaluator<T>,
     R: Rng,
 {
     fn name(&self) -> &str {
         "ShawRelatedDestroy"
     }
 
-    fn propose<'b, 's, 'm, 'p>(
+    fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
-        ctx: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
         let sampled_ratio = sample_f64_inclusive(&self.ratio_range, rng);
@@ -477,7 +482,7 @@ where
         }
 
         let model = ctx.model();
-        let mut plan_builder: PlanBuilder<'_, 's, 'm, 'p, T> = ctx.builder();
+        let mut plan_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = ctx.builder();
 
         let full_pool = plan_builder.with_explorer(|explorer| {
             let mut v = triples_from_explorer(explorer, model);
@@ -624,18 +629,19 @@ impl BerthNeighborsDestroy {
     }
 }
 
-impl<T, R> DestroyOperator<T, R> for BerthNeighborsDestroy
+impl<T, C, R> DestroyOperator<T, C, R> for BerthNeighborsDestroy
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + std::ops::Mul<Output = Cost>,
+    C: CostEvaluator<T>,
     R: Rng,
 {
     fn name(&self) -> &str {
         "BerthNeighborsDestroy"
     }
 
-    fn propose<'b, 's, 'm, 'p>(
+    fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
-        ctx: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
         let sampled_ratio = sample_f64_inclusive(&self.ratio_range, rng);
@@ -645,7 +651,7 @@ where
         }
 
         let model = ctx.model();
-        let mut plan_builder: PlanBuilder<'_, 's, 'm, 'p, T> = ctx.builder();
+        let mut plan_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = ctx.builder();
 
         let full_pool = plan_builder.with_explorer(|explorer| {
             let mut v = triples_from_explorer(explorer, model);
@@ -769,7 +775,7 @@ impl<T> TimeWindowBandDestroy<T> {
     }
 }
 
-impl<T, R> DestroyOperator<T, R> for TimeWindowBandDestroy<T>
+impl<T, C, R> DestroyOperator<T, C, R> for TimeWindowBandDestroy<T>
 where
     T: Copy
         + Ord
@@ -779,15 +785,16 @@ where
         + std::ops::Mul<Output = Cost>
         + Send
         + Sync,
+    C: CostEvaluator<T>,
     R: Rng,
 {
     fn name(&self) -> &str {
         "TimeWindowBandDestroy"
     }
 
-    fn propose<'b, 's, 'm, 'p>(
+    fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
-        ctx: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
         let sampled_ratio = sample_f64_inclusive(&self.ratio_range, rng);
@@ -797,7 +804,7 @@ where
         }
 
         let model = ctx.model();
-        let mut plan_builder: PlanBuilder<'_, 's, 'm, 'p, T> = ctx.builder();
+        let mut plan_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = ctx.builder();
 
         let full = plan_builder.with_explorer(|explorer| {
             let mut v = triples_from_explorer(explorer, model);
@@ -899,18 +906,19 @@ impl BerthBandDestroy {
     }
 }
 
-impl<T, R> DestroyOperator<T, R> for BerthBandDestroy
+impl<T, C, R> DestroyOperator<T, C, R> for BerthBandDestroy
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + std::ops::Mul<Output = Cost>,
+    C: CostEvaluator<T>,
     R: Rng,
 {
     fn name(&self) -> &str {
         "BerthBandDestroy"
     }
 
-    fn propose<'b, 's, 'm, 'p>(
+    fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
-        ctx: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
         let sampled_ratio = sample_f64_inclusive(&self.ratio_range, rng);
@@ -920,7 +928,7 @@ where
         }
 
         let model = ctx.model();
-        let mut plan_builder: PlanBuilder<'_, 's, 'm, 'p, T> = ctx.builder();
+        let mut plan_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = ctx.builder();
 
         let full = plan_builder.with_explorer(|explorer| {
             let mut v = triples_from_explorer(explorer, model);
@@ -1027,18 +1035,19 @@ impl ProcessingTimeClusterDestroy {
     }
 }
 
-impl<T, R> DestroyOperator<T, R> for ProcessingTimeClusterDestroy
+impl<T, C, R> DestroyOperator<T, C, R> for ProcessingTimeClusterDestroy
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + std::ops::Mul<Output = Cost>,
+    C: CostEvaluator<T>,
     R: Rng,
 {
     fn name(&self) -> &str {
         "ProcessingTimeClusterDestroy"
     }
 
-    fn propose<'b, 's, 'm, 'p>(
+    fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
-        ctx: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         _rng: &mut R,
     ) -> Option<Plan<'p, T>> {
         let sampled_ratio = *self.ratio_range.start(); // deterministic if caller wants; or sample externally
@@ -1047,15 +1056,11 @@ where
         }
 
         let model = ctx.model();
-        let mut plan_builder: PlanBuilder<'_, 's, 'm, 'p, T> = ctx.builder();
+        let mut plan_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = ctx.builder();
 
-        let full = plan_builder.with_explorer(|explorer| {
-            let mut v = triples_from_explorer(explorer, model);
-            v.sort_by(|a, b| {
-                let la = (a.2.end() - a.2.start()).value();
-                let lb = (b.2.end() - b.2.start()).value();
-                la.cmp(&lb)
-            });
+        let full = plan_builder.with_explorer(|ex| {
+            let mut v = triples_from_explorer(ex, model);
+            v.sort_by_key(|(_, _, iv)| (iv.end() - iv.start()).value());
             v
         });
         if full.is_empty() {
@@ -1064,7 +1069,8 @@ where
 
         let target_count = ((full.len() as f64) * sampled_ratio).ceil() as usize;
 
-        let (seed_ri, seed_bi, seed_iv) = full[0]; // longest rectangle bias already applied above
+        // prefer longest:
+        let (seed_ri, seed_bi, seed_iv) = *full.last().unwrap();
         let seed_pt_val = (seed_iv.end() - seed_iv.start()).value();
 
         // Candidate pool: neighbors(seed) if any; else full
@@ -1149,7 +1155,7 @@ impl<T> TimeClusterDestroy<T> {
     }
 }
 
-impl<T, R> DestroyOperator<T, R> for TimeClusterDestroy<T>
+impl<T, C, R> DestroyOperator<T, C, R> for TimeClusterDestroy<T>
 where
     T: Copy
         + Ord
@@ -1158,16 +1164,19 @@ where
         + Into<Cost>
         + std::ops::Mul<Output = Cost>
         + Send
-        + Sync,
+        + Sync
+        + FromPrimitive
+        + CheckedDiv,
+    C: CostEvaluator<T>,
     R: Rng,
 {
     fn name(&self) -> &str {
         "TimeClusterDestroy"
     }
 
-    fn propose<'b, 's, 'm, 'p>(
+    fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
-        ctx: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<crate::state::plan::Plan<'p, T>> {
         let sampled_ratio = sample_f64_inclusive(&self.ratio_range, rng);
@@ -1177,7 +1186,7 @@ where
         }
 
         let model = ctx.model();
-        let mut plan_builder: PlanBuilder<'_, 's, 'm, 'p, T> = ctx.builder();
+        let mut plan_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = ctx.builder();
 
         // Collect assigned triples (ri, bi, [start,end))
         let assigned: Vec<(RequestIndex, BerthIndex, TimeInterval<T>)> = plan_builder
@@ -1214,7 +1223,9 @@ where
         // Prefer longer rectangles as seed (they’re good pivots); RCL pick.
         let mut sorted = assigned.clone();
         sorted.sort_by_key(|(_, _, iv)| (iv.end() - iv.start()).value());
-        let seed_index = randomized_greedy_index(sorted.len(), sampled_alpha, rng);
+        // RCL from the tail:
+        let seed_index_from_end = randomized_greedy_index(sorted.len(), sampled_alpha, rng);
+        let seed_index = sorted.len() - 1 - seed_index_from_end;
         let (seed_request, _, seed_interval) = sorted[seed_index];
 
         // Choose pool = neighbors(seed) if provided/non-empty; else full.
@@ -1260,8 +1271,8 @@ where
 
         // Band around the seed's midpoint (or just seed start); we use seed interval center.
         let mid = {
-            let half = seed_interval.end() - seed_interval.start();
-            seed_interval.start() + half
+            let dur = seed_interval.end() - seed_interval.start();
+            seed_interval.start() + dur / T::from_i32(2).unwrap()
         };
         let band_lo = mid - self.half_window;
         let band_hi = mid + self.half_window;
@@ -1324,18 +1335,19 @@ impl StringBlockDestroy {
     }
 }
 
-impl<T, R> DestroyOperator<T, R> for StringBlockDestroy
+impl<T, C, R> DestroyOperator<T, C, R> for StringBlockDestroy
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + std::ops::Mul<Output = Cost>,
+    C: CostEvaluator<T>,
     R: Rng,
 {
     fn name(&self) -> &str {
         "StringBlockDestroy"
     }
 
-    fn propose<'b, 's, 'm, 'p>(
+    fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
-        ctx: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<crate::state::plan::Plan<'p, T>> {
         let sampled_ratio = sample_f64_inclusive(&self.ratio_range, rng);
@@ -1345,7 +1357,7 @@ where
         }
 
         let model = ctx.model();
-        let mut plan_builder: PlanBuilder<'_, 's, 'm, 'p, T> = ctx.builder();
+        let mut plan_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = ctx.builder();
 
         // Collect (ri, bi, start, end) for currently assigned.
         let assigned: Vec<(RequestIndex, BerthIndex, TimeInterval<T>)> = plan_builder
@@ -1473,7 +1485,7 @@ mod tests {
     use super::*;
     use crate::{
         model::solver_model::SolverModel,
-        search::planner::PlanningContext,
+        search::planner::{DefaultCostEvaluator, PlanningContext},
         state::{
             decisionvar::{DecisionVar, DecisionVarVec},
             solver_state::SolverState,
@@ -1548,12 +1560,13 @@ mod tests {
         SolverState::new(dv, term, fit)
     }
 
-    fn make_ctx<'b, 's, 'm, 'p>(
+    fn make_ctx<'b, 'c, 's, 'm, 'p>(
         model: &'m SolverModel<'p, i64>,
+        cost_evaluator: &'c DefaultCostEvaluator,
         state: &'s SolverState<'p, i64>,
         buffer: &'b mut [DecisionVar<i64>],
-    ) -> PlanningContext<'b, 's, 'm, 'p, i64> {
-        PlanningContext::new(model, state, buffer)
+    ) -> PlanningContext<'b, 'c, 's, 'm, 'p, i64, DefaultCostEvaluator> {
+        PlanningContext::new(model, state, cost_evaluator, buffer)
     }
 
     // ------------- helper tests
@@ -1564,7 +1577,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_assigned_state(&model, 0);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
 
         // Plan with no edits → zero-delta (via builder)
         let pb = ctx.builder();
@@ -1607,7 +1620,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_assigned_state(&model, 0);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(42);
 
         let op = RandomKRatioDestroy::new(1.0..=1.0);
@@ -1620,7 +1633,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_assigned_state(&model, 3);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(7);
 
         let op = RandomKRatioDestroy::new(0.0..=0.0);
@@ -1634,7 +1647,7 @@ mod tests {
         let k_assigned = 3;
         let state = make_assigned_state(&model, k_assigned);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(123);
 
         let op = RandomKRatioDestroy::new(1.0..=1.0);
@@ -1653,7 +1666,7 @@ mod tests {
         // assign 6
         let state = make_assigned_state(&model, 6);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(55);
 
         // Neighbor callback that returns only itself (very tiny local pool) → operator will top up.
@@ -1671,7 +1684,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_assigned_state(&model, 5);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(1);
 
         let op = WorstCostDestroy::new(0.4..=0.4);
@@ -1687,7 +1700,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_assigned_state(&model, 7);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(9);
 
         let op = ShawRelatedDestroy::new(
@@ -1708,7 +1721,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_assigned_state(&model, 6);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(77);
 
         let op = BerthNeighborsDestroy::new(0.5..=0.5, 2.0..=2.0); // ceil(6*0.5)=3
@@ -1722,7 +1735,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_assigned_state(&model, 6);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(101);
 
         // Return two neighbors (seed±1 if valid).
@@ -1748,7 +1761,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_assigned_state(&model, 6);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
 
         let mut rng = StdRng::seed_from_u64(1);
         let op = TimeWindowBandDestroy::new(0.5..=0.5, 1.7..=1.7, TimeDelta::new(5));
@@ -1764,7 +1777,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_assigned_state(&model, 7);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
 
         let mut rng = StdRng::seed_from_u64(2);
         let op = BerthBandDestroy::new(0.4..=0.4, 1.3..=1.3, 0); // same-berth only
@@ -1779,7 +1792,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_assigned_state(&model, 9);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
 
         // deterministic via degenerate range
         let mut rng = StdRng::seed_from_u64(3);
@@ -1796,7 +1809,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_assigned_state(&model, 6);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
 
         // NeighborFn: each request neighbors the next 2 indices (wrapping disabled)
         let cb: Arc<NeighborFn> = Arc::new(|ri: RequestIndex| {
@@ -1827,7 +1840,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_assigned_state(&model, 8);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(11);
 
         let op = TimeClusterDestroy::new(0.25..=0.25, TimeDelta::new(5)).with_alpha(1.7..=1.7);
@@ -1842,7 +1855,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_assigned_state(&model, 10);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(22);
 
         let op = StringBlockDestroy::new(0.3..=0.3).with_alpha(2.0..=2.0);

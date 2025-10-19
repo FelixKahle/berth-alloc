@@ -47,22 +47,27 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
-pub struct PlanExplorer<'pb, 't, 'm, 'p, T: Copy + Ord> {
+pub struct PlanExplorer<'pb, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> {
     solver_model: &'m SolverModel<'p, T>,
     decision_vars: &'pb [DecisionVar<T>],
+    cost_evaluator: &'c C,
     sandbox: &'pb TerminalSandbox<'t, 'p, T>,
 }
 
-impl<'pb, 't, 'm, 'p, T: Copy + Ord> PlanExplorer<'pb, 't, 'm, 'p, T> {
+impl<'pb, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>>
+    PlanExplorer<'pb, 'c, 't, 'm, 'p, T, C>
+{
     #[inline]
     pub fn new(
         solver_model: &'m SolverModel<'p, T>,
         decision_vars: &'pb [DecisionVar<T>],
+        cost_evaluator: &'c C,
         sandbox: &'pb TerminalSandbox<'t, 'p, T>,
     ) -> Self {
         Self {
             solver_model,
             decision_vars,
+            cost_evaluator,
             sandbox,
         }
     }
@@ -148,32 +153,35 @@ impl<'pb, 't, 'm, 'p, T: Copy + Ord> PlanExplorer<'pb, 't, 'm, 'p, T> {
     where
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
-        self.solver_model
-            .cost_of_assignment(request, berth_index, start_time)
+        self.cost_evaluator
+            .eval(self.model(), request, start_time, berth_index)
     }
 }
 
 #[derive(Debug)]
-pub struct PlanBuilder<'b, 't, 'm, 'p, T: Copy + Ord> {
+pub struct PlanBuilder<'b, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> {
     solver_model: &'m SolverModel<'p, T>,
     decision_vars: &'b mut [DecisionVar<T>],
     sandbox: TerminalSandbox<'t, 'p, T>,
     patches: Vec<DecisionVarPatch<T>>,
+    cost_evaluator: &'c C,
     delta_cost: Cost,
     delta_unassigned: i32,
 }
 
-impl<'b, 't, 'm, 'p, T: Copy + Ord> PlanBuilder<'b, 't, 'm, 'p, T> {
+impl<'b, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> PlanBuilder<'b, 'c, 't, 'm, 'p, T, C> {
     #[inline]
     pub fn new(
         solver_model: &'m SolverModel<'p, T>,
         base_terminal: &'t TerminalOccupancy<'p, T>,
+        cost_evaluator: &'c C,
         decision_vars: &'b mut [DecisionVar<T>],
     ) -> Self {
         Self {
             solver_model,
             decision_vars,
             sandbox: TerminalSandbox::new(base_terminal),
+            cost_evaluator,
             delta_cost: Cost::zero(),
             delta_unassigned: 0,
             patches: Vec::with_capacity(32),
@@ -310,11 +318,15 @@ impl<'b, 't, 'm, 'p, T: Copy + Ord> PlanBuilder<'b, 't, 'm, 'p, T> {
     #[inline]
     pub fn with_explorer<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(&PlanExplorer<'_, 't, 'm, 'p, T>) -> R,
+        F: FnOnce(&PlanExplorer<'_, 'c, 't, 'm, 'p, T, C>) -> R,
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
-        let explorer: PlanExplorer<'_, 't, 'm, 'p, T> =
-            PlanExplorer::new(self.solver_model, self.decision_vars, &self.sandbox);
+        let explorer: PlanExplorer<'_, 'c, 't, 'm, 'p, T, C> = PlanExplorer::new(
+            self.solver_model,
+            self.decision_vars,
+            self.cost_evaluator,
+            &self.sandbox,
+        );
         f(&explorer)
     }
 
@@ -349,23 +361,55 @@ impl<'b, 't, 'm, 'p, T: Copy + Ord> PlanBuilder<'b, 't, 'm, 'p, T> {
     }
 }
 
+pub trait CostEvaluator<T: Copy + Ord> {
+    fn eval<'m>(
+        &self,
+        model: &SolverModel<'m, T>,
+        request: RequestIndex,
+        start_time: TimePoint<T>,
+        berth_index: BerthIndex,
+    ) -> Option<Cost>;
+}
+
+pub struct DefaultCostEvaluator;
+impl<T> CostEvaluator<T> for DefaultCostEvaluator
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
+{
+    #[inline]
+    fn eval<'m>(
+        &self,
+        model: &SolverModel<'m, T>,
+        request: RequestIndex,
+        start_time: TimePoint<T>,
+        berth_index: BerthIndex,
+    ) -> Option<Cost> {
+        model.cost_of_assignment(request, berth_index, start_time)
+    }
+}
+
 #[derive(Debug)]
-pub struct PlanningContext<'b, 's, 'm, 'p, T: Copy + Ord> {
+pub struct PlanningContext<'b, 'c, 's, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> {
     model: &'m SolverModel<'p, T>,
     state: &'s SolverState<'p, T>,
+    cost_evaluator: &'c C,
     buffer: &'b mut [DecisionVar<T>],
 }
 
-impl<'b, 's, 'm, 'p, T: Copy + Ord> PlanningContext<'b, 's, 'm, 'p, T> {
+impl<'b, 'c, 's, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>>
+    PlanningContext<'b, 'c, 's, 'm, 'p, T, C>
+{
     #[inline]
     pub fn new(
         model: &'m SolverModel<'p, T>,
         state: &'s SolverState<'p, T>,
+        cost_evaluator: &'c C,
         buffer: &'b mut [DecisionVar<T>],
     ) -> Self {
         Self {
             model,
             state,
+            cost_evaluator,
             buffer,
         }
     }
@@ -378,11 +422,15 @@ impl<'b, 's, 'm, 'p, T: Copy + Ord> PlanningContext<'b, 's, 'm, 'p, T> {
         self.model
     }
 
+    pub fn cost_evaluator(&self) -> &'c C {
+        self.cost_evaluator
+    }
+
     // Build a plan using a closure to configure the builder.
     #[inline]
     pub fn with_builder<F>(&mut self, f: F) -> Plan<'p, T>
     where
-        F: FnOnce(&mut PlanBuilder<'_, 's, 'm, 'p, T>),
+        F: FnOnce(&mut PlanBuilder<'_, 'c, 's, 'm, 'p, T, C>),
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
         // Seed the work buffer with the current decision variables.
@@ -390,24 +438,34 @@ impl<'b, 's, 'm, 'p, T: Copy + Ord> PlanningContext<'b, 's, 'm, 'p, T> {
 
         // For now we do not use specialized overlays. Just the cloned ledger and terminal,
         // so proposals can be made on them independently from the master state.
-        let mut pb = PlanBuilder::new(self.model, self.state.terminal_occupancy(), self.buffer);
+        let mut pb = PlanBuilder::new(
+            self.model,
+            self.state.terminal_occupancy(),
+            self.cost_evaluator,
+            self.buffer,
+        );
         f(&mut pb);
         pb.finalize()
     }
 
     #[inline]
-    pub fn builder(&mut self) -> PlanBuilder<'_, 's, 'm, 'p, T>
+    pub fn builder(&mut self) -> PlanBuilder<'_, 'c, 's, 'm, 'p, T, C>
     where
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
         // Seed the work buffer with the current decision variables.
         self.buffer.copy_from_slice(self.state.decision_variables());
-        PlanBuilder::new(self.model, self.state.terminal_occupancy(), self.buffer)
+        PlanBuilder::new(
+            self.model,
+            self.state.terminal_occupancy(),
+            self.cost_evaluator,
+            self.buffer,
+        )
     }
 }
 
-impl<'b, 's, 'm, 'p, T: Copy + Ord + std::fmt::Display> std::fmt::Display
-    for PlanningContext<'b, 's, 'm, 'p, T>
+impl<'b, 'c, 's, 'm, 'p, T: Copy + Ord + std::fmt::Display, C: CostEvaluator<T>> std::fmt::Display
+    for PlanningContext<'b, 'c, 's, 'm, 'p, T, C>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "PlanningContext(state: {})", self.state)
@@ -491,7 +549,12 @@ mod tests {
 
         // NEW: working buffer
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut pb = PlanBuilder::new(&model, &term, work_buf.as_mut_slice());
+        let mut pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
 
         let r_ix = model.index_manager().request_index(rid(1)).unwrap();
         let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
@@ -529,7 +592,12 @@ mod tests {
 
         // NEW: working buffer
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut pb = PlanBuilder::new(&model, &term, work_buf.as_mut_slice());
+        let mut pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
 
         let r_ix = model.index_manager().request_index(rid(1)).unwrap();
         let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
@@ -563,7 +631,12 @@ mod tests {
 
         // NEW: working buffer
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut pb = PlanBuilder::new(&model, &term, work_buf.as_mut_slice());
+        let mut pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
 
         pb.with_explorer(|ex| {
             assert_eq!(ex.iter_unassigned().count(), model.flexible_requests_len());
@@ -612,7 +685,7 @@ mod tests {
         let state = SolverState::new(dv, term, fit);
 
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = PlanningContext::new(&model, &state, &mut work_buf);
+        let mut ctx = PlanningContext::new(&model, &state, &DefaultCostEvaluator, &mut work_buf);
 
         // NEW: provide a working buffer to the context
         let plan = ctx.with_builder(|pb| {
@@ -651,7 +724,12 @@ mod tests {
 
         // NEW: working buffer
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut pb = PlanBuilder::new(&model, &term, work_buf.as_mut_slice());
+        let mut pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
 
         let r_ix = model.index_manager().request_index(rid(1)).unwrap();
         let b_ix = model.index_manager().berth_index(bid(1)).unwrap();

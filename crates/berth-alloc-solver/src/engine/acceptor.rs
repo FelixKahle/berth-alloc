@@ -33,19 +33,6 @@ impl std::fmt::Display for dyn Acceptor {
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct StrictlyBetterAcceptor;
-
-impl Acceptor for StrictlyBetterAcceptor {
-    fn name(&self) -> &str {
-        "StrictlyBetterAcceptor"
-    }
-
-    fn accept(&self, current: &Fitness, new: &Fitness) -> bool {
-        new < current
-    }
-}
-
-#[derive(Debug, Default, Clone)]
 pub struct LexStrictAcceptor;
 impl Acceptor for LexStrictAcceptor {
     fn name(&self) -> &str {

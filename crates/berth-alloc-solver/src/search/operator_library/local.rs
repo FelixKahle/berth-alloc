@@ -23,7 +23,7 @@ use crate::{
     model::index::{BerthIndex, RequestIndex},
     search::{
         operator::LocalMoveOperator,
-        planner::{PlanBuilder, PlanExplorer, PlanningContext},
+        planner::{CostEvaluator, PlanBuilder, PlanExplorer, PlanningContext},
     },
     state::{
         decisionvar::{Decision, DecisionVar},
@@ -48,13 +48,14 @@ where
 /// Returns `(FreeBerth, start, cost)` for the earliest feasible start in each free interval.
 /// NOTE: returns the `FreeBerth<T>` by value to avoid lifetime issues.
 #[inline]
-fn best_insertion_for_request_ex<'e, 'm, 'p, T>(
-    explorer: &PlanExplorer<'e, '_, 'm, 'p, T>,
+fn best_insertion_for_request_ex<'e, 'c, 'm, 'p, T, C>(
+    explorer: &PlanExplorer<'e, 'c, '_, 'm, 'p, T, C>,
     model: &crate::model::solver_model::SolverModel<'m, T>,
     request_index: RequestIndex,
 ) -> Option<(FreeBerth<T>, TimePoint<T>, Cost)>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>,
+    C: CostEvaluator<T>,
 {
     let mut best_triplet: Option<(Cost, FreeBerth<T>, TimePoint<T>)> = None;
 
@@ -110,10 +111,6 @@ fn rcl_index<R: rand::Rng>(len: usize, alpha: f64, rng: &mut R) -> usize {
         .min(len - 1)
 }
 
-// ======================================================================
-// ShiftEarlierOnSameBerth  (range-based sampling)
-// ======================================================================
-
 #[derive(Clone, Debug)]
 pub struct ShiftEarlierOnSameBerth {
     /// How many assigned requests to randomly sample and try to shift earlier.
@@ -129,24 +126,25 @@ impl ShiftEarlierOnSameBerth {
     }
 }
 
-impl<T, R> LocalMoveOperator<T, R> for ShiftEarlierOnSameBerth
+impl<T, C, R> LocalMoveOperator<T, C, R> for ShiftEarlierOnSameBerth
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>,
+    C: CostEvaluator<T>,
     R: rand::Rng,
 {
     fn name(&self) -> &str {
         "ShiftEarlierOnSameBerth"
     }
 
-    fn propose<'b, 's, 'm, 'p>(
+    fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
-        context: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
         let model = context.model();
 
         // Use a one-off builder to snapshot assigned jobs and sample a subset.
-        let seed_builder: PlanBuilder<'_, 's, 'm, 'p, T> = context.builder();
+        let seed_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
         let assigned_jobs: Vec<(RequestIndex, BerthIndex, TimePoint<T>)> = seed_builder
             .with_explorer(|ex| {
                 ex.decision_vars()
@@ -181,7 +179,7 @@ where
 
         // Try candidates one by one, each attempt with a FRESH builder.
         for (request_index, berth_index, current_start_time) in sampled_jobs {
-            let mut attempt_builder: PlanBuilder<'_, 's, 'm, 'p, T> = context.builder();
+            let mut attempt_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
 
             // Find earliest feasible start on the same berth.
             let earliest_opt = attempt_builder.with_explorer(|ex| {
@@ -245,24 +243,25 @@ impl RelocateSingleBest {
     }
 }
 
-impl<T, R> LocalMoveOperator<T, R> for RelocateSingleBest
+impl<T, C, R> LocalMoveOperator<T, C, R> for RelocateSingleBest
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>,
+    C: CostEvaluator<T>,
     R: rand::Rng,
 {
     fn name(&self) -> &str {
         "RelocateSingleBest"
     }
 
-    fn propose<'b, 's, 'm, 'p>(
+    fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
-        context: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
         let model = context.model();
 
         // Snapshot assigned jobs with their current cost (one-off builder).
-        let seed_builder: PlanBuilder<'_, 's, 'm, 'p, T> = context.builder();
+        let seed_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
         let assigned_with_cost: Vec<(RequestIndex, BerthIndex, TimePoint<T>, Cost)> = seed_builder
             .with_explorer(|ex| {
                 ex.decision_vars()
@@ -298,7 +297,7 @@ where
         sampled.truncate(sample_size);
 
         for (request_index, current_berth, current_start_time, current_cost) in sampled {
-            let mut attempt_builder: PlanBuilder<'_, 's, 'm, 'p, T> = context.builder();
+            let mut attempt_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
 
             let best_option = attempt_builder
                 .with_explorer(|ex| best_insertion_for_request_ex(ex, model, request_index));
@@ -351,24 +350,25 @@ impl SwapPairSameBerth {
     }
 }
 
-impl<T, R> LocalMoveOperator<T, R> for SwapPairSameBerth
+impl<T, C, R> LocalMoveOperator<T, C, R> for SwapPairSameBerth
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>,
+    C: CostEvaluator<T>,
     R: rand::Rng,
 {
     fn name(&self) -> &str {
         "SwapPairSameBerth"
     }
 
-    fn propose<'b, 's, 'm, 'p>(
+    fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
-        context: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
         let model = context.model();
 
         // Use a seed builder to group assigned by berth (ordered by start).
-        let seed_builder: PlanBuilder<'_, 's, 'm, 'p, T> = context.builder();
+        let seed_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
         let by_berth = seed_builder.with_explorer(|ex| {
             use std::collections::BTreeMap;
             let mut map: BTreeMap<BerthIndex, Vec<(RequestIndex, TimePoint<T>)>> = BTreeMap::new();
@@ -433,7 +433,7 @@ where
             );
 
             // Do the swap on a FRESH builder so failures don't pollute later attempts.
-            let mut attempt_builder: PlanBuilder<'_, 's, 'm, 'p, T> = context.builder();
+            let mut attempt_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
             let _ = attempt_builder.propose_unassignment(ri_a).ok()?;
             let _ = attempt_builder.propose_unassignment(ri_b).ok()?;
 
@@ -479,24 +479,25 @@ impl CrossExchangeAcrossBerths {
     }
 }
 
-impl<T, R> LocalMoveOperator<T, R> for CrossExchangeAcrossBerths
+impl<T, C, R> LocalMoveOperator<T, C, R> for CrossExchangeAcrossBerths
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + std::ops::Mul<Output = Cost>,
+    C: CostEvaluator<T>,
     R: rand::Rng,
 {
     fn name(&self) -> &str {
         "CrossExchangeAcrossBerths"
     }
 
-    fn propose<'b, 's, 'm, 'p>(
+    fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
-        context: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<crate::state::plan::Plan<'p, T>> {
         let model = context.model();
 
         // Snapshot all assigned as (ri, berth, start).
-        let seed_builder: PlanBuilder<'_, 's, 'm, 'p, T> = context.builder();
+        let seed_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
         let assigned: Vec<(RequestIndex, BerthIndex, TimePoint<T>)> =
             seed_builder.with_explorer(|ex| {
                 ex.decision_vars()
@@ -571,7 +572,7 @@ where
             }
 
             // Do the cross-swap on a FRESH builder to keep attempts independent.
-            let mut attempt_builder: PlanBuilder<'_, 's, 'm, 'p, T> = context.builder();
+            let mut attempt_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
 
             let _ = attempt_builder.propose_unassignment(ra).ok()?;
             let _ = attempt_builder.propose_unassignment(rb).ok()?;
@@ -634,22 +635,23 @@ impl OrOptBlockRelocate {
     }
 }
 
-impl<T, R> LocalMoveOperator<T, R> for OrOptBlockRelocate
+impl<T, C, R> LocalMoveOperator<T, C, R> for OrOptBlockRelocate
 where
     T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + std::ops::Mul<Output = Cost>,
+    C: CostEvaluator<T>,
     R: rand::Rng,
 {
     fn name(&self) -> &str {
         "OrOptBlockRelocate"
     }
 
-    fn propose<'b, 's, 'm, 'p>(
+    fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
-        context: &mut PlanningContext<'b, 's, 'm, 'p, T>,
+        context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<crate::state::plan::Plan<'p, T>> {
         let model = context.model();
-        let seed_builder: PlanBuilder<'_, 's, 'm, 'p, T> = context.builder();
+        let seed_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
 
         // Pick any berth with at least 2 assigned; collect ordered by start.
         let maybe_group = seed_builder.with_explorer(|ex| {
@@ -709,7 +711,7 @@ where
         let block_indices: Vec<RequestIndex> = block_slice.iter().map(|&(ri, _)| ri).collect();
 
         // Rebuild on a fresh builder: unassign block → greedy reinsert anywhere.
-        let mut attempt_builder: PlanBuilder<'_, 's, 'm, 'p, T> = context.builder();
+        let mut attempt_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
 
         for &ri in &block_indices {
             let _ = attempt_builder.propose_unassignment(ri).ok()?;
@@ -736,7 +738,7 @@ mod tests {
     use super::*;
     use crate::{
         model::solver_model::SolverModel,
-        search::planner::PlanningContext,
+        search::planner::{DefaultCostEvaluator, PlanningContext},
         state::{
             decisionvar::{DecisionVar, DecisionVarVec},
             fitness::Fitness,
@@ -814,12 +816,13 @@ mod tests {
         SolverState::new(dv, term, fit)
     }
 
-    fn make_ctx<'b, 's, 'm, 'p>(
+    fn make_ctx<'b, 'c, 's, 'm, 'p>(
         model: &'m SolverModel<'p, i64>,
+        cost_evaluator: &'c DefaultCostEvaluator,
         state: &'s SolverState<'p, i64>,
         buffer: &'b mut [DecisionVar<i64>],
-    ) -> PlanningContext<'b, 's, 'm, 'p, i64> {
-        PlanningContext::new(model, state, buffer)
+    ) -> PlanningContext<'b, 'c, 's, 'm, 'p, i64, DefaultCostEvaluator> {
+        PlanningContext::new(model, state, cost_evaluator, buffer)
     }
 
     // ------------ tests ------------
@@ -831,7 +834,7 @@ mod tests {
         // Starts later than earliest; operator should move to earliest (=0)
         let state = make_state_with_assignments(&model, &[50]);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
 
         let mut rng = ChaCha8Rng::from_seed([7; 32]);
         let op = ShiftEarlierOnSameBerth::new(1..=3);
@@ -863,7 +866,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_state_with_assignments(&model, &[60, 80]);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
 
         let mut rng = ChaCha8Rng::from_seed([9; 32]);
         let op = RelocateSingleBest::new(1..=2);
@@ -880,7 +883,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_state_with_assignments(&model, &[0, 40]);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
 
         let mut rng = ChaCha8Rng::from_seed([3; 32]);
         let op = SwapPairSameBerth::new(1..=4);
@@ -929,7 +932,7 @@ mod tests {
         let state = SolverState::new(dv, term, fit);
 
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
 
         let mut rng = ChaCha8Rng::from_seed([11; 32]);
         let op = CrossExchangeAcrossBerths::new(1..=3);
@@ -946,7 +949,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_state_with_assignments(&model, &[0, 20, 40, 60, 80, 100]);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
 
         let mut rng = ChaCha8Rng::from_seed([13; 32]);
         // Fix k=3 and alpha=1.7 for determinism in this test.
@@ -964,7 +967,7 @@ mod tests {
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_state_with_assignments(&model, &[]); // nobody assigned
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &state, &mut buffer);
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
 
         let mut rng = ChaCha8Rng::from_seed([1; 32]);
 

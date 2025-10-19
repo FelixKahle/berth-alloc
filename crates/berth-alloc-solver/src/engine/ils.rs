@@ -41,10 +41,9 @@ use crate::{
                 CrossExchangeAcrossBerths, OrOptBlockRelocate, RelocateSingleBest,
                 ShiftEarlierOnSameBerth, SwapPairSameBerth,
             },
-            math::{MatheuristicRepair, MipBlockReoptimize},
             repair::{GreedyInsertion, KRegretInsertion, RandomizedGreedyInsertion},
         },
-        planner::PlanningContext,
+        planner::{DefaultCostEvaluator, PlanningContext},
     },
     state::solver_state::{SolverState, SolverStateView},
 };
@@ -64,9 +63,9 @@ where
     T: SolveNumeric,
     R: rand::Rng,
 {
-    destroy_ops: Vec<Box<dyn DestroyOperator<T, R>>>,
-    repair_ops: Vec<Box<dyn RepairOperator<T, R>>>,
-    local_ops: Vec<Box<dyn LocalMoveOperator<T, R>>>,
+    destroy_ops: Vec<Box<dyn DestroyOperator<T, DefaultCostEvaluator, R>>>,
+    repair_ops: Vec<Box<dyn RepairOperator<T, DefaultCostEvaluator, R>>>,
+    local_ops: Vec<Box<dyn LocalMoveOperator<T, DefaultCostEvaluator, R>>>,
 
     local_acceptor: LexStrictAcceptor, // Phase A
     repair_acceptor: RepairAcceptor,   // Phase C
@@ -115,17 +114,26 @@ where
         }
     }
 
-    pub fn with_destroy_op(mut self, op: Box<dyn DestroyOperator<T, R>>) -> Self {
+    pub fn with_destroy_op(
+        mut self,
+        op: Box<dyn DestroyOperator<T, DefaultCostEvaluator, R>>,
+    ) -> Self {
         self.destroy_ops.push(op);
         self
     }
 
-    pub fn with_repair_op(mut self, op: Box<dyn RepairOperator<T, R>>) -> Self {
+    pub fn with_repair_op(
+        mut self,
+        op: Box<dyn RepairOperator<T, DefaultCostEvaluator, R>>,
+    ) -> Self {
         self.repair_ops.push(op);
         self
     }
 
-    pub fn with_local_op(mut self, op: Box<dyn LocalMoveOperator<T, R>>) -> Self {
+    pub fn with_local_op(
+        mut self,
+        op: Box<dyn LocalMoveOperator<T, DefaultCostEvaluator, R>>,
+    ) -> Self {
         self.local_ops.push(op);
         self
     }
@@ -223,7 +231,7 @@ where
         "Iterated Local Search"
     }
 
-    #[tracing::instrument(name = "ILS Search", skip(self, context))]
+    #[tracing::instrument(level = "debug", name = "ILS Search", skip(self, context))]
     fn run<'e, 'm, 'p>(&mut self, context: &mut SearchContext<'e, 'm, 'p, T, R>) {
         let model = context.model();
         let stop = context.stop();
@@ -282,7 +290,12 @@ where
                 for &i in &order {
                     let op = &self.local_ops[i];
 
-                    let mut pc = PlanningContext::new(model, &current, dv_buf.as_mut_slice());
+                    let mut pc = PlanningContext::new(
+                        model,
+                        &current,
+                        &DefaultCostEvaluator,
+                        dv_buf.as_mut_slice(),
+                    );
                     if let Some(plan) = op.propose(&mut pc, context.rng()) {
                         let mut tmp = current.clone();
                         tmp.apply_plan(plan);
@@ -326,7 +339,12 @@ where
                     };
                     let d = &self.destroy_ops[idx];
 
-                    let mut pc = PlanningContext::new(model, &current, dv_buf.as_mut_slice());
+                    let mut pc = PlanningContext::new(
+                        model,
+                        &current,
+                        &DefaultCostEvaluator,
+                        dv_buf.as_mut_slice(),
+                    );
                     if let Some(plan) = d.propose(&mut pc, context.rng()) {
                         current.apply_plan(plan);
                         destroyed = true;
@@ -348,7 +366,12 @@ where
                     }
 
                     let mut temp = current.clone();
-                    let mut pc = PlanningContext::new(model, &temp, dv_buf.as_mut_slice());
+                    let mut pc = PlanningContext::new(
+                        model,
+                        &temp,
+                        &DefaultCostEvaluator,
+                        dv_buf.as_mut_slice(),
+                    );
                     if let Some(plan) = r.repair(&mut pc, context.rng()) {
                         temp.apply_plan(plan);
 
@@ -438,17 +461,6 @@ where
         .with_destroy_op(Box::new(
             WorstCostDestroy::new(0.20..=0.40).with_neighbors(neighbors_direct_competitors.clone()),
         ))
-        .with_local_op(Box::new(MipBlockReoptimize::same_berth(
-            2..=5,  // block length k
-            3..=6,  // candidate starts per free interval
-            6..=10, // max candidates per request
-        )))
-        // (B) across-all-berths block reopt — heavier, keep caps tighter
-        .with_local_op(Box::new(MipBlockReoptimize::across_all_berths(
-            2..=4, // k a bit smaller across berths
-            2..=4, // fewer starts per interval
-            4..=8, // tighter cap per request
-        )))
         // time cluster around long job
         .with_destroy_op(Box::new(
             TimeClusterDestroy::<T>::new(0.20..=0.35, TimeDelta::new(24.into()))
@@ -479,5 +491,4 @@ where
         .with_repair_op(Box::new(KRegretInsertion::new(4..=4))) // keep k=4 deterministically
         .with_repair_op(Box::new(RandomizedGreedyInsertion::new(1.6..=2.2)))
         .with_repair_op(Box::new(GreedyInsertion))
-        .with_repair_op(Box::new(MatheuristicRepair::new()))
 }
