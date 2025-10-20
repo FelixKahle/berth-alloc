@@ -51,15 +51,6 @@ fn sample_f64_inclusive<R: Rng>(range: &RangeInclusive<f64>, rng: &mut R) -> f64
     rng.random_range(range.clone())
 }
 
-/// Returns `true` when a `Plan` contains no changes (no patches, no terminal delta, zero deltas).
-#[inline]
-fn is_zero_delta_plan<T>(plan: &Plan<'_, T>) -> bool
-where
-    T: Copy + Ord,
-{
-    plan.delta_unassigned == 0 && plan.delta_cost == Cost::zero() && plan.terminal_delta.is_empty()
-}
-
 /// Randomized–greedy index selector (RCL) used in Shaw-style operators.
 /// For `len > 0`, returns an index in `[0, len-1]`.
 /// `greediness_alpha = 1.0` ≈ uniform; larger values bias toward lower indices after sorting.
@@ -265,12 +256,12 @@ where
             let _ = plan_builder.propose_unassignment(request_index);
         }
 
-        let plan = plan_builder.finalize();
-        if is_zero_delta_plan(&plan) {
-            None
-        } else {
-            Some(plan)
+        // Use new APIs: only finalize if there are structural changes and fitness is evaluable.
+        if !plan_builder.has_changes() {
+            return None;
         }
+        plan_builder.peek_fitness()?;
+        Some(plan_builder.finalize())
     }
 }
 
@@ -413,12 +404,11 @@ where
             let _ = plan_builder.propose_unassignment(request_index);
         }
 
-        let plan = plan_builder.finalize();
-        if is_zero_delta_plan(&plan) {
-            None
-        } else {
-            Some(plan)
+        if !plan_builder.has_changes() {
+            return None;
         }
+        plan_builder.peek_fitness()?;
+        Some(plan_builder.finalize())
     }
 }
 
@@ -594,12 +584,11 @@ where
             let _ = plan_builder.propose_unassignment(request_index);
         }
 
-        let plan = plan_builder.finalize();
-        if is_zero_delta_plan(&plan) {
-            None
-        } else {
-            Some(plan)
+        if !plan_builder.has_changes() {
+            return None;
         }
+        plan_builder.peek_fitness()?;
+        Some(plan_builder.finalize())
     }
 }
 
@@ -729,12 +718,11 @@ where
             let _ = plan_builder.propose_unassignment(request_index);
         }
 
-        let plan = plan_builder.finalize();
-        if is_zero_delta_plan(&plan) {
-            None
-        } else {
-            Some(plan)
+        if !plan_builder.has_changes() {
+            return None;
         }
+        plan_builder.peek_fitness()?;
+        Some(plan_builder.finalize())
     }
 }
 
@@ -861,12 +849,11 @@ where
             let _ = plan_builder.propose_unassignment(request_index);
         }
 
-        let plan = plan_builder.finalize();
-        if is_zero_delta_plan(&plan) {
-            None
-        } else {
-            Some(plan)
+        if !plan_builder.has_changes() {
+            return None;
         }
+        plan_builder.peek_fitness()?;
+        Some(plan_builder.finalize())
     }
 }
 
@@ -997,12 +984,11 @@ where
             let _ = plan_builder.propose_unassignment(request_index);
         }
 
-        let plan = plan_builder.finalize();
-        if is_zero_delta_plan(&plan) {
-            None
-        } else {
-            Some(plan)
+        if !plan_builder.has_changes() {
+            return None;
         }
+        plan_builder.peek_fitness()?;
+        Some(plan_builder.finalize())
     }
 }
 
@@ -1112,12 +1098,11 @@ where
             let _ = plan_builder.propose_unassignment(request_index);
         }
 
-        let plan = plan_builder.finalize();
-        if is_zero_delta_plan(&plan) {
-            None
-        } else {
-            Some(plan)
+        if !plan_builder.has_changes() {
+            return None;
         }
+        plan_builder.peek_fitness()?;
+        Some(plan_builder.finalize())
     }
 }
 
@@ -1293,12 +1278,11 @@ where
             }
         }
 
-        let plan = plan_builder.finalize();
-        if plan.decision_var_patches.is_empty() {
-            None
-        } else {
-            Some(plan)
+        if !plan_builder.has_changes() {
+            return None;
         }
+        plan_builder.peek_fitness()?;
+        Some(plan_builder.finalize())
     }
 }
 
@@ -1467,12 +1451,11 @@ where
             let _ = plan_builder.propose_unassignment(request_index);
         }
 
-        let plan = plan_builder.finalize();
-        if plan.decision_var_patches.is_empty() {
-            None
-        } else {
-            Some(plan)
+        if !plan_builder.has_changes() {
+            return None;
         }
+        plan_builder.peek_fitness()?;
+        Some(plan_builder.finalize())
     }
 }
 
@@ -1567,6 +1550,17 @@ mod tests {
         buffer: &'b mut [DecisionVar<i64>],
     ) -> PlanningContext<'b, 'c, 's, 'm, 'p, i64, DefaultCostEvaluator> {
         PlanningContext::new(model, state, cost_evaluator, buffer)
+    }
+
+    /// Returns `true` when a `Plan` contains no changes (no patches, no terminal delta, zero deltas).
+    #[inline]
+    fn is_zero_delta_plan<T>(plan: &Plan<'_, T>) -> bool
+    where
+        T: Copy + Ord,
+    {
+        plan.delta_unassigned == 0
+            && plan.delta_cost == Cost::zero()
+            && plan.terminal_delta.is_empty()
     }
 
     // ------------- helper tests

@@ -19,11 +19,6 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use berth_alloc_core::prelude::{Cost, TimeInterval, TimePoint};
-use num_traits::Zero;
-use num_traits::{CheckedAdd, CheckedSub};
-use std::ops::Mul;
-
 use crate::state::solver_state::SolverStateView;
 use crate::state::terminal::terminalocc::TerminalWrite;
 use crate::{
@@ -45,6 +40,10 @@ use crate::{
         },
     },
 };
+use berth_alloc_core::prelude::{Cost, TimeInterval, TimePoint};
+use num_traits::Zero;
+use num_traits::{CheckedAdd, CheckedSub};
+use std::ops::Mul;
 
 #[derive(Debug, Clone)]
 pub struct PlanExplorer<'pb, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> {
@@ -214,8 +213,13 @@ impl<'b, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> PlanBuilder<'b, 'c,
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
         let cost = self
-            .solver_model
-            .cost_of_assignment(request, free_berth.berth_index(), start_time)
+            .cost_evaluator
+            .eval(
+                self.solver_model,
+                request,
+                start_time,
+                free_berth.berth_index(),
+            )
             .ok_or_else(|| {
                 ProposeAssignmentError::NotAllowedOnBerth(NotAllowedOnBerthError::new(
                     request,
@@ -288,18 +292,15 @@ impl<'b, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> PlanBuilder<'b, 'c,
             }
         };
 
-        let cost =
-            match self
-                .solver_model
-                .cost_of_assignment(request, dv.berth_index, dv.start_time)
-            {
-                Some(cost) => cost,
-                None => {
-                    return Err(ProposeUnassignmentError::NotAllowedOnBerth(
-                        NotAllowedOnBerthError::new(request, dv.berth_index),
-                    ));
-                }
-            };
+        let cost = self
+            .cost_evaluator
+            .eval(self.solver_model, request, dv.start_time, dv.berth_index)
+            .ok_or_else(|| {
+                ProposeUnassignmentError::NotAllowedOnBerth(NotAllowedOnBerthError::new(
+                    request,
+                    dv.berth_index,
+                ))
+            })?;
 
         self.sandbox
             .release(dv.berth_index, iv)
@@ -346,8 +347,48 @@ impl<'b, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> PlanBuilder<'b, 'c,
     where
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
-        self.solver_model
-            .cost_of_assignment(request, free_berth.berth_index(), start_time)
+        self.cost_evaluator.eval(
+            self.solver_model,
+            request,
+            start_time,
+            free_berth.berth_index(),
+        )
+    }
+
+    /// Compute the full fitness (cost, unassigned) of the builder's current tentative plan
+    /// without finalizing. Uses the CostEvaluator for cost.
+    #[inline]
+    pub fn peek_fitness(&self) -> Option<crate::state::fitness::Fitness>
+    where
+        T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
+    {
+        let mut total_cost = Cost::zero();
+        let mut unassigned = 0usize;
+
+        for (i, dv) in self.decision_vars.iter().enumerate() {
+            match *dv {
+                DecisionVar::Unassigned => unassigned += 1,
+                DecisionVar::Assigned(Decision {
+                    berth_index,
+                    start_time,
+                }) => {
+                    let c = self.cost_evaluator.eval(
+                        self.solver_model,
+                        RequestIndex::new(i),
+                        start_time,
+                        berth_index,
+                    )?;
+                    total_cost = total_cost.checked_add(c)?;
+                }
+            }
+        }
+
+        Some(crate::state::fitness::Fitness::new(total_cost, unassigned))
+    }
+
+    #[inline]
+    pub fn has_changes(&self) -> bool {
+        !self.patches.is_empty()
     }
 
     #[inline]

@@ -39,15 +39,6 @@ use std::{
 type AlphaRange = RangeInclusive<f64>;
 type KRange = RangeInclusive<usize>;
 
-/// Returns `true` when a `Plan` contains no changes (no patches, no terminal delta, zero deltas).
-#[inline]
-fn is_zero_delta_plan<T>(plan: &Plan<'_, T>) -> bool
-where
-    T: Copy + Ord,
-{
-    plan.delta_unassigned == 0 && plan.delta_cost == Cost::zero() && plan.terminal_delta.is_empty()
-}
-
 /// Randomized–greedy index selector used by RCL-style insertion.
 /// For `len > 0`, returns an index in `[0, len-1]`.
 /// `greediness_alpha = 1.0` ≈ uniform; larger values bias toward lower indices.
@@ -228,12 +219,17 @@ where
             }
         }
 
-        let plan = plan_builder.finalize();
-        if is_zero_delta_plan(&plan) {
-            None
-        } else {
-            Some(plan)
+        // Extended API usage: avoid finalize when no changes; ensure evaluator can compute fitness.
+        if !plan_builder.has_changes() {
+            plan_builder.discard();
+            return None;
         }
+        if plan_builder.peek_fitness().is_none() {
+            plan_builder.discard();
+            return None;
+        }
+
+        Some(plan_builder.finalize())
     }
 }
 
@@ -362,17 +358,22 @@ where
             );
         }
 
-        let plan = plan_builder.finalize();
-        if is_zero_delta_plan(&plan) {
-            None
-        } else {
-            Some(plan)
+        // Extended API usage: avoid finalize when no changes; ensure evaluator can compute fitness.
+        if !plan_builder.has_changes() {
+            plan_builder.discard();
+            return None;
         }
+        if plan_builder.peek_fitness().is_none() {
+            plan_builder.discard();
+            return None;
+        }
+
+        Some(plan_builder.finalize())
     }
 }
 
 // ======================================================================
-// GreedyInsertion (unchanged API)
+// GreedyInsertion (unchanged API; now uses extended builder guards)
 // ======================================================================
 
 /// At each step, finds the single best insertion (lowest cost) across all
@@ -440,17 +441,22 @@ where
             }
         }
 
-        let plan = plan_builder.finalize();
-        if is_zero_delta_plan(&plan) {
-            None
-        } else {
-            Some(plan)
+        // Extended API usage: avoid finalize when no changes; ensure evaluator can compute fitness.
+        if !plan_builder.has_changes() {
+            plan_builder.discard();
+            return None;
         }
+        if plan_builder.peek_fitness().is_none() {
+            plan_builder.discard();
+            return None;
+        }
+
+        Some(plan_builder.finalize())
     }
 }
 
 // ======================================================================
-// EarliestWindowInsertion (unchanged API)
+// EarliestWindowInsertion (unchanged API; now uses extended builder guards)
 // ======================================================================
 
 /// Sorts all unassigned requests by their feasible window start time and attempts
@@ -496,12 +502,17 @@ where
             }
         }
 
-        let plan = plan_builder.finalize();
-        if is_zero_delta_plan(&plan) {
-            None
-        } else {
-            Some(plan)
+        // Extended API usage: avoid finalize when no changes; ensure evaluator can compute fitness.
+        if !plan_builder.has_changes() {
+            plan_builder.discard();
+            return None;
         }
+        if plan_builder.peek_fitness().is_none() {
+            plan_builder.discard();
+            return None;
+        }
+
+        Some(plan_builder.finalize())
     }
 }
 
