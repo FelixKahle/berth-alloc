@@ -38,7 +38,8 @@ use berth_alloc_model::{
     prelude::{Problem, SolutionRef},
     solution::SolutionError,
 };
-use rand::{RngCore, SeedableRng};
+use rand::seq::{IndexedRandom, SliceRandom};
+use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::{
     sync::atomic::{AtomicBool, Ordering},
@@ -55,8 +56,10 @@ impl Default for SolverEngineConfig {
     #[inline]
     fn default() -> Self {
         Self {
-            num_workers: 4,
-            time_limit: std::time::Duration::from_secs(30),
+            num_workers: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+            time_limit: std::time::Duration::from_secs(60),
         }
     }
 }
@@ -157,27 +160,221 @@ where
             .map_err(EngineError::OpeningFailed)?;
         let shared_incumbent = SharedIncumbent::new(initial_state);
 
+        // --- Diversified, randomized strategy portfolio (types + settings) ---
         if self.strategies.is_empty() {
             let n = self.config.num_workers.max(1);
-            for i in 0..n {
-                match i % 4 {
-                    0 => {
-                        let ils = ils::ils_strategy::<T, ChaCha8Rng>(&model);
-                        self.strategies.push(Box::new(ils));
+
+            #[derive(Clone, Copy, Debug)]
+            enum Kind {
+                Ils,
+                Tabu,
+                Sa,
+                Gls,
+            }
+
+            // Make one of a given kind with randomized knobs.
+            fn make_one_variant<Tnum>(
+                k: Kind,
+                model: &SolverModel<Tnum>,
+                rng: &mut ChaCha8Rng,
+            ) -> Box<dyn SearchStrategy<Tnum, ChaCha8Rng>>
+            where
+                Tnum: SolveNumeric + From<i32>,
+            {
+                match k {
+                    Kind::Ils => {
+                        let mut s = ils::ils_strategy::<Tnum, ChaCha8Rng>(model);
+
+                        // Randomize local budget: either fixed or a range
+                        if rng.random_bool(0.5) {
+                            let max_steps = rng.random_range(600..=1400);
+                            s = s.with_max_local_steps(max_steps);
+                        } else {
+                            let lo = rng.random_range(400..=900);
+                            let hi = rng.random_range((lo + 50)..=(lo + 600));
+                            s = s.with_local_steps_range(lo..=hi);
+                        }
+
+                        // Acceptance tweaks
+                        let sideways = rng.random_bool(0.4); // sometimes allow equal-cost “plateau” moves
+                        s = s.with_local_sideways(sideways);
+
+                        // Small chance to allow random worsening moves in Phase A
+                        if rng.random_bool(0.35) {
+                            // tiny to modest probability
+                            let p = rng.random_range(0.02_f64..=0.10);
+                            s = s.with_local_worsening_prob(p);
+                        }
+
+                        // Shuffle policy (per step vs per round)
+                        s = s.with_shuffle_local_each_step(rng.random_bool(0.7));
+
+                        // Cap attempts for perturbation phases (destroy/repair)
+                        if rng.random_bool(0.6) {
+                            s = s.with_destroy_attempts(rng.random_range(1..=3));
+                        }
+                        if rng.random_bool(0.6) {
+                            s = s.with_repair_attempts(rng.random_range(1..=3));
+                        }
+
+                        // Refetch policies
+                        if rng.random_bool(0.5) {
+                            s = s.with_refetch_after_stale(rng.random_range(64..=192));
+                        }
+                        if rng.random_bool(0.25) {
+                            s = s.with_hard_refetch_every(rng.random_range(12..=48));
+                        }
+
+                        Box::new(s)
                     }
-                    1 => {
-                        let tabu = tabu::tabu_strategy::<T, ChaCha8Rng>(&model);
-                        self.strategies.push(Box::new(tabu));
+                    Kind::Tabu => {
+                        // Randomize tenure, steps, samples, and restart behavior a bit.
+                        let lo = rng.random_range(10..=20);
+                        let hi = rng.random_range(24..=40).max(lo + 1);
+                        let steps = rng.random_range(512..=1400);
+                        let samples = rng.random_range(48..=120);
+                        let restart_on_publish = rng.random_bool(0.7);
+                        let reset_on_refetch = rng.random_bool(0.9);
+                        let kick = rng.random_range(2..=6);
+
+                        let mut s = tabu::tabu_strategy::<Tnum, ChaCha8Rng>(model)
+                            .with_tabu_tenure(lo..=hi)
+                            .with_max_local_steps(steps)
+                            .with_samples_per_step(samples)
+                            .with_restart_on_publish(restart_on_publish)
+                            .with_reset_on_refetch(reset_on_refetch)
+                            .with_kick_steps_on_reset(kick);
+
+                        // Occasionally add periodic refetch
+                        if rng.random_bool(0.35) {
+                            let every = rng.random_range(15..=50);
+                            s = s.with_hard_refetch_every(every);
+                        }
+                        Box::new(s)
                     }
-                    2 => {
-                        let sa = sa::sa_strategy::<T, ChaCha8Rng>(&model);
-                        self.strategies.push(Box::new(sa));
+                    Kind::Sa => {
+                        // Randomize cooling/temperature/steps and acceptance targets.
+                        let init_t = rng.random_range(0.8_f64..=1.6);
+                        let cooling = rng.random_range(0.996_f64..=0.999);
+                        let steps = rng.random_range(160..=420);
+                        let low = rng.random_range(0.08_f64..=0.18);
+                        let high = rng.random_range(0.40_f64..=0.60).max(low + 0.05);
+                        let ema = rng.random_range(0.12_f64..=0.30);
+                        let reheat = [0.0, 0.6, 1.0, 8.0].choose(rng).copied().unwrap_or(1.0);
+                        let big_m = [900_000_000_i64, 1_200_000_000, 1_500_000_000]
+                            .choose(rng)
+                            .copied()
+                            .unwrap_or(1_200_000_000);
+
+                        let mut s = sa::sa_strategy::<Tnum, ChaCha8Rng>(model)
+                            .with_init_temp(init_t)
+                            .with_cooling(cooling)
+                            .with_steps_per_temp(steps)
+                            .with_acceptance_targets(low, high)
+                            .with_op_ema_alpha(ema)
+                            .with_reheat_factor(reheat)
+                            .with_big_m_for_energy(big_m);
+
+                        // Sometimes set periodic refetch for SA too
+                        if rng.random_bool(0.30) {
+                            s = s.with_hard_refetch_every(rng.random_range(12..=40));
+                        }
+                        // And/or staleness refetch
+                        if rng.random_bool(0.60) {
+                            s = s.with_refetch_after_stale(rng.random_range(48..=160));
+                        }
+                        Box::new(s)
                     }
-                    _ => {
-                        let ils = gls::gls_strategy::<T, ChaCha8Rng>(&model);
-                        self.strategies.push(Box::new(ils));
+                    // inside make_one_variant(), in Kind::Gls arm (replace that arm)
+                    Kind::Gls => {
+                        // Randomize lambda, decay, pulse parameters and refetch/reset knobs.
+                        let lambda = [3_i64, 4, 5, 6].choose(rng).copied().unwrap_or(4);
+                        let step = [1_i64, 1, 2].choose(rng).copied().unwrap_or(1);
+                        let max_steps = rng.random_range(800..=1800);
+                        let top_k = rng.random_range(6..=14);
+                        let stagnation = rng.random_range(12..=24);
+                        let decay = if rng.random_bool(0.8) {
+                            // multiplicative decay 85–95%
+                            let den = 100u32;
+                            let keep = rng.random_range(85u32..=95);
+                            gls::DecayMode::Multiplicative { num: keep, den }
+                        } else {
+                            gls::DecayMode::Subtractive {
+                                step: rng.random_range(1_i64..=3),
+                            }
+                        };
+                        let restart_on_publish = rng.random_bool(0.85);
+                        let reset_on_refetch = rng.random_bool(0.85);
+                        let kick = rng.random_range(2..=6);
+
+                        let mut s = gls::gls_strategy::<Tnum, ChaCha8Rng>(model)
+                            .with_lambda(lambda)
+                            .with_penalty_step(step)
+                            .with_max_local_steps(max_steps)
+                            .with_decay(decay)
+                            .with_restart_on_publish(restart_on_publish)
+                            .with_reset_on_refetch(reset_on_refetch)
+                            .with_kick_steps_on_reset(kick)
+                            .with_max_penalty(1_000_000_000);
+
+                        // If your GLS exposes this:
+                        s = s.with_pulse_params(stagnation, top_k);
+
+                        if rng.random_bool(0.35) {
+                            s = s.with_hard_refetch_every(rng.random_range(10..=36));
+                        }
+                        if rng.random_bool(0.60) {
+                            s = s.with_refetch_after_stale(rng.random_range(96..=192));
+                        }
+
+                        Box::new(s)
                     }
                 }
+            }
+
+            // Start with guaranteed coverage (one of each, up to n).
+            let mut kinds: Vec<Kind> = Vec::with_capacity(n);
+            let all = [Kind::Ils, Kind::Tabu, Kind::Sa, Kind::Gls];
+            for k in all.into_iter().take(n) {
+                kinds.push(k);
+            }
+
+            // Fill remaining slots from a weighted bag, then shuffle.
+            let weights = &[
+                (Kind::Ils, 2usize),
+                (Kind::Tabu, 1usize),
+                (Kind::Sa, 1usize),
+                (Kind::Gls, 3usize),
+            ];
+            let mut bag: Vec<Kind> = Vec::new();
+            for (k, w) in weights {
+                for _ in 0..*w {
+                    bag.push(*k);
+                }
+            }
+
+            // Use a deterministic per-run RNG for portfolio construction
+            let mut pf_rng = rand::rng();
+            while kinds.len() < n {
+                if let Some(&k) = bag.choose(&mut pf_rng) {
+                    kinds.push(k);
+                } else {
+                    kinds.push(Kind::Ils);
+                }
+            }
+            kinds.shuffle(&mut pf_rng);
+
+            // Materialize diversified strategies with randomized settings.
+            // Each worker gets its own seed; we derive a sub-seed for the “variant maker”
+            // so that creation-time randomization is also independent per worker.
+            let mut variant_seed_rng = rand::rng();
+            for _ in 0..kinds.len() {
+                // Derive a seed to randomize the strategy's internal knobs
+                let seed = variant_seed_rng.next_u64();
+                let mut knob_rng = ChaCha8Rng::seed_from_u64(seed);
+                let k = kinds[self.strategies.len()];
+                self.strategies
+                    .push(make_one_variant(k, &model, &mut knob_rng));
             }
         }
 

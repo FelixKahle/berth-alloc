@@ -733,6 +733,511 @@ where
     }
 }
 
+// ======================================================================
+// RelocateSingleBestAllowWorsening  (same as RelocateSingleBest but allows worsening)
+// ======================================================================
+
+#[derive(Clone, Debug)]
+pub struct RelocateSingleBestAllowWorsening {
+    /// How many assigned requests to randomly sample and try to relocate.
+    pub number_of_candidates_to_try_range: RangeInclusive<usize>,
+}
+
+impl RelocateSingleBestAllowWorsening {
+    pub fn new(number_of_candidates_to_try_range: RangeInclusive<usize>) -> Self {
+        assert!(!number_of_candidates_to_try_range.is_empty());
+        Self {
+            number_of_candidates_to_try_range,
+        }
+    }
+}
+
+impl<T, C, R> LocalMoveOperator<T, C, R> for RelocateSingleBestAllowWorsening
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+{
+    fn name(&self) -> &str {
+        "RelocateSingleBestAllowWorsening"
+    }
+
+    fn propose<'b, 'c, 's, 'm, 'p>(
+        &self,
+        context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
+        rng: &mut R,
+    ) -> Option<Plan<'p, T>> {
+        let model = context.model();
+
+        // Snapshot assigned jobs with their current cost (one-off builder).
+        let seed_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
+        let assigned_with_cost: Vec<(RequestIndex, BerthIndex, TimePoint<T>, Cost)> = seed_builder
+            .with_explorer(|ex| {
+                ex.decision_vars()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, dv)| {
+                        if let DecisionVar::Assigned(Decision {
+                            berth_index,
+                            start_time,
+                        }) = *dv
+                        {
+                            let ri = RequestIndex::new(i);
+                            ex.peek_cost(ri, start_time, berth_index)
+                                .map(|current_cost| (ri, berth_index, start_time, current_cost))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            });
+        if assigned_with_cost.is_empty() {
+            return None;
+        }
+
+        let sample_size = clamp_range_sample(
+            rng,
+            &self.number_of_candidates_to_try_range,
+            assigned_with_cost.len(),
+        )
+        .max(1);
+        let mut sampled = assigned_with_cost.clone();
+        sampled.shuffle(rng);
+        sampled.truncate(sample_size);
+
+        for (request_index, _current_berth, _current_start_time, _current_cost) in sampled {
+            let mut attempt_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
+
+            // Keep the "best insertion" computation, but DO NOT require it to beat current cost.
+            let best_option = attempt_builder
+                .with_explorer(|ex| best_insertion_for_request_ex(ex, model, request_index));
+            let Some((best_free_berth, best_start_time, _best_cost)) = best_option else {
+                continue;
+            };
+
+            let _ = attempt_builder.propose_unassignment(request_index).ok()?;
+            attempt_builder
+                .propose_assignment(request_index, best_start_time, &best_free_berth)
+                .ok()?;
+
+            let plan = attempt_builder.finalize();
+            if !is_zero_delta_plan(&plan) {
+                return Some(plan);
+            }
+        }
+
+        None
+    }
+}
+
+// ======================================================================
+// RandomRelocateAnywhere  (random feasible reinsert; can worsen on purpose)
+// ======================================================================
+
+#[derive(Clone, Debug)]
+pub struct RandomRelocateAnywhere {
+    /// How many assigned requests to randomly sample and try to reinsert randomly.
+    pub number_of_candidates_to_try_range: RangeInclusive<usize>,
+}
+
+impl RandomRelocateAnywhere {
+    pub fn new(number_of_candidates_to_try_range: RangeInclusive<usize>) -> Self {
+        assert!(!number_of_candidates_to_try_range.is_empty());
+        Self {
+            number_of_candidates_to_try_range,
+        }
+    }
+}
+
+impl<T, C, R> LocalMoveOperator<T, C, R> for RandomRelocateAnywhere
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+{
+    fn name(&self) -> &str {
+        "RandomRelocateAnywhere"
+    }
+
+    fn propose<'b, 'c, 's, 'm, 'p>(
+        &self,
+        context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
+        rng: &mut R,
+    ) -> Option<Plan<'p, T>> {
+        let model = context.model();
+
+        // Snapshot assigned jobs.
+        let seed_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
+        let assigned_jobs: Vec<(RequestIndex, BerthIndex, TimePoint<T>)> = seed_builder
+            .with_explorer(|ex| {
+                ex.decision_vars()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, dv)| {
+                        if let DecisionVar::Assigned(Decision {
+                            berth_index,
+                            start_time,
+                        }) = *dv
+                        {
+                            Some((RequestIndex::new(i), berth_index, start_time))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            });
+        if assigned_jobs.is_empty() {
+            return None;
+        }
+
+        let sample_size = clamp_range_sample(
+            rng,
+            &self.number_of_candidates_to_try_range,
+            assigned_jobs.len(),
+        )
+        .max(1);
+
+        // Shuffle & truncate candidates.
+        let mut sampled = assigned_jobs.clone();
+        sampled.shuffle(rng);
+        sampled.truncate(sample_size);
+
+        for (ri, _cur_b, _cur_s) in sampled {
+            let mut attempt_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
+
+            // Gather all feasible "earliest start" placements across all free intervals.
+            let options = attempt_builder.with_explorer(|ex| {
+                let mut opts: Vec<(FreeBerth<T>, TimePoint<T>)> = Vec::new();
+                for free in ex.iter_free_for(ri) {
+                    let b = free.berth_index();
+                    if let Some(pt) = model.processing_time(ri, b) {
+                        let iv = free.interval();
+                        let s = iv.start();
+                        if s + pt <= iv.end() {
+                            opts.push((free, s));
+                        }
+                    }
+                }
+                opts
+            });
+
+            if options.is_empty() {
+                continue;
+            }
+
+            // Pick a random feasible placement (not minimum cost on purpose).
+            let (fb, s) = {
+                let idx = rng.random_range(0..options.len());
+                options[idx].clone()
+            };
+
+            let _ = attempt_builder.propose_unassignment(ri).ok()?;
+            attempt_builder.propose_assignment(ri, s, &fb).ok()?;
+
+            let plan = attempt_builder.finalize();
+            if !is_zero_delta_plan(&plan) {
+                return Some(plan);
+            }
+        }
+
+        None
+    }
+}
+
+// ======================================================================
+// HillClimbRelocateBest  (best improving relocate among sampled requests)
+// ======================================================================
+
+#[derive(Clone, Debug)]
+pub struct HillClimbRelocateBest {
+    /// How many assigned requests to sample and try (upper bound).
+    pub number_of_candidates_to_try_range: RangeInclusive<usize>,
+}
+
+impl HillClimbRelocateBest {
+    pub fn new(number_of_candidates_to_try_range: RangeInclusive<usize>) -> Self {
+        assert!(!number_of_candidates_to_try_range.is_empty());
+        Self {
+            number_of_candidates_to_try_range,
+        }
+    }
+}
+
+impl<T, C, R> LocalMoveOperator<T, C, R> for HillClimbRelocateBest
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+{
+    fn name(&self) -> &str {
+        "HillClimbRelocateBest"
+    }
+
+    fn propose<'b, 'c, 's, 'm, 'p>(
+        &self,
+        context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
+        rng: &mut R,
+    ) -> Option<Plan<'p, T>> {
+        let model = context.model();
+
+        // Gather assigned requests (seed snapshot).
+        let seed_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
+        let assigned: Vec<(RequestIndex, BerthIndex, TimePoint<T>)> =
+            seed_builder.with_explorer(|ex| {
+                ex.decision_vars()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, dv)| {
+                        if let DecisionVar::Assigned(Decision {
+                            berth_index,
+                            start_time,
+                        }) = *dv
+                        {
+                            Some((RequestIndex::new(i), berth_index, start_time))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            });
+        if assigned.is_empty() {
+            return None;
+        }
+
+        // Sample a subset to keep per-call work bounded.
+        let k =
+            clamp_range_sample(rng, &self.number_of_candidates_to_try_range, assigned.len()).max(1);
+        let mut cand_reqs = assigned.clone();
+        cand_reqs.shuffle(rng);
+        cand_reqs.truncate(k);
+
+        // Track best improving plan by lexicographic delta.
+        let mut best_plan: Option<Plan<'p, T>> = None;
+        let mut best_delta_unassigned: i64 = 0;
+        let mut best_delta_cost: Cost = Cost::zero();
+
+        // Lex compare on deltas: smaller is better; unassigned first, then cost.
+        #[inline]
+        fn lex_better(du_a: i64, dc_a: Cost, du_b: i64, dc_b: Cost) -> bool {
+            (du_a < du_b) || (du_a == du_b && dc_a < dc_b)
+        }
+
+        for (ri, _cur_b, _cur_s) in cand_reqs {
+            // Explore all feasible earliest placements; pick the one that yields the best improvement.
+            // We will construct a plan for each feasible "best_insertion_for_request_ex" and evaluate deltas.
+            let attempt_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
+
+            // Build the list of candidate placements (free rectangles + earliest start).
+            let placements = attempt_builder.with_explorer(|ex| {
+                let mut opts: Vec<(FreeBerth<T>, TimePoint<T>)> = Vec::new();
+                for free in ex.iter_free_for(ri) {
+                    let b = free.berth_index();
+                    if let Some(pt) = model.processing_time(ri, b) {
+                        let iv = free.interval();
+                        let s = iv.start();
+                        if s + pt <= iv.end() {
+                            opts.push((free, s));
+                        }
+                    }
+                }
+                opts
+            });
+
+            if placements.is_empty() {
+                continue;
+            }
+
+            for (fb, s) in placements {
+                let mut bld: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
+                let _ = bld.propose_unassignment(ri).ok()?;
+                if bld.propose_assignment(ri, s, &fb).is_err() {
+                    continue;
+                }
+                let plan = bld.finalize();
+
+                if is_zero_delta_plan(&plan) {
+                    continue;
+                }
+
+                // Improvement check (lex on deltas).
+                let du = plan.delta_unassigned as i64;
+                let dc = plan.delta_cost;
+
+                // Must be an improving move.
+                if du < 0 || (du == 0 && dc < 0) {
+                    match &best_plan {
+                        None => {
+                            best_delta_unassigned = du;
+                            best_delta_cost = dc;
+                            best_plan = Some(plan);
+                        }
+                        Some(_) => {
+                            if lex_better(du, dc, best_delta_unassigned, best_delta_cost) {
+                                best_delta_unassigned = du;
+                                best_delta_cost = dc;
+                                best_plan = Some(plan);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        best_plan
+    }
+}
+
+// ======================================================================
+// HillClimbBestSwapSameBerth  (best improving swap among sampled same-berth pairs)
+// ======================================================================
+
+#[derive(Clone, Debug)]
+pub struct HillClimbBestSwapSameBerth {
+    /// How many random same-berth pairs to sample per call (upper bound).
+    pub number_of_pair_attempts_to_try_range: RangeInclusive<usize>,
+}
+
+impl HillClimbBestSwapSameBerth {
+    pub fn new(number_of_pair_attempts_to_try_range: RangeInclusive<usize>) -> Self {
+        assert!(!number_of_pair_attempts_to_try_range.is_empty());
+        Self {
+            number_of_pair_attempts_to_try_range,
+        }
+    }
+}
+
+impl<T, C, R> LocalMoveOperator<T, C, R> for HillClimbBestSwapSameBerth
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+{
+    fn name(&self) -> &str {
+        "HillClimbBestSwapSameBerth"
+    }
+
+    fn propose<'b, 'c, 's, 'm, 'p>(
+        &self,
+        context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
+        rng: &mut R,
+    ) -> Option<Plan<'p, T>> {
+        let model = context.model();
+
+        // Collect assigned by berth, ordered by start.
+        let seed_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
+        let by_berth = seed_builder.with_explorer(|ex| {
+            use std::collections::BTreeMap;
+            let mut map: BTreeMap<BerthIndex, Vec<(RequestIndex, TimePoint<T>)>> = BTreeMap::new();
+            for (i, dv) in ex.decision_vars().iter().enumerate() {
+                if let DecisionVar::Assigned(Decision {
+                    berth_index,
+                    start_time,
+                }) = *dv
+                {
+                    map.entry(berth_index)
+                        .or_default()
+                        .push((RequestIndex::new(i), start_time));
+                }
+            }
+            for v in map.values_mut() {
+                v.sort_by_key(|(_, s)| s.value());
+            }
+            map
+        });
+        if by_berth.is_empty() {
+            return None;
+        }
+
+        // Enumerate all feasible swap candidates (indices on same berth).
+        #[allow(clippy::type_complexity)]
+        let mut pairs: Vec<(
+            BerthIndex,
+            (RequestIndex, TimePoint<T>),
+            (RequestIndex, TimePoint<T>),
+        )> = Vec::new();
+        for (bi, seq) in by_berth.iter() {
+            if seq.len() < 2 {
+                continue;
+            }
+            for i in 0..(seq.len() - 1) {
+                for j in (i + 1)..seq.len() {
+                    pairs.push((*bi, seq[i], seq[j]));
+                }
+            }
+        }
+        if pairs.is_empty() {
+            return None;
+        }
+
+        // Sample a subset of pairs to bound per-call work.
+        let attempts =
+            clamp_range_sample(rng, &self.number_of_pair_attempts_to_try_range, pairs.len()).max(1);
+        pairs.shuffle(rng);
+        pairs.truncate(attempts);
+
+        // Track best improving swap plan (lex on deltas).
+        let mut best_plan: Option<Plan<'p, T>> = None;
+        let mut best_du: i64 = 0;
+        let mut best_dc: Cost = Cost::zero();
+
+        #[inline]
+        fn lex_better(du_a: i64, dc_a: Cost, du_b: i64, dc_b: Cost) -> bool {
+            (du_a < du_b) || (du_a == du_b && dc_a < dc_b)
+        }
+
+        for (bi, (ri_a, sa), (ri_b, sb)) in pairs {
+            let Some(pt_a_on_b) = model.processing_time(ri_a, bi) else {
+                continue;
+            };
+            let Some(pt_b_on_b) = model.processing_time(ri_b, bi) else {
+                continue;
+            };
+
+            let iv_a_to_b = TimeInterval::new(sb, sb + pt_a_on_b);
+            let iv_b_to_a = TimeInterval::new(sa, sa + pt_b_on_b);
+
+            let fb_a_to_b = FreeBerth::new(iv_a_to_b, bi);
+            let fb_b_to_a = FreeBerth::new(iv_b_to_a, bi);
+
+            let mut bld: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
+            let _ = bld.propose_unassignment(ri_a).ok()?;
+            let _ = bld.propose_unassignment(ri_b).ok()?;
+            if bld.propose_assignment(ri_a, sb, &fb_a_to_b).is_err() {
+                continue;
+            }
+            if bld.propose_assignment(ri_b, sa, &fb_b_to_a).is_err() {
+                continue;
+            }
+            let plan = bld.finalize();
+            if is_zero_delta_plan(&plan) {
+                continue;
+            }
+
+            // Improvement?
+            let du = plan.delta_unassigned as i64;
+            let dc = plan.delta_cost;
+            if du < 0 || (du == 0 && dc < 0) {
+                match &best_plan {
+                    None => {
+                        best_du = du;
+                        best_dc = dc;
+                        best_plan = Some(plan);
+                    }
+                    Some(_) => {
+                        if lex_better(du, dc, best_du, best_dc) {
+                            best_du = du;
+                            best_dc = dc;
+                            best_plan = Some(plan);
+                        }
+                    }
+                }
+            }
+        }
+
+        best_plan
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -982,5 +1487,116 @@ mod tests {
         assert!(op_swap.propose(&mut ctx, &mut rng).is_none());
         assert!(op_cross.propose(&mut ctx, &mut rng).is_none());
         assert!(op_oropt.propose(&mut ctx, &mut rng).is_none());
+    }
+
+    #[test]
+    fn test_relocate_single_best_allow_worsening_produces_plan() {
+        let prob = make_problem(2);
+        let model = SolverModel::try_from(&prob).unwrap();
+        let state = make_state_with_assignments(&model, &[60, 80]);
+
+        let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
+        let mut rng = ChaCha8Rng::from_seed([17; 32]);
+
+        let op = RelocateSingleBestAllowWorsening::new(1..=3);
+        let plan = op.propose(&mut ctx, &mut rng).expect("plan expected");
+
+        assert_eq!(plan.delta_unassigned, 0);
+        assert!(
+            plan.decision_var_patches.len() >= 2,
+            "should perform an unassign+assign"
+        );
+        assert!(!plan.terminal_delta.is_empty());
+    }
+
+    #[test]
+    fn test_random_relocate_anywhere_moves_some_request() {
+        let prob = make_problem(3);
+        let model = SolverModel::try_from(&prob).unwrap();
+        // Three assigned at spaced times to give room for relocations
+        let state = make_state_with_assignments(&model, &[0, 30, 70]);
+
+        let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
+        let mut rng = ChaCha8Rng::from_seed([19; 32]);
+
+        let op = RandomRelocateAnywhere::new(2..=4);
+        let plan = op.propose(&mut ctx, &mut rng).expect("plan expected");
+
+        assert_eq!(plan.delta_unassigned, 0);
+        assert!(
+            plan.decision_var_patches.len() >= 2,
+            "expect an unassign + assign"
+        );
+        assert!(!plan.terminal_delta.is_empty());
+    }
+
+    #[test]
+    fn test_hill_climb_relocate_best_reduces_cost_when_possible() {
+        let prob = make_problem(1);
+        let model = SolverModel::try_from(&prob).unwrap();
+        // Start later than arrival; moving earlier should reduce base cost
+        let state = make_state_with_assignments(&model, &[50]);
+
+        let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
+        let mut rng = ChaCha8Rng::from_seed([23; 32]);
+
+        let op = HillClimbRelocateBest::new(1..=3);
+        let plan = op.propose(&mut ctx, &mut rng).expect("plan expected");
+
+        // Expect strict cost improvement on the base objective
+        assert!(
+            plan.delta_cost < 0,
+            "hill-climb should reduce base cost when earlier start is possible; got delta_cost={}",
+            plan.delta_cost
+        );
+        assert_eq!(plan.delta_unassigned, 0);
+        assert!(!plan.terminal_delta.is_empty());
+    }
+
+    #[test]
+    fn test_hill_climb_best_swap_same_berth_finds_improving_swap() {
+        // Build a problem where swapping yields a clear improvement due to different weights.
+        let mut pb = berth_alloc_model::problem::builder::ProblemBuilder::new();
+        pb.add_berth(berth(1, 0, 1_000));
+        // Two requests allowed on the same berth, different weights
+        // PT = 10 for both; arrival = 0 (window start)
+        pb.add_flexible(flex_req(1, (0, 200), &[(1, 10)], 10)); // heavy
+        pb.add_flexible(flex_req(2, (0, 200), &[(1, 10)], 1)); // light
+        let prob = pb.build().expect("ok");
+        let model = SolverModel::try_from(&prob).unwrap();
+
+        let b1 = model.index_manager().berth_index(bid(1)).unwrap();
+
+        // Assign heavy late and light early: [R1@40, R2@0]
+        // Swapping them should greatly reduce cost.
+        let mut dvars = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        dvars[0] = DecisionVar::assigned(b1, tp(40)); // heavy
+        dvars[1] = DecisionVar::assigned(b1, tp(0)); // light
+        let dv = DecisionVarVec::from(dvars);
+        let term = TerminalOccupancy::new(model.problem().berths().iter());
+        let state = SolverState::new(dv, term, Fitness::new(0, 0));
+
+        let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
+        let mut rng = ChaCha8Rng::from_seed([29; 32]);
+
+        let op = HillClimbBestSwapSameBerth::new(1..=5);
+        let plan = op.propose(&mut ctx, &mut rng).expect("plan expected");
+
+        // Expect a strict improvement
+        assert!(
+            plan.delta_cost < 0,
+            "swap should reduce base cost with asymmetric weights; got delta_cost={}",
+            plan.delta_cost
+        );
+        assert_eq!(plan.delta_unassigned, 0);
+        assert!(
+            plan.decision_var_patches.len() >= 4,
+            "expect unassign+assign for both requests"
+        );
+        assert!(!plan.terminal_delta.is_empty());
     }
 }

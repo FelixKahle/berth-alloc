@@ -20,7 +20,7 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use berth_alloc_core::prelude::Cost;
-use num_traits::{CheckedAdd, CheckedDiv, CheckedSub, FromPrimitive, Zero};
+use num_traits::{CheckedAdd, CheckedDiv, CheckedSub, FromPrimitive, ToPrimitive, Zero};
 use std::ops::Mul;
 
 pub trait SolveNumeric:
@@ -38,6 +38,7 @@ pub trait SolveNumeric:
     + std::fmt::Display
     + From<i32>
     + FromPrimitive
+    + ToPrimitive
     + 'static
 {
 }
@@ -57,6 +58,7 @@ impl<T> SolveNumeric for T where
         + std::fmt::Display
         + From<i32>
         + FromPrimitive
+        + ToPrimitive
         + 'static
 {
 }

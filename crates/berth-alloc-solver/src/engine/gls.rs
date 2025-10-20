@@ -22,7 +22,7 @@
 use crate::{
     core::numeric::SolveNumeric,
     engine::{
-        acceptor::{Acceptor, LexStrictAcceptor}, // true-objective acceptor
+        acceptor::{Acceptor, LexStrictAcceptor},
         search::{SearchContext, SearchStrategy},
     },
     model::{
@@ -32,8 +32,9 @@ use crate::{
     search::{
         operator::LocalMoveOperator,
         operator_library::local::{
-            CrossExchangeAcrossBerths, OrOptBlockRelocate, RelocateSingleBest,
-            ShiftEarlierOnSameBerth, SwapPairSameBerth,
+            CrossExchangeAcrossBerths, HillClimbBestSwapSameBerth, HillClimbRelocateBest,
+            OrOptBlockRelocate, RandomRelocateAnywhere, RelocateSingleBest,
+            RelocateSingleBestAllowWorsening, ShiftEarlierOnSameBerth, SwapPairSameBerth,
         },
         planner::{CostEvaluator, DefaultCostEvaluator, PlanningContext},
     },
@@ -43,63 +44,270 @@ use crate::{
     },
 };
 use berth_alloc_core::prelude::{Cost, TimePoint};
+use num_traits::ToPrimitive;
 use rand::seq::SliceRandom;
+use smallvec::SmallVec;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering as AtomicOrdering;
+use std::sync::{Arc, atomic::Ordering as AtomicOrdering};
 
-// (request_raw, berth_raw)
-type FeatureKey = (usize, usize);
-
-/// Wrap a base evaluator and add λ * penalty(feature) to the cost seen by operators.
-#[derive(Clone)]
-pub struct AugmentedCostEvaluator<B> {
-    base: B,
-    penalties: HashMap<FeatureKey, i64>,
-    lambda_cost: Cost,
+/// Generalized penalizable feature.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum Feature {
+    /// (request, berth)
+    RequestBerth { req: usize, berth: usize },
+    /// request only (vessel-scoped)
+    Request { req: usize },
+    /// berth only
+    Berth { berth: usize },
+    /// global time bucket
+    TimeBucket { tb: i64 },
+    /// (berth, time bucket)
+    BerthTime { berth: usize, tb: i64 },
+    /// (request, time bucket)
+    RequestTime { req: usize, tb: i64 },
 }
 
-impl<B> AugmentedCostEvaluator<B> {
-    pub fn new(base: B, penalties: HashMap<FeatureKey, i64>, lambda_cost: Cost) -> Self {
+/// Extracts all features “touched” by placing `request` at `(berth, start_time)`.
+pub trait FeatureExtractor<T> {
+    fn features_for(
+        &self,
+        request: RequestIndex,
+        berth: BerthIndex,
+        start_time: TimePoint<T>,
+        out: &mut SmallVec<[Feature; 6]>,
+    );
+}
+
+/// Configurable extractor using a caller-provided time bucketizer.
+#[derive(Clone)]
+pub struct DefaultFeatureExtractor<T, FBucket>
+where
+    FBucket: Fn(TimePoint<T>) -> i64 + Send + Sync + Clone,
+{
+    bucketizer: FBucket,
+    include_req_berth: bool,
+    include_request: bool,
+    include_berth: bool,
+    include_time: bool,
+    include_berth_time: bool,
+    include_req_time: bool,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T, FBucket> DefaultFeatureExtractor<T, FBucket>
+where
+    FBucket: Fn(TimePoint<T>) -> i64 + Send + Sync + Clone,
+{
+    pub fn new(bucketizer: FBucket) -> Self {
+        Self {
+            bucketizer,
+            include_req_berth: true,
+            include_request: false,
+            include_berth: false,
+            include_time: true,
+            include_berth_time: true,
+            include_req_time: false,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    pub fn set_include_req_berth(mut self, yes: bool) -> Self {
+        self.include_req_berth = yes;
+        self
+    }
+    pub fn set_include_request(mut self, yes: bool) -> Self {
+        self.include_request = yes;
+        self
+    }
+    pub fn set_include_berth(mut self, yes: bool) -> Self {
+        self.include_berth = yes;
+        self
+    }
+    pub fn set_include_time(mut self, yes: bool) -> Self {
+        self.include_time = yes;
+        self
+    }
+    pub fn set_include_berth_time(mut self, yes: bool) -> Self {
+        self.include_berth_time = yes;
+        self
+    }
+    pub fn set_include_req_time(mut self, yes: bool) -> Self {
+        self.include_req_time = yes;
+        self
+    }
+}
+
+impl<T, FBucket> FeatureExtractor<T> for DefaultFeatureExtractor<T, FBucket>
+where
+    FBucket: Fn(TimePoint<T>) -> i64 + Send + Sync + Clone,
+{
+    #[inline]
+    fn features_for(
+        &self,
+        req: RequestIndex,
+        berth: BerthIndex,
+        start_time: TimePoint<T>,
+        out: &mut SmallVec<[Feature; 6]>,
+    ) {
+        let r = req.get();
+        let b = berth.get();
+        let tb = (self.bucketizer)(start_time);
+
+        if self.include_req_berth {
+            out.push(Feature::RequestBerth { req: r, berth: b });
+        }
+        if self.include_request {
+            out.push(Feature::Request { req: r });
+        }
+        if self.include_berth {
+            out.push(Feature::Berth { berth: b });
+        }
+        if self.include_time {
+            out.push(Feature::TimeBucket { tb });
+        }
+        if self.include_berth_time {
+            out.push(Feature::BerthTime { berth: b, tb });
+        }
+        if self.include_req_time {
+            out.push(Feature::RequestTime { req: r, tb });
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DecayMode {
+    /// Multiply by num/den each outer round (integer arithmetic).
+    Multiplicative { num: u32, den: u32 },
+    /// Subtract constant (floored at 0).
+    Subtractive { step: i64 },
+}
+
+#[derive(Clone)]
+pub struct PenaltyStore {
+    map: HashMap<Feature, i64>,
+    decay: Option<DecayMode>,
+    max_penalty: i64,
+}
+
+impl Default for PenaltyStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PenaltyStore {
+    pub fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            decay: None,
+            max_penalty: i64::MAX / 4,
+        }
+    }
+    pub fn with_decay(mut self, d: DecayMode) -> Self {
+        self.decay = Some(d);
+        self
+    }
+    pub fn with_max_penalty(mut self, cap: i64) -> Self {
+        self.max_penalty = cap.max(1);
+        self
+    }
+
+    #[inline]
+    pub fn add_one(&mut self, f: Feature, step: i64) {
+        let e = self.map.entry(f).or_insert(0);
+        *e = (*e + step).min(self.max_penalty);
+    }
+
+    #[inline]
+    pub fn get(&self, f: &Feature) -> i64 {
+        *self.map.get(f).unwrap_or(&0)
+    }
+
+    #[inline]
+    pub fn sum<'a>(&self, feats: impl IntoIterator<Item = &'a Feature>) -> i64 {
+        let mut s = 0i64;
+        for f in feats {
+            s = s.saturating_add(self.get(f));
+        }
+        s
+    }
+
+    /// Apply decay once per outer round.
+    pub fn decay_once(&mut self) {
+        if let Some(d) = self.decay {
+            match d {
+                DecayMode::Multiplicative { num, den } => {
+                    if den == 0 || num >= den {
+                        return;
+                    }
+                    for v in self.map.values_mut() {
+                        if *v > 0 {
+                            *v = ((*v as i128 * num as i128) / den as i128) as i64;
+                        }
+                    }
+                }
+                DecayMode::Subtractive { step } => {
+                    for v in self.map.values_mut() {
+                        *v = (*v - step).max(0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AugmentedCostEvaluator<B, T, FX>
+where
+    FX: FeatureExtractor<T> + ?Sized,
+{
+    base: B,
+    penalties: PenaltyStore,
+    lambda_cost: Cost,
+    feats: Arc<FX>,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<B, T, FX> AugmentedCostEvaluator<B, T, FX>
+where
+    FX: FeatureExtractor<T> + ?Sized,
+{
+    pub fn new(base: B, penalties: PenaltyStore, lambda_cost: Cost, feats: Arc<FX>) -> Self {
         Self {
             base,
             penalties,
             lambda_cost,
+            feats,
+            _phantom: std::marker::PhantomData,
         }
-    }
-
-    #[inline]
-    fn feature_key(req: RequestIndex, berth: BerthIndex) -> FeatureKey {
-        (req.get(), berth.get())
     }
 }
 
-impl<T, B> CostEvaluator<T> for AugmentedCostEvaluator<B>
+impl<Tnum, B, FX> CostEvaluator<Tnum> for AugmentedCostEvaluator<B, Tnum, FX>
 where
-    T: Copy + Ord,
-    B: CostEvaluator<T>,
+    Tnum: Copy + Ord,
+    B: CostEvaluator<Tnum>,
+    FX: FeatureExtractor<Tnum> + ?Sized,
 {
     fn eval<'m>(
         &self,
-        model: &SolverModel<'m, T>,
+        model: &SolverModel<'m, Tnum>,
         request: RequestIndex,
-        start_time: TimePoint<T>,
+        start_time: TimePoint<Tnum>,
         berth_index: BerthIndex,
     ) -> Option<Cost> {
         let base = self.base.eval(model, request, start_time, berth_index)?;
-        let pen = *self
-            .penalties
-            .get(&Self::feature_key(request, berth_index))
-            .unwrap_or(&0) as Cost;
-        Some(base.saturating_add(self.lambda_cost.saturating_mul(pen)))
+        let mut buf: SmallVec<[Feature; 6]> = SmallVec::new();
+        self.feats
+            .features_for(request, berth_index, start_time, &mut buf);
+        let pen_sum = self.penalties.sum(buf.iter()) as Cost;
+        Some(base.saturating_add(self.lambda_cost.saturating_mul(pen_sum)))
     }
 }
 
-/// GLS acceptance on the augmented objective:
-/// lexicographic on (unassigned_requests, augmented_cost).
 trait AugmentedAcceptor {
     #[allow(dead_code)]
     fn name(&self) -> &str;
-
     fn accept_aug(
         &self,
         cur_unassigned: usize,
@@ -111,12 +319,10 @@ trait AugmentedAcceptor {
 
 #[derive(Debug, Default, Clone)]
 struct GlsLexStrictAcceptor;
-
 impl AugmentedAcceptor for GlsLexStrictAcceptor {
     fn name(&self) -> &str {
         "GlsLexStrictAcceptor"
     }
-
     #[inline]
     fn accept_aug(
         &self,
@@ -130,38 +336,38 @@ impl AugmentedAcceptor for GlsLexStrictAcceptor {
     }
 }
 
-/// Sum penalties for all assigned (request, berth) pairs in a state.
 #[inline]
-fn penalty_sum_for_state<T>(state: &SolverState<'_, T>, penalties: &HashMap<FeatureKey, i64>) -> i64
-where
-    T: Copy + Ord,
-{
-    let mut sum: i64 = 0;
-    for (i, dv) in state.decision_variables().iter().enumerate() {
-        if let DecisionVar::Assigned(Decision { berth_index, .. }) = *dv {
-            let key = (i, berth_index.get());
-            sum = sum.saturating_add(*penalties.get(&key).unwrap_or(&0));
-        }
-    }
-    sum
-}
-
-/// Compute base_cost + λ * penalty_sum(state).
-#[inline]
-fn augmented_cost_of_state<T>(
+fn augmented_cost_of_state<T, FX>(
     state: &SolverState<'_, T>,
-    penalties: &HashMap<FeatureKey, i64>,
+    feats: &FX,
+    store: &PenaltyStore,
     lambda_cost: Cost,
 ) -> Cost
 where
     T: Copy + Ord,
+    FX: FeatureExtractor<T> + ?Sized,
 {
-    let p = penalty_sum_for_state(state, penalties) as Cost;
+    let mut buf: SmallVec<[Feature; 6]> = SmallVec::new();
+    let mut p_sum: i64 = 0;
+
+    for (i, dv) in state.decision_variables().iter().enumerate() {
+        if let DecisionVar::Assigned(Decision {
+            berth_index,
+            start_time,
+        }) = *dv
+        {
+            buf.clear();
+            feats.features_for(RequestIndex::new(i), berth_index, start_time, &mut buf);
+            p_sum = p_sum.saturating_add(store.sum(buf.iter()));
+        }
+    }
     state
         .fitness()
         .cost
-        .saturating_add(lambda_cost.saturating_mul(p))
+        .saturating_add(lambda_cost.saturating_mul(p_sum as Cost))
 }
+
+// =============== Strategy ===============
 
 #[derive(Clone, Copy)]
 pub enum HardRefetchMode {
@@ -169,13 +375,21 @@ pub enum HardRefetchMode {
     Always,
 }
 
-pub struct GuidedLocalSearchStrategy<T, R>
+pub struct GuidedLocalSearchStrategy<T, R, FX>
 where
     T: SolveNumeric,
     R: rand::Rng,
+    FX: FeatureExtractor<T> + ?Sized,
 {
-    // Operators run against the augmented evaluator
-    local_ops: Vec<Box<dyn LocalMoveOperator<T, AugmentedCostEvaluator<DefaultCostEvaluator>, R>>>,
+    // Operators (evaluated on augmented costs)
+    #[allow(clippy::type_complexity)]
+    local_ops: Vec<
+        Box<
+            dyn LocalMoveOperator<T, AugmentedCostEvaluator<DefaultCostEvaluator, T, FX>, R>
+                + Send
+                + Sync,
+        >,
+    >,
 
     // GLS parameters
     lambda: i64,
@@ -184,8 +398,9 @@ where
     pulse_top_k: usize,
     max_local_steps: usize,
 
-    // Penalty store
-    penalties: HashMap<FeatureKey, i64>,
+    // Penalty store & extractor
+    penalty_store: PenaltyStore,
+    feature_extractor: Arc<FX>,
 
     // Acceptance
     gls_acceptor: GlsLexStrictAcceptor, // augmented objective
@@ -202,22 +417,13 @@ where
     kick_steps_on_reset: usize,
 }
 
-impl<T, R> Default for GuidedLocalSearchStrategy<T, R>
+impl<T, R, FX> GuidedLocalSearchStrategy<T, R, FX>
 where
     T: SolveNumeric,
     R: rand::Rng,
+    FX: FeatureExtractor<T> + ?Sized,
 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<T, R> GuidedLocalSearchStrategy<T, R>
-where
-    T: SolveNumeric,
-    R: rand::Rng,
-{
-    pub fn new() -> Self {
+    pub fn new(feature_extractor: Arc<FX>) -> Self {
         Self {
             local_ops: Vec::new(),
             lambda: 4,
@@ -225,7 +431,9 @@ where
             stagnation_rounds_before_pulse: 16,
             pulse_top_k: 8,
             max_local_steps: 512,
-            penalties: HashMap::new(),
+            penalty_store: PenaltyStore::new()
+                .with_decay(DecayMode::Multiplicative { num: 9, den: 10 }),
+            feature_extractor,
             gls_acceptor: GlsLexStrictAcceptor,
             true_acceptor: LexStrictAcceptor,
             refetch_after_stale: 128,
@@ -239,13 +447,21 @@ where
 
     pub fn with_local_op(
         mut self,
-        op: Box<dyn LocalMoveOperator<T, AugmentedCostEvaluator<DefaultCostEvaluator>, R>>,
+        op: Box<
+            dyn LocalMoveOperator<T, AugmentedCostEvaluator<DefaultCostEvaluator, T, FX>, R>
+                + Send
+                + Sync,
+        >,
     ) -> Self {
         self.local_ops.push(op);
         self
     }
     pub fn with_lambda(mut self, lambda: i64) -> Self {
         self.lambda = lambda;
+        self
+    }
+    pub fn with_penalty_step(mut self, step: i64) -> Self {
+        self.penalty_step = step;
         self
     }
     pub fn with_max_local_steps(mut self, steps: usize) -> Self {
@@ -274,6 +490,19 @@ where
     }
     pub fn with_kick_steps_on_reset(mut self, k: usize) -> Self {
         self.kick_steps_on_reset = k;
+        self
+    }
+    pub fn with_decay(mut self, d: DecayMode) -> Self {
+        self.penalty_store = self.penalty_store.clone().with_decay(d);
+        self
+    }
+    pub fn with_max_penalty(mut self, cap: i64) -> Self {
+        self.penalty_store = self.penalty_store.clone().with_max_penalty(cap);
+        self
+    }
+    pub fn with_pulse_params(mut self, stagnation_rounds: usize, top_k: usize) -> Self {
+        self.stagnation_rounds_before_pulse = stagnation_rounds.max(1);
+        self.pulse_top_k = top_k.max(1);
         self
     }
 
@@ -357,9 +586,9 @@ where
 
     /// Reset local climb state around `current` and optionally apply a few random kick moves
     /// using the *augmented* evaluator (penalties preserved).
-    fn reset_state<'m, 'p>(
+    fn reset_state<'p>(
         &self,
-        model: &'m SolverModel<'p, T>,
+        model: &SolverModel<'p, T>,
         rng: &mut R,
         dv_buf: &mut [DecisionVar<T>],
         current: &mut SolverState<'p, T>,
@@ -371,8 +600,9 @@ where
         if self.kick_steps_on_reset > 0 {
             let aug_eval = AugmentedCostEvaluator::new(
                 DefaultCostEvaluator,
-                self.penalties.clone(),
+                self.penalty_store.clone(),
                 self.lambda as Cost,
+                self.feature_extractor.clone(), // cheap Arc clone
             );
             for _ in 0..self.kick_steps_on_reset {
                 let mut order: Vec<usize> = (0..self.local_ops.len()).collect();
@@ -401,10 +631,11 @@ where
     }
 }
 
-impl<T, R> SearchStrategy<T, R> for GuidedLocalSearchStrategy<T, R>
+impl<T, R, FX> SearchStrategy<T, R> for GuidedLocalSearchStrategy<T, R, FX>
 where
     T: SolveNumeric,
     R: rand::Rng,
+    FX: FeatureExtractor<T> + Send + Sync + 'static + ?Sized,
 {
     fn name(&self) -> &str {
         "Guided Local Search"
@@ -419,13 +650,9 @@ where
             return;
         }
 
-        // Two states:
-        // - `current`: hill-climbs on augmented objective (can worsen true objective)
-        // - `best_true`: best by true objective; only this is published.
         let mut current: SolverState<'p, T> = context.shared_incumbent().snapshot();
         let mut best_true: SolverState<'p, T> = current.clone();
 
-        // Scratch DV buffer for PlanningContext.
         let mut dv_buf: Vec<DecisionVar<T>> =
             vec![DecisionVar::unassigned(); model.flexible_requests_len()];
 
@@ -438,7 +665,10 @@ where
             }
             outer_rounds = outer_rounds.saturating_add(1);
 
-            // Periodic refetch (ILS-style). If we do refetch, optionally reset local climb.
+            // time decay
+            self.penalty_store.decay_once();
+
+            // periodic refetch
             if self.periodic_refetch(&mut current, &mut best_true, context, outer_rounds)
                 && self.reset_on_refetch
             {
@@ -454,11 +684,12 @@ where
 
             let mut accepted_any = false;
 
-            // Fresh augmented evaluator view for this round.
+            // snapshot augmented evaluator for this round
             let aug_eval = AugmentedCostEvaluator::new(
                 DefaultCostEvaluator,
-                self.penalties.clone(),
+                self.penalty_store.clone(),
                 self.lambda as Cost,
+                self.feature_extractor.clone(), // cheap Arc clone
             );
 
             for _ in 0..self.max_local_steps {
@@ -466,7 +697,6 @@ where
                     break 'outer;
                 }
 
-                // Shuffle local operator order each step.
                 let mut order: Vec<usize> = (0..self.local_ops.len()).collect();
                 order.shuffle(context.rng());
 
@@ -474,8 +704,6 @@ where
 
                 for &i in &order {
                     let op = &self.local_ops[i];
-
-                    // Operators "see" augmented costs via aug_eval.
                     let mut pc =
                         PlanningContext::new(model, &current, &aug_eval, dv_buf.as_mut_slice());
 
@@ -483,11 +711,19 @@ where
                         let mut cand = current.clone();
                         cand.apply_plan(plan);
 
-                        // Decide with GLS acceptor on augmented objective.
-                        let cur_aug =
-                            augmented_cost_of_state(&current, &self.penalties, self.lambda as Cost);
-                        let cand_aug =
-                            augmented_cost_of_state(&cand, &self.penalties, self.lambda as Cost);
+                        // GLS acceptor on augmented objective
+                        let cur_aug = augmented_cost_of_state(
+                            &current,
+                            self.feature_extractor.as_ref(),
+                            &self.penalty_store,
+                            self.lambda as Cost,
+                        );
+                        let cand_aug = augmented_cost_of_state(
+                            &cand,
+                            self.feature_extractor.as_ref(),
+                            &self.penalty_store,
+                            self.lambda as Cost,
+                        );
 
                         let cur_unassigned = current.fitness().unassigned_requests;
                         let cand_unassigned = cand.fitness().unassigned_requests;
@@ -508,7 +744,6 @@ where
                                 best_true = current.clone();
                                 let _ = context.shared_incumbent().try_update(&best_true);
 
-                                // Restart around the just-published best, but KEEP penalties.
                                 if self.restart_on_publish {
                                     current = best_true.clone();
                                     self.reset_state(
@@ -524,7 +759,7 @@ where
 
                             step_taken = true;
                             accepted_any = true;
-                            break; // restart climb from new state
+                            break; // restart local climb from new state
                         }
                     }
                 }
@@ -538,14 +773,15 @@ where
                 stale = stale.saturating_add(1);
 
                 if stale >= self.stagnation_rounds_before_pulse {
-                    // Pulse penalties on highest-utility features (computed on base cost).
+                    // Build utilities per FEATURE on base evaluator.
                     let base_eval = DefaultCostEvaluator;
                     let mut pc =
                         PlanningContext::new(model, &current, &base_eval, dv_buf.as_mut_slice());
 
-                    // Collect utilities and bump top-k penalties.
-                    let utils = pc.builder().with_explorer(|ex| {
-                        let mut tmp: Vec<(FeatureKey, i64)> = Vec::new();
+                    let mut util_by_feature: HashMap<Feature, i128> = HashMap::new();
+
+                    pc.builder().with_explorer(|ex| {
+                        let mut feats_buf: SmallVec<[Feature; 6]> = SmallVec::new();
                         for (i, dv) in ex.decision_vars().iter().enumerate() {
                             if let DecisionVar::Assigned(Decision {
                                 berth_index,
@@ -554,26 +790,38 @@ where
                                 && let Some(base) =
                                     ex.peek_cost(RequestIndex::new(i), start_time, berth_index)
                             {
-                                let key = (i, berth_index.get());
-                                let p = *self.penalties.get(&key).unwrap_or(&0);
-                                // GLS proxy: utility = base_cost / (1 + penalty)
-                                let util = base / (1 + p) as Cost;
-                                tmp.push((key, util));
+                                feats_buf.clear();
+                                self.feature_extractor.features_for(
+                                    RequestIndex::new(i),
+                                    berth_index,
+                                    start_time,
+                                    &mut feats_buf,
+                                );
+                                for f in feats_buf.iter().cloned() {
+                                    let p = *self.penalty_store.map.get(&f).unwrap_or(&0) as i128;
+                                    // GLS proxy utility: higher base & lower current penalty -> higher utility
+                                    let u = (base as i128) / (1 + p);
+                                    *util_by_feature.entry(f).or_insert(0) += u;
+                                }
                             }
                         }
-                        tmp.sort_by_key(|&(_, util)| -util); // descending
-                        tmp
                     });
 
-                    for (idx, (key, _)) in utils.into_iter().enumerate() {
-                        if idx >= self.pulse_top_k {
+                    let mut items: Vec<(Feature, i128)> = util_by_feature.into_iter().collect();
+                    items.sort_by_key(|&(_, u)| -u);
+                    for (rank, (f, _)) in items.into_iter().enumerate() {
+                        if rank >= self.pulse_top_k {
                             break;
                         }
-                        *self.penalties.entry(key).or_insert(0) += self.penalty_step;
+                        self.penalty_store.add_one(f, self.penalty_step);
                     }
 
                     stale = 0;
-                    tracing::trace!("GLS: penalty pulse (top_k={})", self.pulse_top_k);
+                    tracing::trace!(
+                        "GLS: penalty pulse (top_k={}, step={})",
+                        self.pulse_top_k,
+                        self.penalty_step
+                    );
                 } else if self.stale_refetch(&mut current, &mut best_true, context, stale)
                     && self.reset_on_refetch
                 {
@@ -596,23 +844,45 @@ where
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub fn gls_strategy<T, R>(
-    _: &crate::model::solver_model::SolverModel<T>,
-) -> GuidedLocalSearchStrategy<T, R>
+    _model: &crate::model::solver_model::SolverModel<T>,
+) -> GuidedLocalSearchStrategy<T, R, DefaultFeatureExtractor<T, fn(TimePoint<T>) -> i64>>
 where
-    T: SolveNumeric + From<i32>,
+    T: SolveNumeric + ToPrimitive + Copy + From<i32>,
     R: rand::Rng,
 {
-    GuidedLocalSearchStrategy::new()
+    // Coerce the non-capturing closure to a function pointer (`fn`).
+    let bucketizer: fn(TimePoint<T>) -> i64 = |t: TimePoint<T>| -> i64 {
+        let v_i64 = t
+            .value()
+            .to_i64()
+            .expect("TimePoint<T>::value() must be convertible to i64 for bucketing");
+        v_i64 / 90
+    };
+
+    let feats = DefaultFeatureExtractor::new(bucketizer)
+        .set_include_req_berth(true)
+        .set_include_time(true)
+        .set_include_berth_time(true)
+        .set_include_req_time(true)
+        .set_include_berth(true)
+        .set_include_request(true);
+
+    let feats_arc = std::sync::Arc::new(feats);
+
+    GuidedLocalSearchStrategy::new(feats_arc)
         .with_lambda(4)
         .with_max_local_steps(1024)
         .with_refetch_after_stale(128)
         .with_hard_refetch_every(0)
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
-        .with_restart_on_publish(true) // restart around new best (penalties kept)
-        .with_reset_on_refetch(true) // reset after refetch (penalties kept)
-        .with_kick_steps_on_reset(3) // small diversification after reset
-        // Local improvement operators (evaluated on augmented costs)
+        .with_restart_on_publish(true)
+        .with_reset_on_refetch(true)
+        .with_kick_steps_on_reset(3)
+        .with_decay(DecayMode::Multiplicative { num: 9, den: 10 })
+        .with_penalty_step(1)
+        .with_max_penalty(1_000_000_000)
         .with_local_op(Box::new(ShiftEarlierOnSameBerth {
             number_of_candidates_to_try_range: 8..=24,
         }))
@@ -626,4 +896,8 @@ where
             number_of_pair_attempts_to_try_range: 12..=48,
         }))
         .with_local_op(Box::new(OrOptBlockRelocate::new(2..=4, 1.4..=2.0)))
+        .with_local_op(Box::new(RelocateSingleBestAllowWorsening::new(2..=4)))
+        .with_local_op(Box::new(RandomRelocateAnywhere::new(2..=4)))
+        .with_local_op(Box::new(HillClimbRelocateBest::new(12..=36)))
+        .with_local_op(Box::new(HillClimbBestSwapSameBerth::new(24..=72)))
 }

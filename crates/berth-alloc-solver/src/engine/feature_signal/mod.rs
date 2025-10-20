@@ -19,15 +19,12 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod acceptor;
-pub mod feature_signal;
-pub mod gls;
-pub mod greedy_opening;
-pub mod ils;
-pub mod neighbors;
-pub mod opening;
-pub mod sa;
-pub mod search;
-pub mod shared_incumbent;
-pub mod solver_engine;
-pub mod tabu;
+pub mod augmented;
+pub mod features;
+pub mod penalty;
+
+pub mod prelude {
+    pub use super::augmented::{AugmentedCostEvaluator, augmented_cost_of_state};
+    pub use super::features::{DefaultFeatureExtractor, Feature, FeatureExtractor};
+    pub use super::penalty::{DecayMode, PenaltyStore};
+}

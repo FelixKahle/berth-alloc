@@ -22,7 +22,12 @@
 use berth_alloc_model::prelude::{Problem, SolutionView};
 use berth_alloc_model::problem::loader::ProblemLoader;
 use berth_alloc_solver::engine::solver_engine::SolverEngineBuilder;
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
 
@@ -79,29 +84,84 @@ fn enable_tracing() {
         .init();
 }
 
+#[derive(Serialize)]
+struct RunRecord {
+    iteration: usize, // 1-based
+    filename: String,
+    start_ts: DateTime<Utc>, // RFC3339 via chrono (serde)
+    end_ts: DateTime<Utc>,   // RFC3339 via chrono (serde)
+    runtime_ms: u128,
+    cost: Option<i64>, // None if infeasible / failed
+}
+
 fn main() {
     enable_tracing();
 
-    for (problem, file) in instances().take(1) {
+    let mut results: Vec<RunRecord> = Vec::new();
+
+    for (iter, (problem, file)) in instances().enumerate() {
+        let iteration = iter + 1;
+
         tracing::info!(
-            "Solving problem {} with {} berths and {} vessels",
+            "Solving [{}] {} with {} berths and {} vessels",
+            iteration,
             file,
             problem.berths().len(),
             problem.flexible_requests().len()
         );
 
+        let start_ts = Utc::now();
+        let t0 = Instant::now();
+
         let mut solver = SolverEngineBuilder::<i64>::default().build();
-        match solver.solve(&problem) {
+        let outcome = solver.solve(&problem);
+
+        let runtime = t0.elapsed();
+        let end_ts = Utc::now();
+
+        let cost_opt = match outcome {
             Ok(Some(solution)) => {
+                let c = solution.cost();
                 tracing::info!(
-                    "Solver finished on problem {}: cost={}",
+                    "Finished [{}] {}: cost={}, runtime={:?}",
+                    iteration,
                     file,
-                    solution.cost()
+                    c,
+                    runtime
                 );
+                Some(c)
             }
             _ => {
-                tracing::error!("Solver failed on problem {}", file);
+                tracing::error!("Failed [{}] {}: runtime={:?}", iteration, file, runtime);
+                None
             }
+        };
+
+        results.push(RunRecord {
+            iteration,
+            filename: file,
+            start_ts,
+            end_ts,
+            runtime_ms: runtime.as_millis(),
+            cost: cost_opt,
+        });
+    }
+
+    // Persist as pretty JSON
+    let out_path = PathBuf::from("solver_results.json");
+    match File::create(&out_path).and_then(|mut f| {
+        let json = serde_json::to_string_pretty(&results).expect("serialize results");
+        f.write_all(json.as_bytes())
+    }) {
+        Ok(()) => {
+            tracing::info!(
+                "Wrote {} run record(s) to {}",
+                results.len(),
+                out_path.display()
+            );
+        }
+        Err(e) => {
+            tracing::error!("Failed to write results to {}: {}", out_path.display(), e);
         }
     }
 }

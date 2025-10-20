@@ -39,3 +39,6 @@ berth_alloc_model = { path = "../berth-alloc-model" }
 berth_alloc_solver = { path = "../berth-alloc-solver" }
 tracing = { version = "0.1.41", default-features = false, features = ["std", "attributes", "release_max_level_debug"] }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+chrono = { version = "0.4.42", features = ["serde"] }
