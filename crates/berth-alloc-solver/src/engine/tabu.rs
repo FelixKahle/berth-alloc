@@ -1,5 +1,3 @@
-// crates/berth-alloc-solver/src/engine/tabu.rs
-
 // Copyright (c) 2025 Felix Kahle.
 //
 // Permission is hereby granted, free of charge, to any person obtaining

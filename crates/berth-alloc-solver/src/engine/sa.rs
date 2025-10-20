@@ -1,7 +1,4 @@
-// src/search/strategy_sa.rs
-
 // Copyright (c) 2025 Felix Kahle.
-// MIT License
 //
 // Permission is hereby granted, free of charge, to any person obtaining
 // a copy of this software and associated documentation files (the
