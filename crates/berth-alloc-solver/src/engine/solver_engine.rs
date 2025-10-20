@@ -59,7 +59,7 @@ impl Default for SolverEngineConfig {
             num_workers: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1),
-            time_limit: std::time::Duration::from_secs(60),
+            time_limit: std::time::Duration::from_secs(30),
         }
     }
 }
@@ -183,57 +183,58 @@ where
             {
                 match k {
                     Kind::Ils => {
+                        // Neighbor-wired ILS baseline; we just randomize/tune knobs.
                         let mut s = ils::ils_strategy::<Tnum, ChaCha8Rng>(model);
 
-                        // Randomize local budget: either fixed or a range
-                        if rng.random_bool(0.5) {
-                            let max_steps = rng.random_range(600..=1400);
+                        // Local budget: wider, slightly heavier tail for these instance sizes.
+                        if rng.random_bool(0.25) {
+                            let max_steps = rng.random_range(900..=1700);
                             s = s.with_max_local_steps(max_steps);
                         } else {
-                            let lo = rng.random_range(400..=900);
-                            let hi = rng.random_range((lo + 50)..=(lo + 600));
+                            let lo = rng.random_range(600..=1100);
+                            let hi = rng.random_range((lo + 100)..=(lo + 700));
                             s = s.with_local_steps_range(lo..=hi);
                         }
 
                         // Acceptance tweaks
-                        let sideways = rng.random_bool(0.4); // sometimes allow equal-cost “plateau” moves
+                        let sideways = rng.random_bool(0.5); // allow plateau moves about half the time
                         s = s.with_local_sideways(sideways);
 
-                        // Small chance to allow random worsening moves in Phase A
-                        if rng.random_bool(0.35) {
-                            // tiny to modest probability
-                            let p = rng.random_range(0.02_f64..=0.10);
+                        // Small chance to allow random worsening moves in Phase A (diversification)
+                        if rng.random_bool(0.40) {
+                            let p = rng.random_range(0.02_f64..=0.12);
                             s = s.with_local_worsening_prob(p);
                         }
 
                         // Shuffle policy (per step vs per round)
-                        s = s.with_shuffle_local_each_step(rng.random_bool(0.7));
+                        s = s.with_shuffle_local_each_step(rng.random_bool(0.75));
 
                         // Cap attempts for perturbation phases (destroy/repair)
-                        if rng.random_bool(0.6) {
-                            s = s.with_destroy_attempts(rng.random_range(1..=3));
+                        if rng.random_bool(0.65) {
+                            s = s.with_destroy_attempts(rng.random_range(18..=36));
                         }
-                        if rng.random_bool(0.6) {
-                            s = s.with_repair_attempts(rng.random_range(1..=3));
+                        if rng.random_bool(0.65) {
+                            s = s.with_repair_attempts(rng.random_range(18..=36));
                         }
 
-                        // Refetch policies
-                        if rng.random_bool(0.5) {
-                            s = s.with_refetch_after_stale(rng.random_range(64..=192));
+                        // Refetch policies (to escape local stagnation)
+                        if rng.random_bool(0.55) {
+                            s = s.with_refetch_after_stale(rng.random_range(96..=224));
                         }
-                        if rng.random_bool(0.25) {
-                            s = s.with_hard_refetch_every(rng.random_range(12..=48));
+                        if rng.random_bool(0.30) {
+                            s = s.with_hard_refetch_every(rng.random_range(16..=56));
                         }
 
                         Box::new(s)
                     }
+
                     Kind::Tabu => {
-                        // Randomize tenure, steps, samples, and restart behavior a bit.
-                        let lo = rng.random_range(10..=20);
-                        let hi = rng.random_range(24..=40).max(lo + 1);
-                        let steps = rng.random_range(512..=1400);
-                        let samples = rng.random_range(48..=120);
-                        let restart_on_publish = rng.random_bool(0.7);
+                        // Neighbor-wired TABU baseline; tune tenure/steps/samples and restart behavior.
+                        let lo = rng.random_range(16..=22);
+                        let hi = rng.random_range(28..=40).max(lo + 2);
+                        let steps = rng.random_range(700..=1600);
+                        let samples = rng.random_range(72..=128);
+                        let restart_on_publish = rng.random_bool(0.75);
                         let reset_on_refetch = rng.random_bool(0.9);
                         let kick = rng.random_range(2..=6);
 
@@ -245,26 +246,31 @@ where
                             .with_reset_on_refetch(reset_on_refetch)
                             .with_kick_steps_on_reset(kick);
 
-                        // Occasionally add periodic refetch
-                        if rng.random_bool(0.35) {
-                            let every = rng.random_range(15..=50);
-                            s = s.with_hard_refetch_every(every);
+                        // Periodic refetch can help when tenure is long.
+                        if rng.random_bool(0.40) {
+                            s = s.with_hard_refetch_every(rng.random_range(18..=54));
                         }
+                        // Staleness-based refetch
+                        if rng.random_bool(0.50) {
+                            s = s.with_refetch_after_stale(rng.random_range(112..=256));
+                        }
+
                         Box::new(s)
                     }
+
                     Kind::Sa => {
-                        // Randomize cooling/temperature/steps and acceptance targets.
-                        let init_t = rng.random_range(0.8_f64..=1.6);
-                        let cooling = rng.random_range(0.996_f64..=0.999);
-                        let steps = rng.random_range(160..=420);
-                        let low = rng.random_range(0.08_f64..=0.18);
-                        let high = rng.random_range(0.40_f64..=0.60).max(low + 0.05);
-                        let ema = rng.random_range(0.12_f64..=0.30);
+                        // Neighbor-wired SA baseline; tune cooling/temperature/steps and acceptance targets.
+                        let init_t = rng.random_range(0.9_f64..=1.6);
+                        let cooling = rng.random_range(0.9965_f64..=0.9992);
+                        let steps = rng.random_range(220..=440);
+                        let low = rng.random_range(0.10_f64..=0.18);
+                        let high = rng.random_range(0.45_f64..=0.62).max(low + 0.07);
+                        let ema = rng.random_range(0.15_f64..=0.30);
                         let reheat = [0.0, 0.6, 1.0, 8.0].choose(rng).copied().unwrap_or(1.0);
-                        let big_m = [900_000_000_i64, 1_200_000_000, 1_500_000_000]
+                        let big_m = [1_000_000_000_i64, 1_250_000_000, 1_500_000_000]
                             .choose(rng)
                             .copied()
-                            .unwrap_or(1_200_000_000);
+                            .unwrap_or(1_250_000_000);
 
                         let mut s = sa::sa_strategy::<Tnum, ChaCha8Rng>(model)
                             .with_init_temp(init_t)
@@ -275,36 +281,37 @@ where
                             .with_reheat_factor(reheat)
                             .with_big_m_for_energy(big_m);
 
-                        // Sometimes set periodic refetch for SA too
-                        if rng.random_bool(0.30) {
-                            s = s.with_hard_refetch_every(rng.random_range(12..=40));
+                        // Periodic refetch & staleness refetch
+                        if rng.random_bool(0.35) {
+                            s = s.with_hard_refetch_every(rng.random_range(14..=40));
                         }
-                        // And/or staleness refetch
-                        if rng.random_bool(0.60) {
-                            s = s.with_refetch_after_stale(rng.random_range(48..=160));
+                        if rng.random_bool(0.65) {
+                            s = s.with_refetch_after_stale(rng.random_range(64..=192));
                         }
+
                         Box::new(s)
                     }
+
                     // inside make_one_variant(), in Kind::Gls arm (replace that arm)
                     Kind::Gls => {
-                        // Randomize lambda, decay, pulse parameters and refetch/reset knobs.
-                        let lambda = [3_i64, 4, 5, 6].choose(rng).copied().unwrap_or(4);
-                        let step = [1_i64, 1, 2].choose(rng).copied().unwrap_or(1);
-                        let max_steps = rng.random_range(800..=1800);
-                        let top_k = rng.random_range(6..=14);
+                        // Neighbor-wired GLS baseline; randomize lambda/decay/pulse and refetch/reset knobs.
+                        let lambda = [4_i64, 5, 6].choose(rng).copied().unwrap_or(5);
+                        let step = [1_i64, 2].choose(rng).copied().unwrap_or(1);
+                        let max_steps = rng.random_range(1000..=2200);
+                        let top_k = rng.random_range(8..=16);
                         let stagnation = rng.random_range(12..=24);
-                        let decay = if rng.random_bool(0.8) {
-                            // multiplicative decay 85–95%
+                        let decay = if rng.random_bool(0.85) {
+                            // multiplicative decay 88–95%
                             let den = 100u32;
-                            let keep = rng.random_range(85u32..=95);
+                            let keep = rng.random_range(88u32..=95);
                             gls::DecayMode::Multiplicative { num: keep, den }
                         } else {
                             gls::DecayMode::Subtractive {
-                                step: rng.random_range(1_i64..=3),
+                                step: rng.random_range(1_i64..=2),
                             }
                         };
-                        let restart_on_publish = rng.random_bool(0.85);
-                        let reset_on_refetch = rng.random_bool(0.85);
+                        let restart_on_publish = rng.random_bool(0.9);
+                        let reset_on_refetch = rng.random_bool(0.9);
                         let kick = rng.random_range(2..=6);
 
                         let mut s = gls::gls_strategy::<Tnum, ChaCha8Rng>(model)
@@ -317,14 +324,13 @@ where
                             .with_kick_steps_on_reset(kick)
                             .with_max_penalty(1_000_000_000);
 
-                        // If your GLS exposes this:
                         s = s.with_pulse_params(stagnation, top_k);
 
-                        if rng.random_bool(0.35) {
-                            s = s.with_hard_refetch_every(rng.random_range(10..=36));
+                        if rng.random_bool(0.40) {
+                            s = s.with_hard_refetch_every(rng.random_range(12..=40));
                         }
-                        if rng.random_bool(0.60) {
-                            s = s.with_refetch_after_stale(rng.random_range(96..=192));
+                        if rng.random_bool(0.65) {
+                            s = s.with_refetch_after_stale(rng.random_range(96..=224));
                         }
 
                         Box::new(s)

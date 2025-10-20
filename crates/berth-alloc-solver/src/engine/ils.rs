@@ -534,57 +534,69 @@ where
     T: SolveNumeric + From<i32>,
     R: rand::Rng,
 {
-    // Neighbor scopes
     let proximity_map = model.proximity_map();
     let neighbors_any = neighbors::any(proximity_map);
     let neighbors_direct_competitors = neighbors::direct_competitors(proximity_map);
     let neighbors_same_berth = neighbors::same_berth(proximity_map);
 
-    // Tuned default; new tuners may override per portfolio variant
+    // Tuned for ~20 berths / ~250 ships / PT 20–120
     IteratedLocalSearchStrategy::new()
         // cadence & refetch
-        .with_max_local_steps(1024)
-        .with_refetch_after_stale(128)
+        .with_max_local_steps(1400) // allow compound moves to settle
+        .with_refetch_after_stale(160) // slightly slower stale refresh
         .with_hard_refetch_every(0)
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
-        // optional tuners (defaults shown)
         .with_shuffle_local_each_step(true)
         // ------------------------- Phase A: Local improvement -------------------------
-        .with_local_op(Box::new(ShiftEarlierOnSameBerth {
-            number_of_candidates_to_try_range: 8..=24,
-        }))
-        .with_local_op(Box::new(RelocateSingleBest {
-            number_of_candidates_to_try_range: 8..=24,
-        }))
-        .with_local_op(Box::new(SwapPairSameBerth {
-            number_of_pair_attempts_to_try_range: 10..=40,
-        }))
-        .with_local_op(Box::new(CrossExchangeAcrossBerths {
-            number_of_pair_attempts_to_try_range: 12..=48,
-        }))
-        .with_local_op(Box::new(OrOptBlockRelocate::new(
-            2..=4,     // block length to relocate
-            1.4..=2.0, // RCL alpha (seed bias)
-        )))
-        .with_local_op(Box::new(RelocateSingleBestAllowWorsening::new(2..=4)))
-        .with_local_op(Box::new(RandomRelocateAnywhere::new(2..=4)))
-        .with_local_op(Box::new(HillClimbRelocateBest::new(12..=36)))
-        .with_local_op(Box::new(HillClimbBestSwapSameBerth::new(24..=72)))
+        .with_local_op(Box::new(
+            ShiftEarlierOnSameBerth::new(12..=32).with_neighbors(neighbors_same_berth.clone()),
+        ))
+        .with_local_op(Box::new(
+            RelocateSingleBest::new(12..=32).with_neighbors(neighbors_direct_competitors.clone()),
+        ))
+        .with_local_op(Box::new(
+            SwapPairSameBerth::new(24..=72).with_neighbors(neighbors_same_berth.clone()),
+        ))
+        .with_local_op(Box::new(
+            CrossExchangeAcrossBerths::new(24..=64)
+                .with_neighbors(neighbors_direct_competitors.clone()),
+        ))
+        .with_local_op(Box::new(
+            OrOptBlockRelocate::new(
+                2..=5,     // relocate block size (2–5 works well at this scale)
+                1.4..=2.0, // RCL alpha
+            )
+            .with_neighbors(neighbors_same_berth.clone()),
+        ))
+        .with_local_op(Box::new(
+            RelocateSingleBestAllowWorsening::new(8..=20)
+                .with_neighbors(neighbors_direct_competitors.clone()),
+        ))
+        .with_local_op(Box::new(
+            RandomRelocateAnywhere::new(8..=20).with_neighbors(neighbors_any.clone()),
+        ))
+        .with_local_op(Box::new(
+            HillClimbRelocateBest::new(16..=48)
+                .with_neighbors(neighbors_direct_competitors.clone()),
+        ))
+        .with_local_op(Box::new(
+            HillClimbBestSwapSameBerth::new(32..=96).with_neighbors(neighbors_same_berth.clone()),
+        ))
         // ---------------------- Phase B: Destroy (neighbor-aware) ---------------------
         .with_destroy_op(Box::new(
-            RandomKRatioDestroy::new(0.15..=0.55).with_neighbors(neighbors_any.clone()),
+            RandomKRatioDestroy::new(0.18..=0.52).with_neighbors(neighbors_any.clone()),
         ))
         .with_destroy_op(Box::new(
-            WorstCostDestroy::new(0.20..=0.40).with_neighbors(neighbors_direct_competitors.clone()),
+            WorstCostDestroy::new(0.22..=0.40).with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_destroy_op(Box::new(
-            TimeClusterDestroy::<T>::new(0.20..=0.35, TimeDelta::new(24.into()))
+            TimeClusterDestroy::<T>::new(0.22..=0.36, TimeDelta::new(24.into()))
                 .with_alpha(1.6..=2.2)
                 .with_neighbors(neighbors_any.clone()),
         ))
         .with_destroy_op(Box::new(
-            TimeWindowBandDestroy::<T>::new(0.30..=0.50, 1.4..=1.8, TimeDelta::new(12.into()))
-                .with_neighbors(neighbors_any),
+            TimeWindowBandDestroy::<T>::new(0.30..=0.48, 1.5..=1.9, TimeDelta::new(12.into()))
+                .with_neighbors(neighbors_any.clone()),
         ))
         .with_destroy_op(Box::new(
             ShawRelatedDestroy::new(
@@ -600,7 +612,7 @@ where
             StringBlockDestroy::new(0.25..=0.45).with_alpha(1.4..=2.0),
         ))
         // -------------------------- Phase C: Repair operators -------------------------
-        .with_repair_op(Box::new(KRegretInsertion::new(4..=4))) // keep k=4 deterministically
+        .with_repair_op(Box::new(KRegretInsertion::new(4..=4))) // deterministic k=4
         .with_repair_op(Box::new(RandomizedGreedyInsertion::new(1.6..=2.2)))
         .with_repair_op(Box::new(GreedyInsertion))
 }

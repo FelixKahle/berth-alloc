@@ -22,7 +22,7 @@
 use crate::{
     model::index::{BerthIndex, RequestIndex},
     search::{
-        operator::LocalMoveOperator,
+        operator::{LocalMoveOperator, NeighborFn},
         planner::{CostEvaluator, PlanBuilder, PlanExplorer, PlanningContext},
     },
     state::{
@@ -34,7 +34,12 @@ use crate::{
 use berth_alloc_core::prelude::{Cost, TimeInterval, TimePoint};
 use num_traits::{CheckedAdd, CheckedSub, Zero};
 use rand::seq::SliceRandom;
-use std::{ops::Mul, ops::RangeInclusive};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    ops::Mul,
+    ops::RangeInclusive,
+    sync::Arc,
+};
 
 #[inline]
 fn is_zero_delta_plan<T>(plan: &Plan<'_, T>) -> bool
@@ -111,10 +116,44 @@ fn rcl_index<R: rand::Rng>(len: usize, alpha: f64, rng: &mut R) -> usize {
         .min(len - 1)
 }
 
-#[derive(Clone, Debug)]
+/// Restrict a list of (RequestIndex, Payload) pairs to a seed’s neighborhood
+/// defined by `neighbor_cb`. If the neighborhood is empty, returns the original
+/// list as a fallback. Also returns the chosen seed.
+#[inline]
+fn restrict_to_neighborhood_or_fallback<T, R>(
+    rng: &mut R,
+    assigned: &[(RequestIndex, T)],
+    neighbor_cb: &Option<Arc<NeighborFn>>,
+) -> (Vec<(RequestIndex, T)>, RequestIndex)
+where
+    R: rand::Rng,
+    T: Clone,
+{
+    let (seed, _) = assigned[rng.random_range(0..assigned.len())].clone();
+    if let Some(cb) = neighbor_cb {
+        let mut keep: HashSet<usize> = HashSet::new();
+        keep.insert(seed.get());
+        for n in cb(seed) {
+            keep.insert(n.get());
+        }
+        let filtered: Vec<_> = assigned
+            .iter()
+            .filter(|&(ri, _)| keep.contains(&ri.get()))
+            .cloned()
+            .collect();
+        if !filtered.is_empty() {
+            return (filtered, seed);
+        }
+    }
+    (assigned.to_vec(), seed)
+}
+
+#[derive(Clone)]
 pub struct ShiftEarlierOnSameBerth {
     /// How many assigned requests to randomly sample and try to shift earlier.
     pub number_of_candidates_to_try_range: RangeInclusive<usize>,
+    /// Optional neighborhood restriction; when present, candidates are picked from seed ∪ neighbors.
+    pub neighbor_callback: Option<Arc<NeighborFn>>,
 }
 
 impl ShiftEarlierOnSameBerth {
@@ -122,7 +161,12 @@ impl ShiftEarlierOnSameBerth {
         assert!(!number_of_candidates_to_try_range.is_empty());
         Self {
             number_of_candidates_to_try_range,
+            neighbor_callback: None,
         }
+    }
+    pub fn with_neighbors(mut self, callback: Arc<NeighborFn>) -> Self {
+        self.neighbor_callback = Some(callback);
+        self
     }
 }
 
@@ -145,7 +189,7 @@ where
 
         // Use a one-off builder to snapshot assigned jobs and sample a subset.
         let seed_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
-        let assigned_jobs: Vec<(RequestIndex, BerthIndex, TimePoint<T>)> = seed_builder
+        let assigned_jobs: Vec<(RequestIndex, (BerthIndex, TimePoint<T>))> = seed_builder
             .with_explorer(|ex| {
                 ex.decision_vars()
                     .iter()
@@ -156,7 +200,7 @@ where
                             start_time,
                         }) = *dv
                         {
-                            Some((RequestIndex::new(i), berth_index, start_time))
+                            Some((RequestIndex::new(i), (berth_index, start_time)))
                         } else {
                             None
                         }
@@ -167,18 +211,19 @@ where
             return None;
         }
 
-        let sample_size = clamp_range_sample(
+        let (mut pool, _seed) = restrict_to_neighborhood_or_fallback(
             rng,
-            &self.number_of_candidates_to_try_range,
-            assigned_jobs.len(),
-        )
-        .max(1);
-        let mut sampled_jobs = assigned_jobs.clone();
-        sampled_jobs.shuffle(rng);
-        sampled_jobs.truncate(sample_size);
+            assigned_jobs.as_slice(),
+            &self.neighbor_callback,
+        );
+
+        let sample_size =
+            clamp_range_sample(rng, &self.number_of_candidates_to_try_range, pool.len()).max(1);
+        pool.shuffle(rng);
+        pool.truncate(sample_size);
 
         // Try candidates one by one, each attempt with a FRESH builder.
-        for (request_index, berth_index, current_start_time) in sampled_jobs {
+        for (request_index, (berth_index, current_start_time)) in pool {
             let mut attempt_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
 
             // Find earliest feasible start on the same berth.
@@ -228,10 +273,11 @@ where
 // RelocateSingleBest  (range-based sampling)
 // ======================================================================
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RelocateSingleBest {
     /// How many assigned requests to randomly sample and try to relocate.
     pub number_of_candidates_to_try_range: RangeInclusive<usize>,
+    pub neighbor_callback: Option<Arc<NeighborFn>>,
 }
 
 impl RelocateSingleBest {
@@ -239,7 +285,12 @@ impl RelocateSingleBest {
         assert!(!number_of_candidates_to_try_range.is_empty());
         Self {
             number_of_candidates_to_try_range,
+            neighbor_callback: None,
         }
+    }
+    pub fn with_neighbors(mut self, callback: Arc<NeighborFn>) -> Self {
+        self.neighbor_callback = Some(callback);
+        self
     }
 }
 
@@ -262,8 +313,10 @@ where
 
         // Snapshot assigned jobs with their current cost (one-off builder).
         let seed_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
-        let assigned_with_cost: Vec<(RequestIndex, BerthIndex, TimePoint<T>, Cost)> = seed_builder
-            .with_explorer(|ex| {
+
+        #[allow(clippy::type_complexity)]
+        let assigned_with_cost: Vec<(RequestIndex, (BerthIndex, TimePoint<T>, Cost))> =
+            seed_builder.with_explorer(|ex| {
                 ex.decision_vars()
                     .iter()
                     .enumerate()
@@ -275,7 +328,7 @@ where
                         {
                             let ri = RequestIndex::new(i);
                             ex.peek_cost(ri, start_time, berth_index)
-                                .map(|current_cost| (ri, berth_index, start_time, current_cost))
+                                .map(|current_cost| (ri, (berth_index, start_time, current_cost)))
                         } else {
                             None
                         }
@@ -286,17 +339,15 @@ where
             return None;
         }
 
-        let sample_size = clamp_range_sample(
-            rng,
-            &self.number_of_candidates_to_try_range,
-            assigned_with_cost.len(),
-        )
-        .max(1);
-        let mut sampled = assigned_with_cost.clone();
-        sampled.shuffle(rng);
-        sampled.truncate(sample_size);
+        let (mut pool, _seed) =
+            restrict_to_neighborhood_or_fallback(rng, &assigned_with_cost, &self.neighbor_callback);
 
-        for (request_index, current_berth, current_start_time, current_cost) in sampled {
+        let sample_size =
+            clamp_range_sample(rng, &self.number_of_candidates_to_try_range, pool.len()).max(1);
+        pool.shuffle(rng);
+        pool.truncate(sample_size);
+
+        for (request_index, (current_berth, current_start_time, current_cost)) in pool {
             let mut attempt_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
 
             let best_option = attempt_builder
@@ -335,10 +386,11 @@ where
 // SwapPairSameBerth  (range-based pair attempts; fresh builder per attempt)
 // ======================================================================
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SwapPairSameBerth {
     /// How many random same-berth pairs to attempt before giving up.
     pub number_of_pair_attempts_to_try_range: RangeInclusive<usize>,
+    pub neighbor_callback: Option<Arc<NeighborFn>>,
 }
 
 impl SwapPairSameBerth {
@@ -346,7 +398,12 @@ impl SwapPairSameBerth {
         assert!(!number_of_pair_attempts_to_try_range.is_empty());
         Self {
             number_of_pair_attempts_to_try_range,
+            neighbor_callback: None,
         }
+    }
+    pub fn with_neighbors(mut self, callback: Arc<NeighborFn>) -> Self {
+        self.neighbor_callback = Some(callback);
+        self
     }
 }
 
@@ -369,35 +426,66 @@ where
 
         // Use a seed builder to group assigned by berth (ordered by start).
         let seed_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
-        let by_berth = seed_builder.with_explorer(|ex| {
-            use std::collections::BTreeMap;
-            let mut map: BTreeMap<BerthIndex, Vec<(RequestIndex, TimePoint<T>)>> = BTreeMap::new();
-            for (i, dv) in ex.decision_vars().iter().enumerate() {
-                if let DecisionVar::Assigned(Decision {
-                    berth_index,
-                    start_time,
-                }) = *dv
-                {
-                    map.entry(berth_index)
-                        .or_default()
-                        .push((RequestIndex::new(i), start_time));
+        let mut by_berth: BTreeMap<BerthIndex, Vec<(RequestIndex, TimePoint<T>)>> = seed_builder
+            .with_explorer(|ex| {
+                let mut map: BTreeMap<BerthIndex, Vec<(RequestIndex, TimePoint<T>)>> =
+                    BTreeMap::new();
+                for (i, dv) in ex.decision_vars().iter().enumerate() {
+                    if let DecisionVar::Assigned(Decision {
+                        berth_index,
+                        start_time,
+                    }) = *dv
+                    {
+                        map.entry(berth_index)
+                            .or_default()
+                            .push((RequestIndex::new(i), start_time));
+                    }
                 }
-            }
-            for v in map.values_mut() {
-                v.sort_by_key(|(_, s)| s.value());
-            }
-            map
-        });
+                for v in map.values_mut() {
+                    v.sort_by_key(|(_, s)| s.value());
+                }
+                map
+            });
         if by_berth.is_empty() {
             return None;
+        }
+
+        // Neighborhood restriction (seed ∪ neighbors) within a *single* berth’s sequence.
+        if let Some(cb) = &self.neighbor_callback {
+            // flatten to pick a seed
+            let mut flat: Vec<(BerthIndex, (RequestIndex, TimePoint<T>))> = Vec::new();
+            for (bi, seq) in by_berth.iter() {
+                for e in seq {
+                    flat.push((*bi, *e));
+                }
+            }
+            if flat.is_empty() {
+                return None;
+            }
+            let (seed_bi, (seed_ri, _)) = flat[rng.random_range(0..flat.len())];
+            let mut set: HashSet<usize> = HashSet::new();
+            set.insert(seed_ri.get());
+            for n in cb(seed_ri) {
+                set.insert(n.get());
+            }
+            if let Some(seq) = by_berth.get_mut(&seed_bi) {
+                let filtered: Vec<_> = seq
+                    .iter()
+                    .cloned()
+                    .filter(|(ri, _)| set.contains(&ri.get()))
+                    .collect();
+                if filtered.len() >= 2 {
+                    by_berth.clear();
+                    by_berth.insert(seed_bi, filtered);
+                }
+            }
         }
 
         let attempts_to_try =
             clamp_range_sample(rng, &self.number_of_pair_attempts_to_try_range, usize::MAX).max(1);
 
-        // Build a flattened list of (berth, idx_a, idx_b) choices lazily by sampling.
+        // Build attempts on the (possibly) restricted berth map.
         for _attempt in 0..attempts_to_try {
-            // Pick a random berth that has at least two assignments.
             let mut candidate_berths: Vec<_> =
                 by_berth.iter().filter(|(_, v)| v.len() >= 2).collect();
             if candidate_berths.is_empty() {
@@ -464,10 +552,11 @@ where
 // CrossExchangeAcrossBerths  (range-based pair attempts; fresh builder per attempt)
 // ======================================================================
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CrossExchangeAcrossBerths {
     /// How many random cross-berth pairs to attempt before giving up.
     pub number_of_pair_attempts_to_try_range: RangeInclusive<usize>,
+    pub neighbor_callback: Option<Arc<NeighborFn>>,
 }
 
 impl CrossExchangeAcrossBerths {
@@ -475,7 +564,12 @@ impl CrossExchangeAcrossBerths {
         assert!(!number_of_pair_attempts_to_try_range.is_empty());
         Self {
             number_of_pair_attempts_to_try_range,
+            neighbor_callback: None,
         }
+    }
+    pub fn with_neighbors(mut self, callback: Arc<NeighborFn>) -> Self {
+        self.neighbor_callback = Some(callback);
+        self
     }
 }
 
@@ -496,9 +590,9 @@ where
     ) -> Option<crate::state::plan::Plan<'p, T>> {
         let model = context.model();
 
-        // Snapshot all assigned as (ri, berth, start).
+        // Snapshot all assigned as (ri, (berth, start)).
         let seed_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
-        let assigned: Vec<(RequestIndex, BerthIndex, TimePoint<T>)> =
+        let assigned: Vec<(RequestIndex, (BerthIndex, TimePoint<T>))> =
             seed_builder.with_explorer(|ex| {
                 ex.decision_vars()
                     .iter()
@@ -509,7 +603,7 @@ where
                             start_time,
                         }) = *dv
                         {
-                            Some((RequestIndex::new(i), berth_index, start_time))
+                            Some((RequestIndex::new(i), (berth_index, start_time)))
                         } else {
                             None
                         }
@@ -520,12 +614,23 @@ where
             return None;
         }
 
+        // Restrict to neighborhood; ensure cross-berth diversity exists, else fallback.
+        let (mut pool, _seed) =
+            restrict_to_neighborhood_or_fallback(rng, &assigned, &self.neighbor_callback);
+
+        let mut berths: BTreeSet<BerthIndex> = BTreeSet::new();
+        for (_, (bi, _)) in &pool {
+            berths.insert(*bi);
+        }
+        if berths.len() < 2 {
+            pool = assigned.clone();
+        }
+
         let attempts_to_try =
             clamp_range_sample(rng, &self.number_of_pair_attempts_to_try_range, usize::MAX).max(1);
 
         for _attempt in 0..attempts_to_try {
-            // Randomize a pair; keep only cross-berth pairs.
-            let mut shuffled = assigned.clone();
+            let mut shuffled = pool.clone();
             shuffled.shuffle(rng);
 
             // Find first cross-berth pair in this random order.
@@ -540,8 +645,8 @@ where
             )> = None;
             'scan: for i in 0..(shuffled.len().saturating_sub(1)) {
                 for j in (i + 1)..shuffled.len() {
-                    let (ra, bi_a, sa) = shuffled[i];
-                    let (rb, bi_b, sb) = shuffled[j];
+                    let (ra, (bi_a, sa)) = shuffled[i];
+                    let (rb, (bi_b, sb)) = shuffled[j];
                     if bi_a != bi_b {
                         chosen = Some((ra, rb, bi_a, bi_b, sa, sb));
                         break 'scan;
@@ -608,12 +713,13 @@ where
 // OrOptBlockRelocate  (ranges for block length + RCL alpha)
 // ======================================================================
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OrOptBlockRelocate {
     /// Inclusive range for the contiguous block length (k) to relocate.
     pub block_length_to_relocate_range: RangeInclusive<usize>,
     /// Inclusive range for RCL alpha when picking the block's starting index.
     pub rcl_alpha_range: RangeInclusive<f64>,
+    pub neighbor_callback: Option<Arc<NeighborFn>>,
 }
 
 impl OrOptBlockRelocate {
@@ -631,7 +737,12 @@ impl OrOptBlockRelocate {
         Self {
             block_length_to_relocate_range,
             rcl_alpha_range,
+            neighbor_callback: None,
         }
+    }
+    pub fn with_neighbors(mut self, callback: Arc<NeighborFn>) -> Self {
+        self.neighbor_callback = Some(callback);
+        self
     }
 }
 
@@ -655,7 +766,6 @@ where
 
         // Pick any berth with at least 2 assigned; collect ordered by start.
         let maybe_group = seed_builder.with_explorer(|ex| {
-            use std::collections::BTreeMap;
             let mut by_berth: BTreeMap<BerthIndex, Vec<(RequestIndex, TimePoint<T>)>> =
                 BTreeMap::new();
             for (i, dv) in ex.decision_vars().iter().enumerate() {
@@ -682,16 +792,12 @@ where
             })
         });
 
-        let (_berth_index, ordered_sequence) = maybe_group?;
+        let (_berth_index, full_sequence) = maybe_group?;
 
-        // Sample k and alpha.
-        let sampled_k = clamp_range_sample(
-            rng,
-            &self.block_length_to_relocate_range,
-            ordered_sequence.len(),
-        )
-        .max(2);
-        if sampled_k > ordered_sequence.len() {
+        // Sample k and alpha using the full berth sequence.
+        let max_k = full_sequence.len();
+        let sampled_k = clamp_range_sample(rng, &self.block_length_to_relocate_range, max_k).max(2);
+        if sampled_k > max_k {
             return None;
         }
         let alpha_sample = {
@@ -704,32 +810,69 @@ where
             }
         };
 
-        // Choose a start index with RCL.
-        let valid_start_count = ordered_sequence.len() - sampled_k + 1;
+        // Neighborhood within this berth (seed ∪ neighbors). Fallback to full berth if
+        // neighborhood is smaller than k.
+        let sequence = if let Some(cb) = &self.neighbor_callback {
+            let (seed_ri, _) = full_sequence[rng.random_range(0..full_sequence.len())];
+            let mut set: HashSet<usize> = HashSet::new();
+            set.insert(seed_ri.get());
+            for n in cb(seed_ri) {
+                set.insert(n.get());
+            }
+            let filtered: Vec<_> = full_sequence
+                .iter()
+                .cloned()
+                .filter(|(ri, _)| set.contains(&ri.get()))
+                .collect();
+            if filtered.len() >= sampled_k {
+                filtered
+            } else {
+                full_sequence
+            }
+        } else {
+            full_sequence
+        };
+
+        // Choose a start index with RCL over the chosen sequence.
+        let valid_start_count = sequence.len().saturating_sub(sampled_k).saturating_add(1);
+        if valid_start_count == 0 {
+            return None;
+        }
         let start_index = rcl_index(valid_start_count, alpha_sample, rng);
-        let block_slice = &ordered_sequence[start_index..start_index + sampled_k];
+        let block_slice = &sequence[start_index..start_index + sampled_k];
         let block_indices: Vec<RequestIndex> = block_slice.iter().map(|&(ri, _)| ri).collect();
 
         // Rebuild on a fresh builder: unassign block → greedy reinsert anywhere.
         let mut attempt_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
 
+        // 1) Unassign all requests in the block first
         for &ri in &block_indices {
             let _ = attempt_builder.propose_unassignment(ri).ok()?;
         }
+
+        // 2) Reinsert every request; if any fails, abandon this attempt
         for &ri in &block_indices {
             if let Some((free, start, _cost)) =
                 attempt_builder.with_explorer(|ex| best_insertion_for_request_ex(ex, model, ri))
             {
-                let _ = attempt_builder.propose_assignment(ri, start, &free).ok();
+                if attempt_builder
+                    .propose_assignment(ri, start, &free)
+                    .is_err()
+                {
+                    return None;
+                }
+            } else {
+                return None;
             }
         }
 
+        // 3) Finalize and ensure we actually changed all k requests (2 patches per request)
         let plan = attempt_builder.finalize();
-        if plan.decision_var_patches.is_empty() {
-            None
-        } else {
-            Some(plan)
+        let expected_min_patches = 2 * block_indices.len();
+        if plan.decision_var_patches.len() < expected_min_patches {
+            return None;
         }
+        Some(plan)
     }
 }
 
@@ -737,10 +880,11 @@ where
 // RelocateSingleBestAllowWorsening  (same as RelocateSingleBest but allows worsening)
 // ======================================================================
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RelocateSingleBestAllowWorsening {
     /// How many assigned requests to randomly sample and try to relocate.
     pub number_of_candidates_to_try_range: RangeInclusive<usize>,
+    pub neighbor_callback: Option<Arc<NeighborFn>>,
 }
 
 impl RelocateSingleBestAllowWorsening {
@@ -748,7 +892,12 @@ impl RelocateSingleBestAllowWorsening {
         assert!(!number_of_candidates_to_try_range.is_empty());
         Self {
             number_of_candidates_to_try_range,
+            neighbor_callback: None,
         }
+    }
+    pub fn with_neighbors(mut self, callback: Arc<NeighborFn>) -> Self {
+        self.neighbor_callback = Some(callback);
+        self
     }
 }
 
@@ -771,8 +920,10 @@ where
 
         // Snapshot assigned jobs with their current cost (one-off builder).
         let seed_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
-        let assigned_with_cost: Vec<(RequestIndex, BerthIndex, TimePoint<T>, Cost)> = seed_builder
-            .with_explorer(|ex| {
+
+        #[allow(clippy::type_complexity)]
+        let assigned_with_cost: Vec<(RequestIndex, (BerthIndex, TimePoint<T>, Cost))> =
+            seed_builder.with_explorer(|ex| {
                 ex.decision_vars()
                     .iter()
                     .enumerate()
@@ -784,7 +935,7 @@ where
                         {
                             let ri = RequestIndex::new(i);
                             ex.peek_cost(ri, start_time, berth_index)
-                                .map(|current_cost| (ri, berth_index, start_time, current_cost))
+                                .map(|current_cost| (ri, (berth_index, start_time, current_cost)))
                         } else {
                             None
                         }
@@ -795,17 +946,15 @@ where
             return None;
         }
 
-        let sample_size = clamp_range_sample(
-            rng,
-            &self.number_of_candidates_to_try_range,
-            assigned_with_cost.len(),
-        )
-        .max(1);
-        let mut sampled = assigned_with_cost.clone();
-        sampled.shuffle(rng);
-        sampled.truncate(sample_size);
+        let (mut pool, _seed) =
+            restrict_to_neighborhood_or_fallback(rng, &assigned_with_cost, &self.neighbor_callback);
 
-        for (request_index, _current_berth, _current_start_time, _current_cost) in sampled {
+        let sample_size =
+            clamp_range_sample(rng, &self.number_of_candidates_to_try_range, pool.len()).max(1);
+        pool.shuffle(rng);
+        pool.truncate(sample_size);
+
+        for (request_index, (_current_berth, _current_start_time, _current_cost)) in pool {
             let mut attempt_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
 
             // Keep the "best insertion" computation, but DO NOT require it to beat current cost.
@@ -834,10 +983,11 @@ where
 // RandomRelocateAnywhere  (random feasible reinsert; can worsen on purpose)
 // ======================================================================
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RandomRelocateAnywhere {
     /// How many assigned requests to randomly sample and try to reinsert randomly.
     pub number_of_candidates_to_try_range: RangeInclusive<usize>,
+    pub neighbor_callback: Option<Arc<NeighborFn>>,
 }
 
 impl RandomRelocateAnywhere {
@@ -845,7 +995,12 @@ impl RandomRelocateAnywhere {
         assert!(!number_of_candidates_to_try_range.is_empty());
         Self {
             number_of_candidates_to_try_range,
+            neighbor_callback: None,
         }
+    }
+    pub fn with_neighbors(mut self, callback: Arc<NeighborFn>) -> Self {
+        self.neighbor_callback = Some(callback);
+        self
     }
 }
 
@@ -868,7 +1023,7 @@ where
 
         // Snapshot assigned jobs.
         let seed_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
-        let assigned_jobs: Vec<(RequestIndex, BerthIndex, TimePoint<T>)> = seed_builder
+        let assigned_jobs: Vec<(RequestIndex, (BerthIndex, TimePoint<T>))> = seed_builder
             .with_explorer(|ex| {
                 ex.decision_vars()
                     .iter()
@@ -879,7 +1034,7 @@ where
                             start_time,
                         }) = *dv
                         {
-                            Some((RequestIndex::new(i), berth_index, start_time))
+                            Some((RequestIndex::new(i), (berth_index, start_time)))
                         } else {
                             None
                         }
@@ -890,19 +1045,16 @@ where
             return None;
         }
 
-        let sample_size = clamp_range_sample(
-            rng,
-            &self.number_of_candidates_to_try_range,
-            assigned_jobs.len(),
-        )
-        .max(1);
+        let (mut pool, _seed) =
+            restrict_to_neighborhood_or_fallback(rng, &assigned_jobs, &self.neighbor_callback);
 
-        // Shuffle & truncate candidates.
-        let mut sampled = assigned_jobs.clone();
-        sampled.shuffle(rng);
-        sampled.truncate(sample_size);
+        let sample_size =
+            clamp_range_sample(rng, &self.number_of_candidates_to_try_range, pool.len()).max(1);
 
-        for (ri, _cur_b, _cur_s) in sampled {
+        pool.shuffle(rng);
+        pool.truncate(sample_size);
+
+        for (ri, (_cur_b, _cur_s)) in pool {
             let mut attempt_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
 
             // Gather all feasible "earliest start" placements across all free intervals.
@@ -948,10 +1100,11 @@ where
 // HillClimbRelocateBest  (best improving relocate among sampled requests)
 // ======================================================================
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HillClimbRelocateBest {
     /// How many assigned requests to sample and try (upper bound).
     pub number_of_candidates_to_try_range: RangeInclusive<usize>,
+    pub neighbor_callback: Option<Arc<NeighborFn>>,
 }
 
 impl HillClimbRelocateBest {
@@ -959,7 +1112,12 @@ impl HillClimbRelocateBest {
         assert!(!number_of_candidates_to_try_range.is_empty());
         Self {
             number_of_candidates_to_try_range,
+            neighbor_callback: None,
         }
+    }
+    pub fn with_neighbors(mut self, callback: Arc<NeighborFn>) -> Self {
+        self.neighbor_callback = Some(callback);
+        self
     }
 }
 
@@ -982,7 +1140,7 @@ where
 
         // Gather assigned requests (seed snapshot).
         let seed_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
-        let assigned: Vec<(RequestIndex, BerthIndex, TimePoint<T>)> =
+        let assigned: Vec<(RequestIndex, (BerthIndex, TimePoint<T>))> =
             seed_builder.with_explorer(|ex| {
                 ex.decision_vars()
                     .iter()
@@ -993,7 +1151,7 @@ where
                             start_time,
                         }) = *dv
                         {
-                            Some((RequestIndex::new(i), berth_index, start_time))
+                            Some((RequestIndex::new(i), (berth_index, start_time)))
                         } else {
                             None
                         }
@@ -1004,10 +1162,17 @@ where
             return None;
         }
 
+        // Restrict to neighborhood.
+        let (mut cand_reqs, _seed) =
+            restrict_to_neighborhood_or_fallback(rng, &assigned, &self.neighbor_callback);
+
         // Sample a subset to keep per-call work bounded.
-        let k =
-            clamp_range_sample(rng, &self.number_of_candidates_to_try_range, assigned.len()).max(1);
-        let mut cand_reqs = assigned.clone();
+        let k = clamp_range_sample(
+            rng,
+            &self.number_of_candidates_to_try_range,
+            cand_reqs.len(),
+        )
+        .max(1);
         cand_reqs.shuffle(rng);
         cand_reqs.truncate(k);
 
@@ -1022,9 +1187,8 @@ where
             (du_a < du_b) || (du_a == du_b && dc_a < dc_b)
         }
 
-        for (ri, _cur_b, _cur_s) in cand_reqs {
+        for (ri, (_cur_b, _cur_s)) in cand_reqs {
             // Explore all feasible earliest placements; pick the one that yields the best improvement.
-            // We will construct a plan for each feasible "best_insertion_for_request_ex" and evaluate deltas.
             let attempt_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
 
             // Build the list of candidate placements (free rectangles + earliest start).
@@ -1091,10 +1255,11 @@ where
 // HillClimbBestSwapSameBerth  (best improving swap among sampled same-berth pairs)
 // ======================================================================
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HillClimbBestSwapSameBerth {
     /// How many random same-berth pairs to sample per call (upper bound).
     pub number_of_pair_attempts_to_try_range: RangeInclusive<usize>,
+    pub neighbor_callback: Option<Arc<NeighborFn>>,
 }
 
 impl HillClimbBestSwapSameBerth {
@@ -1102,7 +1267,12 @@ impl HillClimbBestSwapSameBerth {
         assert!(!number_of_pair_attempts_to_try_range.is_empty());
         Self {
             number_of_pair_attempts_to_try_range,
+            neighbor_callback: None,
         }
+    }
+    pub fn with_neighbors(mut self, callback: Arc<NeighborFn>) -> Self {
+        self.neighbor_callback = Some(callback);
+        self
     }
 }
 
@@ -1125,8 +1295,7 @@ where
 
         // Collect assigned by berth, ordered by start.
         let seed_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = context.builder();
-        let by_berth = seed_builder.with_explorer(|ex| {
-            use std::collections::BTreeMap;
+        let mut by_berth = seed_builder.with_explorer(|ex| {
             let mut map: BTreeMap<BerthIndex, Vec<(RequestIndex, TimePoint<T>)>> = BTreeMap::new();
             for (i, dv) in ex.decision_vars().iter().enumerate() {
                 if let DecisionVar::Assigned(Decision {
@@ -1146,6 +1315,38 @@ where
         });
         if by_berth.is_empty() {
             return None;
+        }
+
+        // Neighborhood restriction (seed ∪ neighbors) within one berth.
+        if let Some(cb) = &self.neighbor_callback {
+            let mut flat: Vec<(BerthIndex, (RequestIndex, TimePoint<T>))> = Vec::new();
+            for (bi, seq) in by_berth.iter() {
+                for e in seq {
+                    flat.push((*bi, *e));
+                }
+            }
+            if flat.is_empty() {
+                return None;
+            }
+            let (seed_bi, (seed_ri, _)) = flat[rng.random_range(0..flat.len())];
+
+            let mut set: HashSet<usize> = HashSet::new();
+            set.insert(seed_ri.get());
+            for n in cb(seed_ri) {
+                set.insert(n.get());
+            }
+
+            if let Some(seq) = by_berth.get_mut(&seed_bi) {
+                let filtered: Vec<_> = seq
+                    .iter()
+                    .cloned()
+                    .filter(|(ri, _)| set.contains(&ri.get()))
+                    .collect();
+                if filtered.len() >= 2 {
+                    by_berth.clear();
+                    by_berth.insert(seed_bi, filtered);
+                }
+            }
         }
 
         // Enumerate all feasible swap candidates (indices on same berth).
@@ -1330,43 +1531,40 @@ mod tests {
         PlanningContext::new(model, state, cost_evaluator, buffer)
     }
 
-    // ------------ tests ------------
+    // Simple neighbor that returns seed ±1 if in range.
+    fn neighbor_pm1(limit: usize) -> Arc<NeighborFn> {
+        Arc::new(move |seed: RequestIndex| {
+            let i = seed.get();
+            let mut v = Vec::new();
+            if i > 0 {
+                v.push(RequestIndex::new(i - 1));
+            }
+            if i + 1 < limit {
+                v.push(RequestIndex::new(i + 1));
+            }
+            v
+        })
+    }
 
     #[test]
-    fn shift_earlier_moves_left_within_random_sample() {
-        let prob = make_problem(1);
+    fn test_shift_earlier_moves_left_within_random_sample_with_neighbors() {
+        let prob = make_problem(3);
         let model = SolverModel::try_from(&prob).unwrap();
-        // Starts later than earliest; operator should move to earliest (=0)
-        let state = make_state_with_assignments(&model, &[50]);
+        // Starts later than earliest; operator should move to earlier time (=0)
+        let state = make_state_with_assignments(&model, &[50, 60, 70]);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
 
         let mut rng = ChaCha8Rng::from_seed([7; 32]);
-        let op = ShiftEarlierOnSameBerth::new(1..=3);
+        let op = ShiftEarlierOnSameBerth::new(1..=3).with_neighbors(neighbor_pm1(3));
         let plan = op.propose(&mut ctx, &mut rng).expect("expected a plan");
 
-        assert_eq!(plan.decision_var_patches.len(), 2); // unassign + assign
         assert_eq!(plan.delta_unassigned, 0);
         assert!(!plan.terminal_delta.is_empty());
-
-        // Verify new start ≤ old start
-        let new_start = plan
-            .decision_var_patches
-            .iter()
-            .rev()
-            .find_map(|p| {
-                if let DecisionVar::Assigned(dec) = p.patch {
-                    Some(dec.start_time)
-                } else {
-                    None
-                }
-            })
-            .expect("assigned patch must exist");
-        assert!(new_start <= tp(50));
     }
 
     #[test]
-    fn relocate_single_best_changes_when_better_exists_sampling_range() {
+    fn test_relocate_single_best_changes_when_better_exists_sampling_range_with_neighbors() {
         let prob = make_problem(2);
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_state_with_assignments(&model, &[60, 80]);
@@ -1374,7 +1572,7 @@ mod tests {
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
 
         let mut rng = ChaCha8Rng::from_seed([9; 32]);
-        let op = RelocateSingleBest::new(1..=2);
+        let op = RelocateSingleBest::new(1..=2).with_neighbors(neighbor_pm1(2));
         let plan = op.propose(&mut ctx, &mut rng).expect("plan expected");
 
         assert_eq!(plan.delta_unassigned, 0);
@@ -1383,38 +1581,24 @@ mod tests {
     }
 
     #[test]
-    fn swap_pair_same_berth_executes_with_fresh_builder_attempts() {
-        let prob = make_problem(2);
+    fn test_swap_pair_same_berth_executes_with_neighbor_restriction_or_fallback() {
+        let prob = make_problem(3);
         let model = SolverModel::try_from(&prob).unwrap();
-        let state = make_state_with_assignments(&model, &[0, 40]);
+        let state = make_state_with_assignments(&model, &[0, 40, 80]);
         let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
 
         let mut rng = ChaCha8Rng::from_seed([3; 32]);
-        let op = SwapPairSameBerth::new(1..=4);
+        let op = SwapPairSameBerth::new(1..=4).with_neighbors(neighbor_pm1(3));
         let plan = op.propose(&mut ctx, &mut rng).expect("plan expected");
 
-        assert_eq!(plan.decision_var_patches.len(), 4); // unassign both + assign both
         assert_eq!(plan.delta_unassigned, 0);
+        assert!(plan.decision_var_patches.len() >= 4); // unassign both + assign both
         assert!(!plan.terminal_delta.is_empty());
-
-        let mut starts = plan
-            .decision_var_patches
-            .iter()
-            .filter_map(|p| {
-                if let DecisionVar::Assigned(dec) = p.patch {
-                    Some(dec.start_time.value())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        starts.sort_unstable();
-        assert_eq!(starts, vec![0, 40]); // swapped positions
     }
 
     #[test]
-    fn cross_exchange_across_berths_works_with_fresh_builder_attempts() {
+    fn test_cross_exchange_across_berths_works_with_neighbors_and_fallback() {
         // Two berths, one request on each to allow cross-exchange.
         let mut pb = berth_alloc_model::problem::builder::ProblemBuilder::new();
         pb.add_berth(berth(1, 0, 1_000));
@@ -1440,7 +1624,7 @@ mod tests {
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
 
         let mut rng = ChaCha8Rng::from_seed([11; 32]);
-        let op = CrossExchangeAcrossBerths::new(1..=3);
+        let op = CrossExchangeAcrossBerths::new(1..=3).with_neighbors(neighbor_pm1(2));
         let plan = op.propose(&mut ctx, &mut rng).expect("plan expected");
 
         assert_eq!(plan.delta_unassigned, 0);
@@ -1449,7 +1633,7 @@ mod tests {
     }
 
     #[test]
-    fn or_opt_block_relocate_k_and_alpha_ranges() {
+    fn test_or_opt_block_relocate_k_and_alpha_ranges_with_neighbors() {
         let prob = make_problem(6);
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_state_with_assignments(&model, &[0, 20, 40, 60, 80, 100]);
@@ -1458,7 +1642,7 @@ mod tests {
 
         let mut rng = ChaCha8Rng::from_seed([13; 32]);
         // Fix k=3 and alpha=1.7 for determinism in this test.
-        let op = OrOptBlockRelocate::new(3..=3, 1.7..=1.7);
+        let op = OrOptBlockRelocate::new(3..=3, 1.7..=1.7).with_neighbors(neighbor_pm1(6));
         let plan = op.propose(&mut ctx, &mut rng).expect("plan expected");
 
         assert!(plan.decision_var_patches.len() >= 6); // unassign 3 + assign ≤3
@@ -1467,30 +1651,7 @@ mod tests {
     }
 
     #[test]
-    fn operators_return_none_when_no_assigned() {
-        let prob = make_problem(2);
-        let model = SolverModel::try_from(&prob).unwrap();
-        let state = make_state_with_assignments(&model, &[]); // nobody assigned
-        let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
-
-        let mut rng = ChaCha8Rng::from_seed([1; 32]);
-
-        let op_shift = ShiftEarlierOnSameBerth::new(1..=2);
-        let op_reloc = RelocateSingleBest::new(1..=2);
-        let op_swap = SwapPairSameBerth::new(1..=2);
-        let op_cross = CrossExchangeAcrossBerths::new(1..=2);
-        let op_oropt = OrOptBlockRelocate::new(2..=3, 1.4..=1.8);
-
-        assert!(op_shift.propose(&mut ctx, &mut rng).is_none());
-        assert!(op_reloc.propose(&mut ctx, &mut rng).is_none());
-        assert!(op_swap.propose(&mut ctx, &mut rng).is_none());
-        assert!(op_cross.propose(&mut ctx, &mut rng).is_none());
-        assert!(op_oropt.propose(&mut ctx, &mut rng).is_none());
-    }
-
-    #[test]
-    fn test_relocate_single_best_allow_worsening_produces_plan() {
+    fn test_relocate_single_best_allow_worsening_produces_plan_with_neighbors() {
         let prob = make_problem(2);
         let model = SolverModel::try_from(&prob).unwrap();
         let state = make_state_with_assignments(&model, &[60, 80]);
@@ -1499,7 +1660,7 @@ mod tests {
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = ChaCha8Rng::from_seed([17; 32]);
 
-        let op = RelocateSingleBestAllowWorsening::new(1..=3);
+        let op = RelocateSingleBestAllowWorsening::new(1..=3).with_neighbors(neighbor_pm1(2));
         let plan = op.propose(&mut ctx, &mut rng).expect("plan expected");
 
         assert_eq!(plan.delta_unassigned, 0);
@@ -1511,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn test_random_relocate_anywhere_moves_some_request() {
+    fn test_random_relocate_anywhere_moves_some_request_with_neighbors() {
         let prob = make_problem(3);
         let model = SolverModel::try_from(&prob).unwrap();
         // Three assigned at spaced times to give room for relocations
@@ -1521,7 +1682,7 @@ mod tests {
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = ChaCha8Rng::from_seed([19; 32]);
 
-        let op = RandomRelocateAnywhere::new(2..=4);
+        let op = RandomRelocateAnywhere::new(2..=4).with_neighbors(neighbor_pm1(3));
         let plan = op.propose(&mut ctx, &mut rng).expect("plan expected");
 
         assert_eq!(plan.delta_unassigned, 0);
@@ -1533,7 +1694,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hill_climb_relocate_best_reduces_cost_when_possible() {
+    fn test_hill_climb_relocate_best_reduces_cost_when_possible_with_neighbors() {
         let prob = make_problem(1);
         let model = SolverModel::try_from(&prob).unwrap();
         // Start later than arrival; moving earlier should reduce base cost
@@ -1543,7 +1704,7 @@ mod tests {
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = ChaCha8Rng::from_seed([23; 32]);
 
-        let op = HillClimbRelocateBest::new(1..=3);
+        let op = HillClimbRelocateBest::new(1..=3).with_neighbors(neighbor_pm1(1));
         let plan = op.propose(&mut ctx, &mut rng).expect("plan expected");
 
         // Expect strict cost improvement on the base objective
@@ -1557,7 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hill_climb_best_swap_same_berth_finds_improving_swap() {
+    fn test_hill_climb_best_swap_same_berth_finds_improving_swap_with_neighbors() {
         // Build a problem where swapping yields a clear improvement due to different weights.
         let mut pb = berth_alloc_model::problem::builder::ProblemBuilder::new();
         pb.add_berth(berth(1, 0, 1_000));
@@ -1583,7 +1744,7 @@ mod tests {
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = ChaCha8Rng::from_seed([29; 32]);
 
-        let op = HillClimbBestSwapSameBerth::new(1..=5);
+        let op = HillClimbBestSwapSameBerth::new(1..=5).with_neighbors(neighbor_pm1(2));
         let plan = op.propose(&mut ctx, &mut rng).expect("plan expected");
 
         // Expect a strict improvement

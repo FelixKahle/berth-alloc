@@ -25,8 +25,10 @@ use crate::{
     core::numeric::SolveNumeric,
     engine::{
         acceptor::{Acceptor, LexStrictAcceptor},
+        neighbors,
         search::{SearchContext, SearchStrategy},
     },
+    model::solver_model::SolverModel,
     search::{
         operator::LocalMoveOperator,
         operator_library::local::{
@@ -509,13 +511,18 @@ where
     }
 }
 
-pub fn sa_strategy<T, R>(
-    _: &crate::model::solver_model::SolverModel<T>,
-) -> SimulatedAnnealingStrategy<T, R>
+pub fn sa_strategy<T, R>(model: &SolverModel<T>) -> SimulatedAnnealingStrategy<T, R>
 where
     T: SolveNumeric + From<i32>,
     R: rand::Rng,
 {
+    // Preconfigured neighbor scopes
+    let proximity_map = model.proximity_map();
+    let neighbors_any = neighbors::any(proximity_map);
+    let neighbors_direct_competitors = neighbors::direct_competitors(proximity_map);
+    let neighbors_same_berth = neighbors::same_berth(proximity_map);
+
+    // SA with neighbor wiring + params tuned for ~20 berths / ~250 ships / PT 20–120
     SimulatedAnnealingStrategy::new()
         .with_init_temp(1.0)
         .with_cooling(0.997)
@@ -527,24 +534,37 @@ where
         .with_op_ema_alpha(0.2)
         .with_acceptance_targets(0.12, 0.5)
         .with_big_m_for_energy(1_500_000_000)
-        // Local improvement operators (true objective via DefaultCostEvaluator)
-        .with_local_op(Box::new(ShiftEarlierOnSameBerth {
-            number_of_candidates_to_try_range: 8..=24,
-        }))
-        .with_local_op(Box::new(RelocateSingleBest {
-            number_of_candidates_to_try_range: 8..=24,
-        }))
-        .with_local_op(Box::new(SwapPairSameBerth {
-            number_of_pair_attempts_to_try_range: 10..=40,
-        }))
-        .with_local_op(Box::new(CrossExchangeAcrossBerths {
-            number_of_pair_attempts_to_try_range: 12..=48,
-        }))
-        .with_local_op(Box::new(OrOptBlockRelocate::new(2..=4, 1.4..=2.0)))
-        // Diversification / worsening-capable moves
-        .with_local_op(Box::new(RelocateSingleBestAllowWorsening::new(2..=4)))
-        .with_local_op(Box::new(RandomRelocateAnywhere::new(2..=4)))
-        // Hill climbers (strictly improving)
-        .with_local_op(Box::new(HillClimbRelocateBest::new(12..=36)))
-        .with_local_op(Box::new(HillClimbBestSwapSameBerth::new(24..=72)))
+        // ------------------------- Local improvement (neighbor-aware) -------------------------
+        .with_local_op(Box::new(
+            ShiftEarlierOnSameBerth::new(12..=36).with_neighbors(neighbors_same_berth.clone()),
+        ))
+        .with_local_op(Box::new(
+            RelocateSingleBest::new(12..=36).with_neighbors(neighbors_direct_competitors.clone()),
+        ))
+        .with_local_op(Box::new(
+            SwapPairSameBerth::new(28..=84).with_neighbors(neighbors_same_berth.clone()),
+        ))
+        .with_local_op(Box::new(
+            CrossExchangeAcrossBerths::new(28..=72)
+                .with_neighbors(neighbors_direct_competitors.clone()),
+        ))
+        .with_local_op(Box::new(
+            OrOptBlockRelocate::new(2..=5, 1.4..=2.0).with_neighbors(neighbors_same_berth.clone()),
+        ))
+        // ------------------------- Diversification / worsening-capable -------------------------
+        .with_local_op(Box::new(
+            RelocateSingleBestAllowWorsening::new(8..=20)
+                .with_neighbors(neighbors_direct_competitors.clone()),
+        ))
+        .with_local_op(Box::new(
+            RandomRelocateAnywhere::new(8..=20).with_neighbors(neighbors_any.clone()),
+        ))
+        // ------------------------- Hill climbers (strictly improving) -------------------------
+        .with_local_op(Box::new(
+            HillClimbRelocateBest::new(18..=54)
+                .with_neighbors(neighbors_direct_competitors.clone()),
+        ))
+        .with_local_op(Box::new(
+            HillClimbBestSwapSameBerth::new(36..=108).with_neighbors(neighbors_same_berth.clone()),
+        ))
 }
