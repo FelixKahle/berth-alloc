@@ -516,55 +516,54 @@ where
     T: SolveNumeric + From<i32>,
     R: rand::Rng,
 {
-    // Preconfigured neighbor scopes
     let proximity_map = model.proximity_map();
     let neighbors_any = neighbors::any(proximity_map);
     let neighbors_direct_competitors = neighbors::direct_competitors(proximity_map);
     let neighbors_same_berth = neighbors::same_berth(proximity_map);
 
-    // SA with neighbor wiring + params tuned for ~20 berths / ~250 ships / PT 20–120
+    // Aggressive SA
     SimulatedAnnealingStrategy::new()
         .with_init_temp(1.0)
-        .with_cooling(0.997)
-        .with_steps_per_temp(256)
+        .with_cooling(0.999) // slower early cooling
+        .with_steps_per_temp(400) // more exploration per temp
         .with_refetch_after_stale(64)
-        .with_hard_refetch_every(0)
+        .with_hard_refetch_every(18)
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
         .with_reheat_factor(8.0)
-        .with_op_ema_alpha(0.2)
-        .with_acceptance_targets(0.12, 0.5)
-        .with_big_m_for_energy(1_500_000_000)
-        // ------------------------- Local improvement (neighbor-aware) -------------------------
+        .with_op_ema_alpha(0.25)
+        .with_acceptance_targets(0.12, 0.60) // cool, hot
+        .with_big_m_for_energy(1_250_000_000)
+        // ------------------------- Local improvement -------------------------
         .with_local_op(Box::new(
-            ShiftEarlierOnSameBerth::new(12..=36).with_neighbors(neighbors_same_berth.clone()),
+            ShiftEarlierOnSameBerth::new(18..=52).with_neighbors(neighbors_same_berth.clone()),
         ))
         .with_local_op(Box::new(
-            RelocateSingleBest::new(12..=36).with_neighbors(neighbors_direct_competitors.clone()),
+            RelocateSingleBest::new(18..=56).with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            SwapPairSameBerth::new(28..=84).with_neighbors(neighbors_same_berth.clone()),
+            SwapPairSameBerth::new(32..=90).with_neighbors(neighbors_same_berth.clone()),
         ))
         .with_local_op(Box::new(
-            CrossExchangeAcrossBerths::new(28..=72)
+            CrossExchangeAcrossBerths::new(32..=90)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            OrOptBlockRelocate::new(2..=5, 1.4..=2.0).with_neighbors(neighbors_same_berth.clone()),
+            OrOptBlockRelocate::new(3..=6, 1.5..=2.5).with_neighbors(neighbors_same_berth.clone()),
         ))
-        // ------------------------- Diversification / worsening-capable -------------------------
+        // ------------------------- Diversification -------------------------
         .with_local_op(Box::new(
-            RelocateSingleBestAllowWorsening::new(8..=20)
+            RelocateSingleBestAllowWorsening::new(12..=24)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            RandomRelocateAnywhere::new(8..=20).with_neighbors(neighbors_any.clone()),
+            RandomRelocateAnywhere::new(12..=24).with_neighbors(neighbors_any.clone()),
         ))
-        // ------------------------- Hill climbers (strictly improving) -------------------------
+        // ------------------------- Hill climbers -------------------------
         .with_local_op(Box::new(
-            HillClimbRelocateBest::new(18..=54)
+            HillClimbRelocateBest::new(24..=72)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            HillClimbBestSwapSameBerth::new(36..=108).with_neighbors(neighbors_same_berth.clone()),
+            HillClimbBestSwapSameBerth::new(48..=120).with_neighbors(neighbors_same_berth.clone()),
         ))
 }

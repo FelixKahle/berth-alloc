@@ -663,7 +663,6 @@ where
     }
 }
 
-// Factory with reusable feature signals and safe 'static bucketizer
 pub fn tabu_strategy<T, R>(
     model: &crate::model::solver_model::SolverModel<T>,
 ) -> TabuSearchStrategy<T, R, DefaultFeatureExtractor<T>>
@@ -671,19 +670,16 @@ where
     T: SolveNumeric + ToPrimitive + Copy + From<i32>,
     R: rand::Rng,
 {
-    // Preconfigured neighbor scopes (already tuned & provided by the model)
     let proximity_map = model.proximity_map();
     let neighbors_any = neighbors::any(proximity_map);
     let neighbors_direct_competitors = neighbors::direct_competitors(proximity_map);
     let neighbors_same_berth = neighbors::same_berth(proximity_map);
 
-    // Non-capturing bucketizer coerces to `fn`, ensuring 'static object safety.
     let bucketizer: fn(TimePoint<T>) -> i64 = |t: TimePoint<T>| {
         let v = t
             .value()
             .to_i64()
             .expect("TimePoint<T>::value() must be convertible to i64 for bucketing");
-        // 90-minute (or 90-slot) buckets; adjust if your time unit differs.
         v / 90
     };
 
@@ -697,53 +693,52 @@ where
 
     let feats_arc = Arc::new(feats);
 
-    // Tabu tuned for ~20 berths / ~250 ships / PT 20–120, with neighbor-wired ops
+    // Aggressive Tabu
     TabuSearchStrategy::new(feats_arc)
-        .with_lambda(4)
-        .with_penalty_step(1)
-        .with_pulse_params(16, 8)
-        .with_decay(DecayMode::Multiplicative { num: 9, den: 10 }) // ~10% decay/round
+        .with_lambda(6)
+        .with_penalty_step(2)
+        .with_decay(DecayMode::Multiplicative { num: 94, den: 100 })
         .with_max_penalty(1_000_000_000)
-        .with_max_local_steps(1024)
-        .with_tabu_tenure(18..=36) // a bit longer for mid-size instances
-        .with_samples_per_step(96)
-        .with_refetch_after_stale(128)
-        .with_hard_refetch_every(0)
+        .with_max_local_steps(1800)
+        .with_tabu_tenure(24..=48)
+        .with_samples_per_step(128)
+        .with_refetch_after_stale(96)
+        .with_hard_refetch_every(24)
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
         .with_restart_on_publish(true)
         .with_reset_on_refetch(true)
-        .with_kick_steps_on_reset(3)
-        // ------------------------- Local improvement (augmented costs) -------------------------
+        .with_kick_steps_on_reset(4)
+        // ------------------------- Local (tabu-augmented costs) -------------------------
         .with_local_op(Box::new(
-            ShiftEarlierOnSameBerth::new(12..=36).with_neighbors(neighbors_same_berth.clone()),
+            ShiftEarlierOnSameBerth::new(18..=52).with_neighbors(neighbors_same_berth.clone()),
         ))
         .with_local_op(Box::new(
-            RelocateSingleBest::new(12..=36).with_neighbors(neighbors_direct_competitors.clone()),
+            RelocateSingleBest::new(20..=64).with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            SwapPairSameBerth::new(28..=84).with_neighbors(neighbors_same_berth.clone()),
+            SwapPairSameBerth::new(36..=96).with_neighbors(neighbors_same_berth.clone()),
         ))
         .with_local_op(Box::new(
-            CrossExchangeAcrossBerths::new(28..=72)
+            CrossExchangeAcrossBerths::new(36..=96)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            OrOptBlockRelocate::new(2..=5, 1.4..=2.0).with_neighbors(neighbors_same_berth.clone()),
+            OrOptBlockRelocate::new(3..=6, 1.5..=2.5).with_neighbors(neighbors_same_berth.clone()),
         ))
-        // ------------------------- Diversification / worsening-capable -------------------------
+        // Diversification
         .with_local_op(Box::new(
-            RelocateSingleBestAllowWorsening::new(8..=20)
+            RelocateSingleBestAllowWorsening::new(12..=24)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            RandomRelocateAnywhere::new(8..=20).with_neighbors(neighbors_any.clone()),
+            RandomRelocateAnywhere::new(12..=24).with_neighbors(neighbors_any.clone()),
         ))
-        // ------------------------- Hill climbers (strictly improving) -------------------------
+        // Hill climbers
         .with_local_op(Box::new(
-            HillClimbRelocateBest::new(18..=54)
+            HillClimbRelocateBest::new(24..=72)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            HillClimbBestSwapSameBerth::new(36..=108).with_neighbors(neighbors_same_berth.clone()),
+            HillClimbBestSwapSameBerth::new(48..=120).with_neighbors(neighbors_same_berth.clone()),
         ))
 }

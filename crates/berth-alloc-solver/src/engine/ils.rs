@@ -539,80 +539,71 @@ where
     let neighbors_direct_competitors = neighbors::direct_competitors(proximity_map);
     let neighbors_same_berth = neighbors::same_berth(proximity_map);
 
-    // Tuned for ~20 berths / ~250 ships / PT 20–120
+    // Aggressive ILS
     IteratedLocalSearchStrategy::new()
-        // cadence & refetch
-        .with_max_local_steps(1400) // allow compound moves to settle
-        .with_refetch_after_stale(160) // slightly slower stale refresh
-        .with_hard_refetch_every(0)
+        .with_max_local_steps(2000)
+        .with_refetch_after_stale(120)
+        .with_hard_refetch_every(20) // periodic refetch to avoid stickiness
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
         .with_shuffle_local_each_step(true)
-        // ------------------------- Phase A: Local improvement -------------------------
+        // ------------------------- Local improvement -------------------------
         .with_local_op(Box::new(
-            ShiftEarlierOnSameBerth::new(12..=32).with_neighbors(neighbors_same_berth.clone()),
+            ShiftEarlierOnSameBerth::new(18..=52).with_neighbors(neighbors_same_berth.clone()),
         ))
         .with_local_op(Box::new(
-            RelocateSingleBest::new(12..=32).with_neighbors(neighbors_direct_competitors.clone()),
+            RelocateSingleBest::new(18..=56).with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            SwapPairSameBerth::new(24..=72).with_neighbors(neighbors_same_berth.clone()),
+            SwapPairSameBerth::new(32..=90).with_neighbors(neighbors_same_berth.clone()),
         ))
         .with_local_op(Box::new(
-            CrossExchangeAcrossBerths::new(24..=64)
+            CrossExchangeAcrossBerths::new(32..=90)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            OrOptBlockRelocate::new(
-                2..=5,     // relocate block size (2–5 works well at this scale)
-                1.4..=2.0, // RCL alpha
-            )
-            .with_neighbors(neighbors_same_berth.clone()),
+            OrOptBlockRelocate::new(3..=6, 1.5..=2.5).with_neighbors(neighbors_same_berth.clone()),
         ))
+        // Diversification / controlled worsening
         .with_local_op(Box::new(
-            RelocateSingleBestAllowWorsening::new(8..=20)
+            RelocateSingleBestAllowWorsening::new(12..=24)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            RandomRelocateAnywhere::new(8..=20).with_neighbors(neighbors_any.clone()),
+            RandomRelocateAnywhere::new(12..=24).with_neighbors(neighbors_any.clone()),
         ))
+        // Hill climbers
         .with_local_op(Box::new(
-            HillClimbRelocateBest::new(16..=48)
+            HillClimbRelocateBest::new(22..=66)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            HillClimbBestSwapSameBerth::new(32..=96).with_neighbors(neighbors_same_berth.clone()),
+            HillClimbBestSwapSameBerth::new(40..=112).with_neighbors(neighbors_same_berth.clone()),
         ))
-        // ---------------------- Phase B: Destroy (neighbor-aware) ---------------------
+        // ---------------------- Destroy ----------------------
         .with_destroy_op(Box::new(
-            RandomKRatioDestroy::new(0.18..=0.52).with_neighbors(neighbors_any.clone()),
-        ))
-        .with_destroy_op(Box::new(
-            WorstCostDestroy::new(0.22..=0.40).with_neighbors(neighbors_direct_competitors.clone()),
+            RandomKRatioDestroy::new(0.24..=0.56).with_neighbors(neighbors_any.clone()),
         ))
         .with_destroy_op(Box::new(
-            TimeClusterDestroy::<T>::new(0.22..=0.36, TimeDelta::new(24.into()))
-                .with_alpha(1.6..=2.2)
+            WorstCostDestroy::new(0.26..=0.44).with_neighbors(neighbors_direct_competitors.clone()),
+        ))
+        .with_destroy_op(Box::new(
+            TimeClusterDestroy::<T>::new(0.26..=0.40, TimeDelta::new(24.into()))
+                .with_alpha(1.6..=2.3)
                 .with_neighbors(neighbors_any.clone()),
         ))
         .with_destroy_op(Box::new(
-            TimeWindowBandDestroy::<T>::new(0.30..=0.48, 1.5..=1.9, TimeDelta::new(12.into()))
+            TimeWindowBandDestroy::<T>::new(0.34..=0.50, 1.5..=1.95, TimeDelta::new(12.into()))
                 .with_neighbors(neighbors_any.clone()),
         ))
         .with_destroy_op(Box::new(
-            ShawRelatedDestroy::new(
-                0.20..=0.40, // ratio
-                1.6..=2.2,   // alpha
-                1.into(),    // |Δstart| weight
-                1.into(),    // |Δend| weight
-                4.into(),    // berth mismatch penalty
-            )
-            .with_neighbors(neighbors_same_berth.clone()),
+            ShawRelatedDestroy::new(0.24..=0.44, 1.6..=2.3, 1.into(), 1.into(), 4.into())
+                .with_neighbors(neighbors_same_berth.clone()),
         ))
         .with_destroy_op(Box::new(
-            StringBlockDestroy::new(0.25..=0.45).with_alpha(1.4..=2.0),
+            StringBlockDestroy::new(0.30..=0.50).with_alpha(1.5..=2.2),
         ))
-        // -------------------------- Phase C: Repair operators -------------------------
-        .with_repair_op(Box::new(KRegretInsertion::new(4..=4))) // deterministic k=4
-        .with_repair_op(Box::new(RandomizedGreedyInsertion::new(1.6..=2.2)))
+        // ---------------------- Repair ----------------------
+        .with_repair_op(Box::new(KRegretInsertion::new(4..=4)))
+        .with_repair_op(Box::new(RandomizedGreedyInsertion::new(1.6..=2.4)))
         .with_repair_op(Box::new(GreedyInsertion))
 }

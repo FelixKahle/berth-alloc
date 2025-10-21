@@ -853,7 +853,6 @@ where
     T: SolveNumeric + ToPrimitive + Copy + From<i32>,
     R: rand::Rng,
 {
-    // --- feature bucketizer (unchanged) ---
     let bucketizer: fn(TimePoint<T>) -> i64 = |t: TimePoint<T>| -> i64 {
         let v_i64 = t
             .value()
@@ -878,48 +877,49 @@ where
     let neighbors_direct_competitors = neighbors::direct_competitors(proximity_map);
     let neighbors_same_berth = neighbors::same_berth(proximity_map);
 
-    // --- GLS with tuned params for ~20 berths / ~250 ships / PT 20–120 ---
+    // Aggressive GLS for ~20 berths / ~250 ships / PT 20–120
     GuidedLocalSearchStrategy::new(feats_arc)
-        .with_lambda(6) // a bit stronger guidance at this scale
-        .with_max_local_steps(1600) // allow deeper exploitation per restart
-        .with_refetch_after_stale(180)
-        .with_hard_refetch_every(0)
+        .with_lambda(7)
+        .with_penalty_step(2)
+        .with_decay(DecayMode::Multiplicative { num: 95, den: 100 }) // 95%
+        .with_max_penalty(1_000_000_000)
+        .with_pulse_params(10, 18) // stagnation, top-k
+        .with_max_local_steps(2000)
+        .with_refetch_after_stale(120)
+        .with_hard_refetch_every(24) // periodic gentle shake-up
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
         .with_restart_on_publish(true)
         .with_reset_on_refetch(true)
-        .with_kick_steps_on_reset(4)
-        .with_decay(DecayMode::Multiplicative { num: 9, den: 10 })
-        .with_penalty_step(1)
-        .with_max_penalty(1_000_000_000)
-        // ------------------------- Local improvement ops (neighbor-aware) -------------------------
+        .with_kick_steps_on_reset(5)
+        // ------------------------- Local operators (aggressive) -------------------------
         .with_local_op(Box::new(
-            ShiftEarlierOnSameBerth::new(12..=36).with_neighbors(neighbors_same_berth.clone()),
+            ShiftEarlierOnSameBerth::new(18..=52).with_neighbors(neighbors_same_berth.clone()),
         ))
         .with_local_op(Box::new(
-            RelocateSingleBest::new(12..=36).with_neighbors(neighbors_direct_competitors.clone()),
+            RelocateSingleBest::new(20..=64).with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            SwapPairSameBerth::new(28..=84).with_neighbors(neighbors_same_berth.clone()),
+            SwapPairSameBerth::new(36..=96).with_neighbors(neighbors_same_berth.clone()),
         ))
         .with_local_op(Box::new(
-            CrossExchangeAcrossBerths::new(28..=72)
+            CrossExchangeAcrossBerths::new(36..=96)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            OrOptBlockRelocate::new(2..=5, 1.4..=2.0).with_neighbors(neighbors_same_berth.clone()),
+            OrOptBlockRelocate::new(3..=6, 1.5..=2.5).with_neighbors(neighbors_same_berth.clone()),
         ))
         .with_local_op(Box::new(
-            RelocateSingleBestAllowWorsening::new(8..=20)
+            RelocateSingleBestAllowWorsening::new(12..=24)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            RandomRelocateAnywhere::new(8..=20).with_neighbors(neighbors_any.clone()),
+            RandomRelocateAnywhere::new(12..=24).with_neighbors(neighbors_any.clone()),
         ))
         .with_local_op(Box::new(
-            HillClimbRelocateBest::new(18..=54)
+            HillClimbRelocateBest::new(24..=72)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            HillClimbBestSwapSameBerth::new(36..=108).with_neighbors(neighbors_same_berth.clone()),
+            HillClimbBestSwapSameBerth::new(48..=120).with_neighbors(neighbors_same_berth.clone()),
         ))
 }
