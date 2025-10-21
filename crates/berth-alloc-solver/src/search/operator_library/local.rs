@@ -1433,6 +1433,7 @@ mod tests {
         state::{
             decisionvar::{DecisionVar, DecisionVarVec},
             solver_state::SolverStateView,
+            terminal::terminalocc::TerminalWrite,
         },
     };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
@@ -1491,23 +1492,48 @@ mod tests {
         model: &SolverModel<'p, i64>,
         starts: &[(u32, i64)],
     ) -> crate::state::solver_state::SolverState<'p, i64> {
-        let mut dvars = Vec::new();
+        // Build DV vector with the correct length.
+        let mut dvars = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+
+        // We'll use berth id=1 for these tests (exists in make_problem()).
         let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
-        for (_, _) in model.problem().flexible_requests().iter().enumerate() {
-            dvars.push(DecisionVar::unassigned());
-        }
-        for (req_id, start) in starts {
-            let ri = model.index_manager().request_index(rid(*req_id)).unwrap();
-            dvars[ri.get()] = DecisionVar::assigned(b_ix, tp(*start));
-        }
-        let dv = DecisionVarVec::from(dvars);
-        let term = crate::state::terminal::terminalocc::TerminalOccupancy::new(
+
+        // Create terminal occupancy and compute total cost and occupied intervals.
+        let mut term = crate::state::terminal::terminalocc::TerminalOccupancy::new(
             model.problem().berths().iter(),
         );
+        use num_traits::Zero;
+        let mut total_cost = Cost::zero();
+
+        for (req_id, start) in starts {
+            let ri = model.index_manager().request_index(rid(*req_id)).unwrap();
+            let start_tp = tp(*start);
+
+            // Set the decision variable
+            dvars[ri.get()] = DecisionVar::assigned(b_ix, start_tp);
+
+            // Occupy the corresponding interval in terminal occupancy
+            let pt = model
+                .processing_time(ri, b_ix)
+                .expect("processing time defined for test");
+            let end_tp = start_tp + pt;
+            let asg_iv = TimeInterval::new(start_tp, end_tp);
+            term.occupy(b_ix, asg_iv).expect("occupy must succeed");
+
+            // Accumulate the cost for consistency with SolverState::apply_plan
+            let c = model
+                .cost_of_assignment(ri, b_ix, start_tp)
+                .expect("cost defined for test");
+            total_cost += c;
+        }
+
+        let dv = DecisionVarVec::from(dvars);
+
+        let unassigned = model.flexible_requests_len() - starts.len();
         crate::state::solver_state::SolverState::new(
             dv,
             term,
-            crate::state::fitness::Fitness::new(0, 0),
+            crate::state::fitness::Fitness::new(total_cost, unassigned),
         )
     }
 
