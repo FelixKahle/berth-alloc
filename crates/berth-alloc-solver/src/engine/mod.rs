@@ -26,6 +26,7 @@ pub mod greedy_opening;
 pub mod ils;
 pub mod neighbors;
 pub mod opening;
+pub mod popmusic;
 pub mod sa;
 pub mod search;
 pub mod shared_incumbent;

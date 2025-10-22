@@ -399,7 +399,10 @@ where
                             current = tmp;
                             accepted_this_step = true;
                             improved_in_round |= better; // count only strict better as “improved”
-                            let _ = context.shared_incumbent().try_update(&current);
+                            let succ = context.shared_incumbent().try_update(&current);
+                            if succ {
+                                tracing::info!("ILS found new incumbent: {}", current.fitness());
+                            }
                             tracing::trace!(
                                 "ILS: accepted local op {} (better={}, sideways={}, worse_random={})",
                                 op.name(),
@@ -496,7 +499,10 @@ where
                             repaired_and_accepted = true;
 
                             // Publish improvement vs baseline (may or may not beat global best).
-                            let _ = context.shared_incumbent().try_update(&current);
+                            let succ = context.shared_incumbent().try_update(&current);
+                            if succ {
+                                tracing::info!("ILS found new incumbent: {}", current.fitness());
+                            }
                             tracing::trace!("ILS: accepted repair op {}", r.name());
                             break;
                         }

@@ -404,7 +404,10 @@ where
                         let mut reward = 0.6;
                         if self.true_acceptor.accept(best.fitness(), current.fitness()) {
                             best = current.clone();
-                            let _ = context.shared_incumbent().try_update(&best);
+                            let succ = context.shared_incumbent().try_update(&best);
+                            if succ {
+                                tracing::info!("SA found new incumbent: {}", best.fitness());
+                            }
                             improved_global_in_epoch = true;
                             reward = 1.0;
                         }
@@ -434,7 +437,10 @@ where
                             // Upgrade `best` only if true objective improves.
                             if self.true_acceptor.accept(best.fitness(), current.fitness()) {
                                 best = current.clone();
-                                let _ = context.shared_incumbent().try_update(&best);
+                                let succ = context.shared_incumbent().try_update(&best);
+                                if succ {
+                                    tracing::info!("SA found new incumbent: {}", best.fitness());
+                                }
                                 improved_global_in_epoch = true;
 
                                 // Bonus: a bit more credit if a worse-by-energy

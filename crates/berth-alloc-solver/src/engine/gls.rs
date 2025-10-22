@@ -743,7 +743,13 @@ where
                                 .accept(best_true.fitness(), current.fitness())
                             {
                                 best_true = current.clone();
-                                let _ = context.shared_incumbent().try_update(&best_true);
+                                let succ = context.shared_incumbent().try_update(&best_true);
+                                if succ {
+                                    tracing::info!(
+                                        "GLS found new incumbent: {}",
+                                        best_true.fitness()
+                                    );
+                                }
 
                                 if self.restart_on_publish {
                                     current = best_true.clone();

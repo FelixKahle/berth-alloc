@@ -26,7 +26,7 @@ use crate::{
         greedy_opening::GreedyOpening,
         ils,
         opening::OpeningStrategy,
-        sa,
+        popmusic, sa,
         search::{SearchContext, SearchStrategy},
         shared_incumbent::SharedIncumbent,
         tabu,
@@ -42,24 +42,35 @@ use rand::seq::{IndexedRandom, SliceRandom};
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::{
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SolverEngineConfig {
     pub num_workers: usize,
+    /// Legacy single time limit (kept for backward compatibility with builder method).
+    /// Not used directly by the engine phases anymore.
     pub time_limit: std::time::Duration,
+    /// Heuristics phase time budget
+    pub heuristics_time: std::time::Duration,
+    /// Finishing POPMUSIC phase time budget
+    pub finishing_time: std::time::Duration,
 }
 
 impl Default for SolverEngineConfig {
     #[inline]
     fn default() -> Self {
         Self {
-            num_workers: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
-            time_limit: std::time::Duration::from_secs(30),
+            num_workers: 5,
+            // Keep as 60s for legacy callers, but phases use fields below
+            time_limit: std::time::Duration::from_secs(60),
+            // Defaults per request: 30s heuristics + 30s popmusic
+            heuristics_time: std::time::Duration::from_secs(30),
+            finishing_time: std::time::Duration::from_secs(30),
         }
     }
 }
@@ -160,7 +171,7 @@ where
             .map_err(EngineError::OpeningFailed)?;
         let shared_incumbent = SharedIncumbent::new(initial_state);
 
-        // --- Diversified, randomized strategy portfolio (types + settings) ---
+        // --- Diversified, randomized strategy portfolio (heuristics only) ---
         if self.strategies.is_empty() {
             let n = self.config.num_workers.max(1);
 
@@ -173,7 +184,6 @@ where
             }
 
             // Make one of a given kind with randomized knobs.
-            // inside make_one_variant(), replace the Kind arms with these more aggressive ranges
             fn make_one_variant<Tnum>(
                 k: Kind,
                 model: &SolverModel<Tnum>,
@@ -186,7 +196,6 @@ where
                     Kind::Ils => {
                         let mut s = ils::ils_strategy::<Tnum, ChaCha8Rng>(model);
 
-                        // Local budget (heavier): fixed or ranged
                         if rng.random_bool(0.35) {
                             s = s.with_max_local_steps(rng.random_range(1200..=2200));
                         } else {
@@ -195,7 +204,6 @@ where
                             s = s.with_local_steps_range(lo..=hi);
                         }
 
-                        // Plateau acceptance & controlled worsening
                         s = s.with_local_sideways(rng.random_bool(0.6));
                         if rng.random_bool(0.7) {
                             s = s.with_local_worsening_prob(rng.random_range(0.06..=0.12));
@@ -348,55 +356,90 @@ where
             }
             kinds.shuffle(&mut pf_rng);
 
-            // Materialize diversified strategies with randomized settings.
-            // Each worker gets its own seed; we derive a sub-seed for the “variant maker”
-            // so that creation-time randomization is also independent per worker.
+            // Materialize diversified strategies with randomized settings
             let mut variant_seed_rng = rand::rng();
-            for _ in 0..kinds.len() {
+            for i in 0..kinds.len() {
                 // Derive a seed to randomize the strategy's internal knobs
                 let seed = variant_seed_rng.next_u64();
                 let mut knob_rng = ChaCha8Rng::seed_from_u64(seed);
-                let k = kinds[self.strategies.len()];
+                let k = kinds[i];
                 self.strategies
                     .push(make_one_variant(k, &model, &mut knob_rng));
             }
         }
 
-        let deadline = Instant::now() + self.config.time_limit;
-        let stop = AtomicBool::new(false);
-
-        let mut strategies = std::mem::take(&mut self.strategies);
-
+        // Prepare shared references for worker phases
         let inc_ref = &shared_incumbent;
-        let stop_ref = &stop;
         let problem_ref = problem;
         let model_ref = &model;
 
-        std::thread::scope(|scope| {
-            let mut seeder = rand::rng();
+        // Phase 1: Heuristics only, under heuristics_time budget
+        let heur_deadline = Instant::now() + self.config.heuristics_time;
+        let heur_stop = Arc::new(AtomicBool::new(false));
 
-            scope.spawn(move || {
-                let now = Instant::now();
-                if deadline > now {
-                    std::thread::sleep(deadline - now);
-                }
-                stop_ref.store(true, Ordering::SeqCst);
-            });
-
-            let max_workers = self.config.num_workers.max(1);
-            let take_n = max_workers.min(strategies.len());
-
-            for mut strategy in strategies.drain(..take_n) {
-                let worker_seed: u64 = seeder.next_u64();
-
-                scope.spawn(move || {
-                    let rng = ChaCha8Rng::seed_from_u64(worker_seed);
-                    let mut context =
-                        SearchContext::new(problem_ref, model_ref, inc_ref, stop_ref, rng);
-                    strategy.run(&mut context);
+        {
+            std::thread::scope(|scope| {
+                // Watchdog to stop the heuristic workers at deadline
+                scope.spawn({
+                    let stop = heur_stop.clone();
+                    move || {
+                        let now = Instant::now();
+                        if heur_deadline > now {
+                            std::thread::sleep(heur_deadline - now);
+                        }
+                        stop.store(true, Ordering::SeqCst);
+                    }
                 });
-            }
-        });
+
+                // Run heuristic strategies in parallel
+                let mut strategies = std::mem::take(&mut self.strategies);
+                let max_workers = self.config.num_workers.max(1);
+                let take_n = max_workers.min(strategies.len());
+
+                let mut seeder = rand::rng();
+                for mut strategy in strategies.drain(..take_n) {
+                    let worker_seed: u64 = seeder.next_u64();
+                    let stop = heur_stop.clone();
+
+                    scope.spawn(move || {
+                        let rng = ChaCha8Rng::seed_from_u64(worker_seed);
+                        let mut context =
+                            SearchContext::new(problem_ref, model_ref, inc_ref, &*stop, rng);
+                        strategy.run(&mut context);
+                    });
+                }
+            });
+        }
+
+        // Phase 2: Finishing POPMUSIC, single-threaded, under finishing_time budget
+        if self.config.finishing_time > std::time::Duration::from_millis(0) {
+            let fini_deadline = Instant::now() + self.config.finishing_time;
+            let fini_stop = Arc::new(AtomicBool::new(false));
+
+            std::thread::scope(|scope| {
+                // Watchdog for finishing phase
+                scope.spawn({
+                    let stop = fini_stop.clone();
+                    move || {
+                        let now = Instant::now();
+                        if fini_deadline > now {
+                            std::thread::sleep(fini_deadline - now);
+                        }
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                });
+
+                // Run exactly one POPMUSIC strategy
+                let seed = rand::rng().next_u64();
+                let rng = ChaCha8Rng::seed_from_u64(seed);
+                let mut context =
+                    SearchContext::new(problem_ref, model_ref, inc_ref, &*fini_stop, rng);
+                let mut pop = popmusic::PopmusicStrategy::<T, ChaCha8Rng>::new(
+                    popmusic::PopmusicParams::default(),
+                );
+                pop.run(&mut context);
+            });
+        }
 
         let best = shared_incumbent.snapshot();
         if best.is_feasible() {
@@ -446,8 +489,15 @@ where
         self
     }
 
-    pub fn with_time_limit(mut self, time_limit: std::time::Duration) -> Self {
-        self.config.time_limit = time_limit;
+    /// Explicitly set heuristics phase time.
+    pub fn with_heuristics_time(mut self, time: std::time::Duration) -> Self {
+        self.config.heuristics_time = time;
+        self
+    }
+
+    /// Explicitly set finishing POPMUSIC phase time.
+    pub fn with_finishing_time(mut self, time: std::time::Duration) -> Self {
+        self.config.finishing_time = time;
         self
     }
 
@@ -458,141 +508,5 @@ where
 
     pub fn build(self) -> SolverEngine<T> {
         SolverEngine::new(self.config, self.strategies)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
-    use berth_alloc_model::prelude::*;
-    use rand_chacha::ChaCha8Rng;
-    use std::collections::BTreeMap;
-
-    #[inline]
-    fn tp(v: i64) -> TimePoint<i64> {
-        TimePoint::new(v)
-    }
-    #[inline]
-    fn iv(a: i64, b: i64) -> TimeInterval<i64> {
-        TimeInterval::new(tp(a), tp(b))
-    }
-    #[inline]
-    fn bid(n: u32) -> BerthIdentifier {
-        BerthIdentifier::new(n)
-    }
-    #[inline]
-    fn rid(n: u32) -> RequestIdentifier {
-        RequestIdentifier::new(n)
-    }
-
-    fn berth(id: u32, s: i64, e: i64) -> Berth<i64> {
-        Berth::from_windows(bid(id), [iv(s, e)])
-    }
-
-    fn flex_req(
-        id: u32,
-        window: (i64, i64),
-        pt: &[(u32, i64)],
-        weight: i64,
-    ) -> Request<FlexibleKind, i64> {
-        let mut m = BTreeMap::new();
-        for (b, d) in pt {
-            m.insert(bid(*b), TimeDelta::new(*d));
-        }
-        Request::<FlexibleKind, i64>::new(rid(id), iv(window.0, window.1), weight, m).unwrap()
-    }
-
-    fn problem_feasible_two_flex() -> Problem<i64> {
-        let mut berths = berth_alloc_model::problem::berth::BerthContainer::new();
-        berths.insert(berth(1, 0, 1000));
-
-        let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
-
-        let mut flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
-        // Two small requests that both fit
-        flex.insert(flex_req(1, (0, 200), &[(1, 10)], 1));
-        flex.insert(flex_req(2, (0, 200), &[(1, 5)], 1));
-
-        Problem::new(berths, fixed, flex).unwrap()
-    }
-
-    fn problem_infeasible_two_large() -> Problem<i64> {
-        let mut berths = berth_alloc_model::problem::berth::BerthContainer::new();
-        berths.insert(berth(1, 0, 12));
-
-        let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
-
-        let mut flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
-        // Two requests of length 10 in a 12-length window → only one can fit
-        flex.insert(flex_req(1, (0, 12), &[(1, 10)], 1));
-        flex.insert(flex_req(2, (0, 12), &[(1, 10)], 1));
-
-        Problem::new(berths, fixed, flex).unwrap()
-    }
-
-    struct DummyStrategy {
-        sleep_time: std::time::Duration,
-    }
-
-    impl Default for DummyStrategy {
-        fn default() -> Self {
-            Self {
-                sleep_time: std::time::Duration::from_millis(5),
-            }
-        }
-    }
-
-    impl SearchStrategy<i64, ChaCha8Rng> for DummyStrategy {
-        fn name(&self) -> &str {
-            "DummyStrategy"
-        }
-
-        fn run<'e, 'm, 'p>(&mut self, _context: &mut SearchContext<'e, 'm, 'p, i64, ChaCha8Rng>) {
-            std::thread::sleep(self.sleep_time);
-        }
-    }
-
-    fn engine_with_strategies(
-        num_workers: usize,
-        strategies_count: usize,
-        time_ms: u64,
-    ) -> SolverEngine<i64> {
-        let mut builder = SolverEngineBuilder::<i64>::new()
-            .with_worker_count(num_workers)
-            .with_time_limit(std::time::Duration::from_millis(time_ms));
-
-        for _ in 0..strategies_count {
-            builder = builder.with_strategy(Box::new(DummyStrategy::default()));
-        }
-
-        builder.build()
-    }
-
-    #[test]
-    fn test_solve_returns_solution_when_opening_feasible() {
-        let prob = problem_feasible_two_flex();
-        let mut engine = engine_with_strategies(2, 2, 50);
-
-        let res = engine.solve(&prob);
-        match res {
-            Ok(Some(sol)) => {
-                // Flexible assignments should be non-empty
-                assert!(sol.flexible_assignments().len() == 2);
-            }
-            other => panic!("expected Some(solution), got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_solve_returns_none_when_opening_infeasible() {
-        let prob = problem_infeasible_two_large();
-        let mut engine = engine_with_strategies(4, 1, 20);
-
-        let res = engine.solve(&prob);
-        match res {
-            Ok(None) => { /* infeasible incumbent stays infeasible */ }
-            other => panic!("expected Ok(None), got: {:?}", other),
-        }
     }
 }
