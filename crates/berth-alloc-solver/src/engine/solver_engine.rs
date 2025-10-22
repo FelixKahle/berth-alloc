@@ -172,8 +172,6 @@ where
                 Gls,
             }
 
-            // Make one of a given kind with randomized knobs.
-            // inside make_one_variant(), replace the Kind arms with these more aggressive ranges
             fn make_one_variant<Tnum>(
                 k: Kind,
                 model: &SolverModel<Tnum>,
@@ -186,75 +184,88 @@ where
                     Kind::Ils => {
                         let mut s = ils::ils_strategy::<Tnum, ChaCha8Rng>(model);
 
-                        // Local budget (heavier): fixed or ranged
-                        if rng.random_bool(0.35) {
-                            s = s.with_max_local_steps(rng.random_range(1200..=2200));
+                        // Heavier local budget; sample per-run for variability
+                        if rng.random_bool(0.5) {
+                            s = s.with_max_local_steps(rng.random_range(1400..=2200));
                         } else {
-                            let lo = rng.random_range(900..=1500);
+                            let lo = rng.random_range(800..=1400);
                             let hi = rng.random_range((lo + 200)..=(lo + 900));
                             s = s.with_local_steps_range(lo..=hi);
                         }
 
-                        // Plateau acceptance & controlled worsening
-                        s = s.with_local_sideways(rng.random_bool(0.6));
-                        if rng.random_bool(0.7) {
-                            s = s.with_local_worsening_prob(rng.random_range(0.06..=0.12));
+                        // Allow plateaus and controlled worsening
+                        s = s.with_local_sideways(rng.random_bool(0.7));
+                        if rng.random_bool(0.75) {
+                            s = s.with_local_worsening_prob(rng.random_range(0.08..=0.15));
                         }
 
+                        // More perturbation attempts per round
                         s = s.with_shuffle_local_each_step(true);
-
                         if rng.random_bool(0.75) {
-                            s = s.with_destroy_attempts(rng.random_range(24..=48));
+                            s = s.with_destroy_attempts(rng.random_range(18..=42));
                         }
                         if rng.random_bool(0.75) {
-                            s = s.with_repair_attempts(rng.random_range(24..=48));
+                            s = s.with_repair_attempts(rng.random_range(18..=42));
                         }
 
-                        if rng.random_bool(0.65) {
-                            s = s.with_refetch_after_stale(rng.random_range(64..=160));
+                        // Refetch policy: prefer earlier stale-refetch; periodic refetch less often
+                        if rng.random_bool(0.70) {
+                            s = s.with_refetch_after_stale(rng.random_range(60..=140));
                         }
-                        if rng.random_bool(0.50) {
-                            s = s.with_hard_refetch_every(rng.random_range(16..=48));
+                        if rng.random_bool(0.35) {
+                            s = s.with_hard_refetch_every(rng.random_range(16..=40));
                         }
 
                         Box::new(s)
                     }
 
                     Kind::Tabu => {
-                        let lo = rng.random_range(24..=32);
-                        let hi = rng.random_range(40..=64).max(lo + 2);
-                        let steps = rng.random_range(900..=2200);
-                        let samples = rng.random_range(96..=160);
-                        let restart_on_publish = rng.random_bool(0.8);
-                        let reset_on_refetch = rng.random_bool(0.9);
-                        let kick = rng.random_range(3..=6);
+                        // Longer tabu tenure and more sampling
+                        let lo = rng.random_range(36..=56);
+                        let hi = rng.random_range((lo + 2)..=96);
+                        let steps = rng.random_range(1400..=2200);
+                        let samples = rng.random_range(128..=192);
+                        let restart_on_publish = rng.random_bool(0.85);
+                        let reset_on_refetch = rng.random_bool(0.95);
+                        let kick = rng.random_range(6..=10);
+
+                        // Penalty pulses earlier and broader
+                        let pulse_top_k = rng.random_range(16..=28);
+                        let stagnation = rng.random_range(6..=12);
 
                         let mut s = tabu::tabu_strategy::<Tnum, ChaCha8Rng>(model)
                             .with_tabu_tenure(lo..=hi)
                             .with_max_local_steps(steps)
                             .with_samples_per_step(samples)
+                            .with_pulse_params(stagnation, pulse_top_k)
                             .with_restart_on_publish(restart_on_publish)
                             .with_reset_on_refetch(reset_on_refetch)
                             .with_kick_steps_on_reset(kick);
 
-                        if rng.random_bool(0.55) {
+                        // Refetch policy: rely more on stale-refetch; occasional periodic refetch
+                        if rng.random_bool(0.30) {
                             s = s.with_hard_refetch_every(rng.random_range(18..=40));
                         }
-                        if rng.random_bool(0.60) {
-                            s = s.with_refetch_after_stale(rng.random_range(80..=160));
+                        if rng.random_bool(0.70) {
+                            s = s.with_refetch_after_stale(rng.random_range(60..=140));
                         }
 
                         Box::new(s)
                     }
 
                     Kind::Sa => {
-                        let init_t = rng.random_range(0.9_f64..=1.6);
-                        let cooling = rng.random_range(0.9985_f64..=0.9993);
-                        let steps = rng.random_range(300..=600);
-                        let low = rng.random_range(0.12_f64..=0.18);
-                        let high = rng.random_range(0.55_f64..=0.65).max(low + 0.06);
-                        let ema = rng.random_range(0.20_f64..=0.35);
-                        let reheat = [0.0, 1.0, 8.0].choose(rng).copied().unwrap_or(1.0);
+                        // Hotter start, slower cooling, longer epochs
+                        let init_t = rng.random_range(1.6_f64..=2.4);
+                        let cooling = rng.random_range(0.9990_f64..=0.9997);
+                        let steps = rng.random_range(450..=700);
+
+                        // Acceptance targeting widened for sustained exploration
+                        let low = rng.random_range(0.08_f64..=0.15);
+                        let high = rng.random_range(0.60_f64..=0.70).max(low + 0.06);
+
+                        // Faster EMA for bandit and full/none reheat
+                        let ema = rng.random_range(0.25_f64..=0.40);
+                        let reheat = if rng.random_bool(0.5) { 1.0 } else { 0.0 };
                         let big_m = [1_000_000_000_i64, 1_250_000_000, 1_500_000_000]
                             .choose(rng)
                             .copied()
@@ -266,32 +277,34 @@ where
                             .with_steps_per_temp(steps)
                             .with_acceptance_targets(low, high)
                             .with_op_ema_alpha(ema)
-                            .with_reheat_factor(reheat)
+                            .with_reheat_factor(reheat) // 0.0 or 1.0
                             .with_big_m_for_energy(big_m);
 
-                        if rng.random_bool(0.45) {
+                        // Mostly rely on stale-refetch + reheat
+                        if rng.random_bool(0.25) {
                             s = s.with_hard_refetch_every(rng.random_range(14..=36));
                         }
-                        if rng.random_bool(0.70) {
-                            s = s.with_refetch_after_stale(rng.random_range(64..=160));
+                        if rng.random_bool(0.75) {
+                            s = s.with_refetch_after_stale(rng.random_range(48..=120));
                         }
 
                         Box::new(s)
                     }
 
                     Kind::Gls => {
-                        let lambda = [5_i64, 6, 7, 8].choose(rng).copied().unwrap_or(6);
+                        // Stronger penalty guidance with earlier pulses
+                        let lambda = [7_i64, 8, 9, 10].choose(rng).copied().unwrap_or(8);
                         let step = [2_i64, 3].choose(rng).copied().unwrap_or(2);
-                        let max_steps = rng.random_range(1400..=2200);
-                        let top_k = rng.random_range(12..=24);
-                        let stagnation = rng.random_range(8..=16);
+                        let max_steps = rng.random_range(1600..=2400);
+                        let top_k = rng.random_range(18..=28);
+                        let stagnation = rng.random_range(6..=12);
                         let decay = gls::DecayMode::Multiplicative {
-                            num: rng.random_range(92u32..=97),
+                            num: rng.random_range(90u32..=95),
                             den: 100,
                         };
                         let restart_on_publish = rng.random_bool(0.9);
-                        let reset_on_refetch = rng.random_bool(0.9);
-                        let kick = rng.random_range(3..=6);
+                        let reset_on_refetch = rng.random_bool(0.95);
+                        let kick = rng.random_range(5..=9);
 
                         let mut s = gls::gls_strategy::<Tnum, ChaCha8Rng>(model)
                             .with_lambda(lambda)
@@ -304,11 +317,12 @@ where
                             .with_max_penalty(1_000_000_000)
                             .with_pulse_params(stagnation, top_k);
 
-                        if rng.random_bool(0.50) {
+                        // Let it wander; periodic refetch occasionally
+                        if rng.random_bool(0.30) {
                             s = s.with_hard_refetch_every(rng.random_range(12..=36));
                         }
-                        if rng.random_bool(0.70) {
-                            s = s.with_refetch_after_stale(rng.random_range(64..=160));
+                        if rng.random_bool(0.75) {
+                            s = s.with_refetch_after_stale(rng.random_range(60..=140));
                         }
 
                         Box::new(s)
@@ -327,8 +341,8 @@ where
             let weights = &[
                 (Kind::Ils, 2usize),
                 (Kind::Tabu, 1usize),
-                (Kind::Sa, 1usize),
-                (Kind::Gls, 3usize),
+                (Kind::Sa, 4usize),
+                (Kind::Gls, 2usize),
             ];
             let mut bag: Vec<Kind> = Vec::new();
             for (k, w) in weights {

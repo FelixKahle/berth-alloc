@@ -19,7 +19,7 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use berth_alloc_core::prelude::TimeDelta;
+use berth_alloc_core::prelude::{Cost, TimeDelta};
 use rand::seq::SliceRandom;
 
 use crate::{
@@ -34,12 +34,14 @@ use crate::{
         operator::{DestroyOperator, LocalMoveOperator, RepairOperator},
         operator_library::{
             destroy::{
+                BerthBandDestroy, BerthNeighborsDestroy, ProcessingTimeClusterDestroy,
                 RandomKRatioDestroy, ShawRelatedDestroy, StringBlockDestroy, TimeClusterDestroy,
                 TimeWindowBandDestroy, WorstCostDestroy,
             },
             local::{
-                CrossExchangeAcrossBerths, HillClimbBestSwapSameBerth, HillClimbRelocateBest,
-                OrOptBlockRelocate, RandomRelocateAnywhere, RelocateSingleBest,
+                CrossExchangeAcrossBerths, CrossExchangeBestAcrossBerths,
+                HillClimbBestSwapSameBerth, HillClimbRelocateBest, OrOptBlockRelocate,
+                RandomRelocateAnywhere, RandomizedGreedyRelocateRcl, RelocateSingleBest,
                 RelocateSingleBestAllowWorsening, ShiftEarlierOnSameBerth, SwapPairSameBerth,
             },
             repair::{GreedyInsertion, KRegretInsertion, RandomizedGreedyInsertion},
@@ -376,7 +378,42 @@ where
                         &DefaultCostEvaluator,
                         dv_buf.as_mut_slice(),
                     );
-                    if let Some(plan) = op.propose(&mut pc, context.rng()) {
+                    if let Some(mut plan) = op.propose(&mut pc, context.rng()) {
+                        // Recompute base delta for this plan before applying
+                        use crate::model::index::RequestIndex;
+                        use crate::state::decisionvar::DecisionVar;
+                        use std::collections::HashMap;
+
+                        let mut base_delta: Cost = Cost::from(0);
+
+                        // Keep last patch per request (in case operators emit multiple)
+                        let mut last: HashMap<usize, DecisionVar<T>> = HashMap::new();
+                        for p in &plan.decision_var_patches {
+                            last.insert(p.index.get(), p.patch);
+                        }
+
+                        for (ri_u, patch) in last {
+                            let ri = RequestIndex::new(ri_u);
+                            let old_dv = current.decision_variables()[ri.get()];
+
+                            if let DecisionVar::Assigned(old) = old_dv
+                                && let Some(c) =
+                                    model.cost_of_assignment(ri, old.berth_index, old.start_time)
+                                {
+                                    base_delta = base_delta.saturating_sub(c);
+                                }
+                            if let DecisionVar::Assigned(new_dec) = patch
+                                && let Some(c) = model.cost_of_assignment(
+                                    ri,
+                                    new_dec.berth_index,
+                                    new_dec.start_time,
+                                ) {
+                                    base_delta = base_delta.saturating_add(c);
+                                }
+                        }
+
+                        plan.delta_cost = base_delta;
+
                         let mut tmp = current.clone();
                         tmp.apply_plan(plan);
 
@@ -399,7 +436,7 @@ where
                             current = tmp;
                             accepted_this_step = true;
                             improved_in_round |= better; // count only strict better as “improved”
-                            let _ = context.shared_incumbent().try_update(&current);
+                            let _ = context.shared_incumbent().try_update(&current, model);
                             tracing::trace!(
                                 "ILS: accepted local op {} (better={}, sideways={}, worse_random={})",
                                 op.name(),
@@ -449,7 +486,37 @@ where
                         &DefaultCostEvaluator,
                         dv_buf.as_mut_slice(),
                     );
-                    if let Some(plan) = d.propose(&mut pc, context.rng()) {
+                    if let Some(mut plan) = d.propose(&mut pc, context.rng()) {
+                        // Recompute base delta vs current
+                        use crate::model::index::RequestIndex;
+                        use crate::state::decisionvar::DecisionVar;
+                        use std::collections::HashMap;
+
+                        let mut base_delta: Cost = Cost::from(0);
+                        let mut last: HashMap<usize, DecisionVar<T>> = HashMap::new();
+                        for p in &plan.decision_var_patches {
+                            last.insert(p.index.get(), p.patch);
+                        }
+                        for (ri_u, patch) in last {
+                            let ri = RequestIndex::new(ri_u);
+                            let old_dv = current.decision_variables()[ri.get()];
+                            if let DecisionVar::Assigned(old) = old_dv
+                                && let Some(c) =
+                                    model.cost_of_assignment(ri, old.berth_index, old.start_time)
+                                {
+                                    base_delta = base_delta.saturating_sub(c);
+                                }
+                            if let DecisionVar::Assigned(new_dec) = patch
+                                && let Some(c) = model.cost_of_assignment(
+                                    ri,
+                                    new_dec.berth_index,
+                                    new_dec.start_time,
+                                ) {
+                                    base_delta = base_delta.saturating_add(c);
+                                }
+                        }
+                        plan.delta_cost = base_delta;
+
                         current.apply_plan(plan);
                         destroyed = true;
                         tracing::trace!("ILS: applied destroy op {}", d.name());
@@ -485,7 +552,39 @@ where
                         &DefaultCostEvaluator,
                         dv_buf.as_mut_slice(),
                     );
-                    if let Some(plan) = r.repair(&mut pc, context.rng()) {
+                    if let Some(mut plan) = r.repair(&mut pc, context.rng()) {
+                        // Recompute base delta vs temp (pre-application)
+                        use crate::model::index::RequestIndex;
+                        use crate::state::decisionvar::DecisionVar;
+                        use std::collections::HashMap;
+
+                        let mut base_delta: Cost = Cost::from(0);
+                        let mut last: HashMap<usize, DecisionVar<T>> = HashMap::new();
+                        for p in &plan.decision_var_patches {
+                            last.insert(p.index.get(), p.patch);
+                        }
+                        for (ri_u, patch) in last {
+                            let req_ix = RequestIndex::new(ri_u);
+                            let old_dv = temp.decision_variables()[req_ix.get()];
+                            if let DecisionVar::Assigned(old) = old_dv
+                                && let Some(c) = model.cost_of_assignment(
+                                    req_ix,
+                                    old.berth_index,
+                                    old.start_time,
+                                ) {
+                                    base_delta = base_delta.saturating_sub(c);
+                                }
+                            if let DecisionVar::Assigned(new_dec) = patch
+                                && let Some(c) = model.cost_of_assignment(
+                                    req_ix,
+                                    new_dec.berth_index,
+                                    new_dec.start_time,
+                                ) {
+                                    base_delta = base_delta.saturating_add(c);
+                                }
+                        }
+                        plan.delta_cost = base_delta;
+
                         temp.apply_plan(plan);
 
                         if self
@@ -496,7 +595,7 @@ where
                             repaired_and_accepted = true;
 
                             // Publish improvement vs baseline (may or may not beat global best).
-                            let _ = context.shared_incumbent().try_update(&current);
+                            let _ = context.shared_incumbent().try_update(&current, model);
                             tracing::trace!("ILS: accepted repair op {}", r.name());
                             break;
                         }
@@ -525,7 +624,7 @@ where
         }
 
         // Final publish (harmless if we didn't beat the incumbent).
-        let _ = context.shared_incumbent().try_update(&current);
+        let _ = context.shared_incumbent().try_update(&current, model);
     }
 }
 
@@ -539,31 +638,38 @@ where
     let neighbors_direct_competitors = neighbors::direct_competitors(proximity_map);
     let neighbors_same_berth = neighbors::same_berth(proximity_map);
 
-    // Aggressive ILS
+    // Intensify packing with tighter, structured ruins and stronger repair
     IteratedLocalSearchStrategy::new()
-        .with_max_local_steps(2000)
-        .with_refetch_after_stale(120)
-        .with_hard_refetch_every(20) // periodic refetch to avoid stickiness
-        .with_hard_refetch_mode(HardRefetchMode::IfBetter)
+        // Local budget and acceptance (tighter noise)
+        .with_local_steps_range(900..=1600)
+        .with_local_sideways(true)
+        .with_local_worsening_prob(0.015)
+        // Attempts per outer round (favor repair)
+        .with_destroy_attempts(12)
+        .with_repair_attempts(28)
         .with_shuffle_local_each_step(true)
+        // Refetch: stale-based with light periodic sync
+        .with_refetch_after_stale(45)
+        .with_hard_refetch_every(24)
+        .with_hard_refetch_mode(HardRefetchMode::IfBetter)
         // ------------------------- Local improvement -------------------------
         .with_local_op(Box::new(
             ShiftEarlierOnSameBerth::new(18..=52).with_neighbors(neighbors_same_berth.clone()),
         ))
         .with_local_op(Box::new(
-            RelocateSingleBest::new(18..=56).with_neighbors(neighbors_direct_competitors.clone()),
+            RelocateSingleBest::new(20..=64).with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            SwapPairSameBerth::new(32..=90).with_neighbors(neighbors_same_berth.clone()),
+            SwapPairSameBerth::new(36..=96).with_neighbors(neighbors_same_berth.clone()),
         ))
         .with_local_op(Box::new(
-            CrossExchangeAcrossBerths::new(32..=90)
+            CrossExchangeAcrossBerths::new(48..=128)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            OrOptBlockRelocate::new(3..=6, 1.5..=2.5).with_neighbors(neighbors_same_berth.clone()),
+            OrOptBlockRelocate::new(6..=10, 1.3..=1.8).with_neighbors(neighbors_same_berth.clone()),
         ))
-        // Diversification / controlled worsening
+        // Diversification
         .with_local_op(Box::new(
             RelocateSingleBestAllowWorsening::new(12..=24)
                 .with_neighbors(neighbors_direct_competitors.clone()),
@@ -573,37 +679,70 @@ where
         ))
         // Hill climbers
         .with_local_op(Box::new(
-            HillClimbRelocateBest::new(22..=66)
+            HillClimbRelocateBest::new(24..=72)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            HillClimbBestSwapSameBerth::new(40..=112).with_neighbors(neighbors_same_berth.clone()),
+            HillClimbBestSwapSameBerth::new(48..=120).with_neighbors(neighbors_same_berth.clone()),
         ))
-        // ---------------------- Destroy ----------------------
+        // ---------------------- Destroy (tight, structured) ----------------------
         .with_destroy_op(Box::new(
-            RandomKRatioDestroy::new(0.24..=0.56).with_neighbors(neighbors_any.clone()),
-        ))
-        .with_destroy_op(Box::new(
-            WorstCostDestroy::new(0.26..=0.44).with_neighbors(neighbors_direct_competitors.clone()),
+            RandomKRatioDestroy::new(0.26..=0.42).with_neighbors(neighbors_any.clone()),
         ))
         .with_destroy_op(Box::new(
-            TimeClusterDestroy::<T>::new(0.26..=0.40, TimeDelta::new(24.into()))
-                .with_alpha(1.6..=2.3)
+            WorstCostDestroy::new(0.28..=0.42).with_neighbors(neighbors_direct_competitors.clone()),
+        ))
+        // NEW: relatedness-driven seed expansion (time and berth proximity)
+        .with_destroy_op(Box::new(
+            ShawRelatedDestroy::new(
+                0.24..=0.36, // modest, focused ruin size
+                1.6..=2.2,   // greedy bias when picking neighbors
+                1.into(),    // weight_abs_start_gap
+                1.into(),    // weight_abs_end_gap
+                5.into(),    // penalty_berth_mismatch
+            )
+            .with_neighbors(neighbors_direct_competitors.clone()),
+        ))
+        .with_destroy_op(Box::new(
+            TimeClusterDestroy::<T>::new(0.28..=0.42, TimeDelta::new(24.into()))
+                .with_alpha(1.5..=1.75)
                 .with_neighbors(neighbors_any.clone()),
         ))
         .with_destroy_op(Box::new(
-            TimeWindowBandDestroy::<T>::new(0.34..=0.50, 1.5..=1.95, TimeDelta::new(12.into()))
+            TimeWindowBandDestroy::<T>::new(0.44..=0.56, 1.4..=1.9, TimeDelta::new(16.into()))
                 .with_neighbors(neighbors_any.clone()),
         ))
+        // NEW: berth-centric band around a seed (kept localized)
         .with_destroy_op(Box::new(
-            ShawRelatedDestroy::new(0.24..=0.44, 1.6..=2.3, 1.into(), 1.into(), 4.into())
+            BerthBandDestroy::new(
+                0.26..=0.40, // small-to-moderate band size
+                1.4..=1.9,   // seed greediness (longer rectangles)
+                1,           // half_berth_span (seed berth ±1)
+            ), // omit neighbors to prefer same-berth micro-bands via operator's default
+        ))
+        .with_destroy_op(Box::new(
+            StringBlockDestroy::new(0.32..=0.46).with_alpha(1.5..=2.0),
+        ))
+        // Same-berth micro-ruins to tighten dense lanes
+        .with_destroy_op(Box::new(
+            BerthNeighborsDestroy::new(0.28..=0.44, 1.4..=1.8)
                 .with_neighbors(neighbors_same_berth.clone()),
         ))
+        // NEW: cluster by processing time (help pack similar-length vessels)
         .with_destroy_op(Box::new(
-            StringBlockDestroy::new(0.30..=0.50).with_alpha(1.5..=2.2),
+            ProcessingTimeClusterDestroy::new(0.22..=0.34, 1.7..=2.0)
+                .with_neighbors(neighbors_direct_competitors.clone()),
         ))
-        // ---------------------- Repair ----------------------
-        .with_repair_op(Box::new(KRegretInsertion::new(4..=4)))
-        .with_repair_op(Box::new(RandomizedGreedyInsertion::new(1.6..=2.4)))
+        // ---------------------- Repair (denser packing) ----------------------
+        .with_repair_op(Box::new(KRegretInsertion::new(9..=11)))
+        .with_repair_op(Box::new(RandomizedGreedyInsertion::new(1.4..=2.0)))
         .with_repair_op(Box::new(GreedyInsertion))
+        // Post-repair shakers
+        .with_local_op(Box::new(
+            RandomizedGreedyRelocateRcl::new(18..=48, 1.5..=2.1)
+                .with_neighbors(neighbors_direct_competitors.clone()),
+        ))
+        .with_local_op(Box::new(
+            CrossExchangeBestAcrossBerths::new(32..=96).with_neighbors(neighbors_any.clone()),
+        ))
 }

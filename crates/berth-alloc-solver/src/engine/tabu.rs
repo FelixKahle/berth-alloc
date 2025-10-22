@@ -5,8 +5,7 @@
 // "Software"), to deal in the Software without restriction, including
 // without limitation the rights to use, copy, modify, merge, publish,
 // distribute, sublicense, and/or sell copies of the Software, and to
-// permit persons to whom the Software is furnished to do so, subject to
-// the following conditions:
+// permit persons to do so, subject to the following conditions:
 //
 // The above copyright notice and this permission notice shall be
 // included in all copies or substantial portions of the Software.
@@ -24,9 +23,10 @@
 use crate::engine::acceptor::Acceptor;
 use crate::engine::neighbors;
 use crate::search::operator_library::local::{
-    HillClimbBestSwapSameBerth, HillClimbRelocateBest, RandomRelocateAnywhere,
-    RelocateSingleBestAllowWorsening,
+    CrossExchangeBestAcrossBerths, HillClimbBestSwapSameBerth, HillClimbRelocateBest,
+    RandomRelocateAnywhere, RandomizedGreedyRelocateRcl, RelocateSingleBestAllowWorsening,
 };
+use crate::state::solver_state::SolverStateView;
 use crate::{
     core::numeric::SolveNumeric,
     engine::search::{SearchContext, SearchStrategy},
@@ -282,7 +282,36 @@ where
                 for &oi in &order {
                     let op = &self.local_ops[oi];
                     let mut pc = PlanningContext::new(model, current, &aug_eval, dv_buf);
-                    if let Some(plan) = op.propose(&mut pc, rng) {
+                    if let Some(mut plan) = op.propose(&mut pc, rng) {
+                        // Recompute base delta for the kick plan
+                        use crate::model::index::RequestIndex;
+                        use std::collections::HashMap;
+
+                        let mut base_delta: Cost = Cost::from(0);
+                        let mut last_patch: HashMap<usize, DecisionVar<T>> = HashMap::new();
+                        for p in &plan.decision_var_patches {
+                            last_patch.insert(p.index.get(), p.patch);
+                        }
+                        for (ri_u, patch) in last_patch {
+                            let ri = RequestIndex::new(ri_u);
+                            let old_dv = current.decision_variables()[ri.get()];
+                            if let DecisionVar::Assigned(old) = old_dv
+                                && let Some(c) =
+                                    model.cost_of_assignment(ri, old.berth_index, old.start_time)
+                                {
+                                    base_delta = base_delta.saturating_sub(c);
+                                }
+                            if let DecisionVar::Assigned(new_dec) = patch
+                                && let Some(c) = model.cost_of_assignment(
+                                    ri,
+                                    new_dec.berth_index,
+                                    new_dec.start_time,
+                                ) {
+                                    base_delta = base_delta.saturating_add(c);
+                                }
+                        }
+                        plan.delta_cost = base_delta;
+
                         current.apply_plan(plan);
                         kicked = true;
                         break;
@@ -432,7 +461,7 @@ where
                     let mut pc =
                         PlanningContext::new(model, &current, &aug_eval, dv_buf.as_mut_slice());
 
-                    if let Some(plan) = op.propose(&mut pc, context.rng()) {
+                    if let Some(mut plan) = op.propose(&mut pc, context.rng()) {
                         // Collect moved request IDs
                         let mut moved: HashSet<usize> = HashSet::new();
                         for p in &plan.decision_var_patches {
@@ -442,7 +471,36 @@ where
                             continue;
                         }
 
-                        // Build candidate by applying the plan
+                        // Recompute base delta for the plan vs `current` before applying
+                        use crate::model::index::RequestIndex;
+
+                        let mut base_delta: Cost = Cost::from(0);
+                        // Only the last patch per request matters
+                        let mut last_patch: HashMap<usize, DecisionVar<T>> = HashMap::new();
+                        for p in &plan.decision_var_patches {
+                            last_patch.insert(p.index.get(), p.patch);
+                        }
+                        for (ri_u, patch) in last_patch.iter() {
+                            let ri = RequestIndex::new(*ri_u);
+                            let old_dv = current.decision_variables()[ri.get()];
+                            if let DecisionVar::Assigned(old) = old_dv
+                                && let Some(c) =
+                                    model.cost_of_assignment(ri, old.berth_index, old.start_time)
+                                {
+                                    base_delta = base_delta.saturating_sub(c);
+                                }
+                            if let DecisionVar::Assigned(new_dec) = patch
+                                && let Some(c) = model.cost_of_assignment(
+                                    ri,
+                                    new_dec.berth_index,
+                                    new_dec.start_time,
+                                ) {
+                                    base_delta = base_delta.saturating_add(c);
+                                }
+                        }
+                        plan.delta_cost = base_delta;
+
+                        // Build candidate by applying the corrected plan
                         let mut cand = current.clone();
                         cand.apply_plan(plan);
 
@@ -541,7 +599,7 @@ where
                     .accept(best_true.fitness(), current.fitness())
                 {
                     best_true = current.clone();
-                    let _ = context.shared_incumbent().try_update(&best_true);
+                    let _ = context.shared_incumbent().try_update(&best_true, model);
 
                     if self.restart_on_publish {
                         self.reset_state(
@@ -659,7 +717,7 @@ where
         }
 
         // Final publish (no-op if not better).
-        let _ = context.shared_incumbent().try_update(&best_true);
+        let _ = context.shared_incumbent().try_update(&best_true, model);
     }
 }
 
@@ -693,22 +751,23 @@ where
 
     let feats_arc = Arc::new(feats);
 
-    // Aggressive Tabu
+    // Tabu tuned for intensification with modest diversification
     TabuSearchStrategy::new(feats_arc)
-        .with_lambda(6)
+        .with_lambda(7)
         .with_penalty_step(2)
         .with_decay(DecayMode::Multiplicative { num: 94, den: 100 })
         .with_max_penalty(1_000_000_000)
-        .with_max_local_steps(1800)
-        .with_tabu_tenure(24..=48)
-        .with_samples_per_step(128)
-        .with_refetch_after_stale(96)
+        .with_max_local_steps(2000)
+        .with_tabu_tenure(36..=60)
+        .with_samples_per_step(140)
+        .with_refetch_after_stale(60)
         .with_hard_refetch_every(24)
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
         .with_restart_on_publish(true)
         .with_reset_on_refetch(true)
-        .with_kick_steps_on_reset(4)
-        // ------------------------- Local (tabu-augmented costs) -------------------------
+        .with_kick_steps_on_reset(6)
+        .with_pulse_params(8, 18)
+        // ------------------------- Local operators -------------------------
         .with_local_op(Box::new(
             ShiftEarlierOnSameBerth::new(18..=52).with_neighbors(neighbors_same_berth.clone()),
         ))
@@ -719,13 +778,12 @@ where
             SwapPairSameBerth::new(36..=96).with_neighbors(neighbors_same_berth.clone()),
         ))
         .with_local_op(Box::new(
-            CrossExchangeAcrossBerths::new(36..=96)
+            CrossExchangeAcrossBerths::new(48..=128)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            OrOptBlockRelocate::new(3..=6, 1.5..=2.5).with_neighbors(neighbors_same_berth.clone()),
+            OrOptBlockRelocate::new(5..=9, 1.4..=1.9).with_neighbors(neighbors_same_berth.clone()),
         ))
-        // Diversification
         .with_local_op(Box::new(
             RelocateSingleBestAllowWorsening::new(12..=24)
                 .with_neighbors(neighbors_direct_competitors.clone()),
@@ -733,12 +791,18 @@ where
         .with_local_op(Box::new(
             RandomRelocateAnywhere::new(12..=24).with_neighbors(neighbors_any.clone()),
         ))
-        // Hill climbers
         .with_local_op(Box::new(
             HillClimbRelocateBest::new(24..=72)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
             HillClimbBestSwapSameBerth::new(48..=120).with_neighbors(neighbors_same_berth.clone()),
+        ))
+        .with_local_op(Box::new(
+            RandomizedGreedyRelocateRcl::new(18..=48, 1.5..=2.2)
+                .with_neighbors(neighbors_direct_competitors.clone()),
+        ))
+        .with_local_op(Box::new(
+            CrossExchangeBestAcrossBerths::new(32..=96).with_neighbors(neighbors_any.clone()),
         ))
 }

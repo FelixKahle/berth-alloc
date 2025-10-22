@@ -212,6 +212,43 @@ impl<'b, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> PlanBuilder<'b, 'c,
     where
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
+        // Guard: don’t allow assigning a request that is already assigned in this builder.
+        if let DecisionVar::Assigned(old) = self.decision_vars[request.get()] {
+            // In debug, surface it loudly; in release, handle as reassignment.
+            debug_assert!(
+                false,
+                "propose_assignment on already-assigned request {:?}; treating as reassignment",
+                request
+            );
+
+            // Release old interval and account for its cost first
+            let old_iv = self
+                .solver_model
+                .interval(request, old.berth_index, old.start_time)
+                .ok_or_else(|| {
+                    ProposeAssignmentError::NotAllowedOnBerth(NotAllowedOnBerthError::new(
+                        request,
+                        old.berth_index,
+                    ))
+                })?;
+
+            let old_cost = self
+                .cost_evaluator
+                .eval(self.solver_model, request, old.start_time, old.berth_index)
+                .ok_or_else(|| {
+                    ProposeAssignmentError::NotAllowedOnBerth(NotAllowedOnBerthError::new(
+                        request,
+                        old.berth_index,
+                    ))
+                })?;
+
+            self.sandbox
+                .release(old.berth_index, old_iv)
+                .map_err(ProposeAssignmentError::from)?;
+            self.delta_cost -= old_cost;
+            // delta_unassigned unchanged for reassignment
+        }
+
         let cost = self
             .cost_evaluator
             .eval(
@@ -251,7 +288,11 @@ impl<'b, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> PlanBuilder<'b, 'c,
             .map_err(ProposeAssignmentError::from)?;
 
         self.delta_cost += cost;
-        self.delta_unassigned -= 1;
+
+        // Only decrement unassigned if this request was truly unassigned before.
+        if !matches!(self.decision_vars[request.get()], DecisionVar::Assigned(_)) {
+            self.delta_unassigned -= 1;
+        }
 
         let assigned = DecisionVar::Assigned(Decision {
             berth_index: free_berth.berth_index(),

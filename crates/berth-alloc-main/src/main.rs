@@ -113,7 +113,9 @@ fn main() {
         let start_ts = Utc::now();
         let t0 = Instant::now();
 
-        let mut solver = SolverEngineBuilder::<i64>::default().build();
+        let mut solver = SolverEngineBuilder::<i64>::default()
+            .with_worker_count(6)
+            .build();
         let outcome = solver.solve(&problem);
 
         let runtime = t0.elapsed();

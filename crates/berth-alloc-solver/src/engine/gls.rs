@@ -33,9 +33,10 @@ use crate::{
     search::{
         operator::LocalMoveOperator,
         operator_library::local::{
-            CrossExchangeAcrossBerths, HillClimbBestSwapSameBerth, HillClimbRelocateBest,
-            OrOptBlockRelocate, RandomRelocateAnywhere, RelocateSingleBest,
-            RelocateSingleBestAllowWorsening, ShiftEarlierOnSameBerth, SwapPairSameBerth,
+            CrossExchangeAcrossBerths, CrossExchangeBestAcrossBerths, HillClimbBestSwapSameBerth,
+            HillClimbRelocateBest, OrOptBlockRelocate, RandomRelocateAnywhere,
+            RandomizedGreedyRelocateRcl, RelocateSingleBest, RelocateSingleBestAllowWorsening,
+            ShiftEarlierOnSameBerth, SwapPairSameBerth,
         },
         planner::{CostEvaluator, DefaultCostEvaluator, PlanningContext},
     },
@@ -603,7 +604,7 @@ where
                 DefaultCostEvaluator,
                 self.penalty_store.clone(),
                 self.lambda as Cost,
-                self.feature_extractor.clone(), // cheap Arc clone
+                self.feature_extractor.clone(),
             );
             for _ in 0..self.kick_steps_on_reset {
                 let mut order: Vec<usize> = (0..self.local_ops.len()).collect();
@@ -612,7 +613,37 @@ where
                 for &oi in &order {
                     let op = &self.local_ops[oi];
                     let mut pc = PlanningContext::new(model, current, &aug_eval, dv_buf);
-                    if let Some(plan) = op.propose(&mut pc, rng) {
+                    if let Some(mut plan) = op.propose(&mut pc, rng) {
+                        // --- recompute TRUE/base delta with "last patch wins" ---
+                        use crate::model::index::RequestIndex;
+                        use std::collections::HashMap;
+
+                        let mut base_delta: Cost = 0.into();
+                        let mut last: HashMap<usize, DecisionVar<T>> = HashMap::new();
+                        for p in &plan.decision_var_patches {
+                            last.insert(p.index.get(), p.patch);
+                        }
+                        for (ri_u, patch) in last {
+                            let ri = RequestIndex::new(ri_u);
+                            let old_dv = current.decision_variables()[ri.get()];
+                            if let DecisionVar::Assigned(old) = old_dv
+                                && let Some(c) =
+                                    model.cost_of_assignment(ri, old.berth_index, old.start_time)
+                                {
+                                    base_delta = base_delta.saturating_sub(c);
+                                }
+                            if let DecisionVar::Assigned(new_dec) = patch
+                                && let Some(c) = model.cost_of_assignment(
+                                    ri,
+                                    new_dec.berth_index,
+                                    new_dec.start_time,
+                                ) {
+                                    base_delta = base_delta.saturating_add(c);
+                                }
+                        }
+                        plan.delta_cost = base_delta;
+                        // -------------------------------------------------------
+
                         current.apply_plan(plan);
                         kicked = true;
                         break;
@@ -705,14 +736,54 @@ where
 
                 for &i in &order {
                     let op = &self.local_ops[i];
+                    // Keep using augmented planner for operator proposal (selection uses augmented)
                     let mut pc =
                         PlanningContext::new(model, &current, &aug_eval, dv_buf.as_mut_slice());
 
-                    if let Some(plan) = op.propose(&mut pc, context.rng()) {
+                    if let Some(mut plan) = op.propose(&mut pc, context.rng()) {
+                        // --- Recompute TRUE/base delta with “last patch per request wins” ---
+                        use crate::model::index::RequestIndex;
+                        use crate::state::decisionvar::DecisionVar;
+                        use std::collections::HashMap;
+
+                        let mut base_delta: Cost = Cost::from(0);
+
+                        // Keep only the final patch per request
+                        let mut last: HashMap<usize, DecisionVar<T>> = HashMap::new();
+                        for p in &plan.decision_var_patches {
+                            last.insert(p.index.get(), p.patch);
+                        }
+
+                        for (ri_u, patch) in last {
+                            let ri = RequestIndex::new(ri_u);
+                            let old_dv = current.decision_variables()[ri.get()];
+
+                            // subtract old base cost
+                            if let DecisionVar::Assigned(old) = old_dv
+                                && let Some(c) =
+                                    model.cost_of_assignment(ri, old.berth_index, old.start_time)
+                                {
+                                    base_delta = base_delta.saturating_sub(c);
+                                }
+                            // add new base cost
+                            if let DecisionVar::Assigned(new_dec) = patch
+                                && let Some(c) = model.cost_of_assignment(
+                                    ri,
+                                    new_dec.berth_index,
+                                    new_dec.start_time,
+                                ) {
+                                    base_delta = base_delta.saturating_add(c);
+                                }
+                        }
+
+                        // Carry the base delta so Fitness stays TRUE/base-accurate
+                        plan.delta_cost = base_delta;
+                        // ---------------------------------------------------------------------
+
                         let mut cand = current.clone();
                         cand.apply_plan(plan);
 
-                        // GLS acceptor on augmented objective
+                        // GLS acceptor on augmented objective (unchanged)
                         let cur_aug = augmented_cost_of_state(
                             &current,
                             self.feature_extractor.as_ref(),
@@ -737,13 +808,13 @@ where
                         ) {
                             current = cand;
 
-                            // If we also improved the TRUE objective, capture & publish.
+                            // TRUE objective for best publishing (unchanged)
                             if self
                                 .true_acceptor
                                 .accept(best_true.fitness(), current.fitness())
                             {
                                 best_true = current.clone();
-                                let _ = context.shared_incumbent().try_update(&best_true);
+                                let _ = context.shared_incumbent().try_update(&best_true, model);
 
                                 if self.restart_on_publish {
                                     current = best_true.clone();
@@ -841,7 +912,7 @@ where
         }
 
         // Final publish (no-op if not better).
-        let _ = context.shared_incumbent().try_update(&best_true);
+        let _ = context.shared_incumbent().try_update(&best_true, model);
     }
 }
 
@@ -853,12 +924,13 @@ where
     T: SolveNumeric + ToPrimitive + Copy + From<i32>,
     R: rand::Rng,
 {
+    // Slightly finer buckets to better target conflicts with PT 12–30
     let bucketizer: fn(TimePoint<T>) -> i64 = |t: TimePoint<T>| -> i64 {
         let v_i64 = t
             .value()
             .to_i64()
             .expect("TimePoint<T>::value() must be convertible to i64 for bucketing");
-        v_i64 / 90
+        v_i64 / 75
     };
 
     let feats = DefaultFeatureExtractor::new(bucketizer)
@@ -871,27 +943,26 @@ where
 
     let feats_arc = std::sync::Arc::new(feats);
 
-    // --- neighbor scopes (preconfigured) ---
     let proximity_map = model.proximity_map();
     let neighbors_any = neighbors::any(proximity_map);
     let neighbors_direct_competitors = neighbors::direct_competitors(proximity_map);
     let neighbors_same_berth = neighbors::same_berth(proximity_map);
 
-    // Aggressive GLS for ~20 berths / ~250 ships / PT 20–120
+    // Guidance tuned to intensify without over-penalizing
     GuidedLocalSearchStrategy::new(feats_arc)
-        .with_lambda(7)
+        .with_lambda(9)
         .with_penalty_step(2)
-        .with_decay(DecayMode::Multiplicative { num: 95, den: 100 }) // 95%
+        .with_decay(DecayMode::Multiplicative { num: 95, den: 100 })
         .with_max_penalty(1_000_000_000)
-        .with_pulse_params(10, 18) // stagnation, top-k
-        .with_max_local_steps(2000)
-        .with_refetch_after_stale(120)
-        .with_hard_refetch_every(24) // periodic gentle shake-up
+        .with_pulse_params(8, 20)
+        .with_max_local_steps(2100)
+        .with_refetch_after_stale(60)
+        .with_hard_refetch_every(24)
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
         .with_restart_on_publish(true)
         .with_reset_on_refetch(true)
-        .with_kick_steps_on_reset(5)
-        // ------------------------- Local operators (aggressive) -------------------------
+        .with_kick_steps_on_reset(6)
+        // ------------------------- Local operators -------------------------
         .with_local_op(Box::new(
             ShiftEarlierOnSameBerth::new(18..=52).with_neighbors(neighbors_same_berth.clone()),
         ))
@@ -902,11 +973,11 @@ where
             SwapPairSameBerth::new(36..=96).with_neighbors(neighbors_same_berth.clone()),
         ))
         .with_local_op(Box::new(
-            CrossExchangeAcrossBerths::new(36..=96)
+            CrossExchangeAcrossBerths::new(48..=128)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            OrOptBlockRelocate::new(3..=6, 1.5..=2.5).with_neighbors(neighbors_same_berth.clone()),
+            OrOptBlockRelocate::new(5..=9, 1.4..=1.9).with_neighbors(neighbors_same_berth.clone()),
         ))
         .with_local_op(Box::new(
             RelocateSingleBestAllowWorsening::new(12..=24)
@@ -921,5 +992,12 @@ where
         ))
         .with_local_op(Box::new(
             HillClimbBestSwapSameBerth::new(48..=120).with_neighbors(neighbors_same_berth.clone()),
+        ))
+        .with_local_op(Box::new(
+            RandomizedGreedyRelocateRcl::new(18..=48, 1.5..=2.2)
+                .with_neighbors(neighbors_direct_competitors.clone()),
+        ))
+        .with_local_op(Box::new(
+            CrossExchangeBestAcrossBerths::new(32..=96).with_neighbors(neighbors_any.clone()),
         ))
 }

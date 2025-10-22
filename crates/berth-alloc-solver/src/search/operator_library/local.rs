@@ -1425,6 +1425,326 @@ where
     }
 }
 
+#[derive(Clone)]
+pub struct CrossExchangeBestAcrossBerths {
+    pub number_of_pair_attempts_to_try_range: std::ops::RangeInclusive<usize>,
+    pub neighbor_callback: Option<std::sync::Arc<crate::search::operator::NeighborFn>>,
+}
+
+impl CrossExchangeBestAcrossBerths {
+    pub fn new(range: std::ops::RangeInclusive<usize>) -> Self {
+        assert!(!range.is_empty());
+        Self {
+            number_of_pair_attempts_to_try_range: range,
+            neighbor_callback: None,
+        }
+    }
+    pub fn with_neighbors(
+        mut self,
+        cb: std::sync::Arc<crate::search::operator::NeighborFn>,
+    ) -> Self {
+        self.neighbor_callback = Some(cb);
+        self
+    }
+}
+
+impl<T, C, R> crate::search::operator::LocalMoveOperator<T, C, R> for CrossExchangeBestAcrossBerths
+where
+    T: Copy
+        + Ord
+        + num_traits::CheckedAdd
+        + num_traits::CheckedSub
+        + Into<berth_alloc_core::prelude::Cost>
+        + std::ops::Mul<Output = berth_alloc_core::prelude::Cost>,
+    C: crate::search::planner::CostEvaluator<T>,
+    R: rand::Rng,
+{
+    fn name(&self) -> &str {
+        "CrossExchangeBestAcrossBerths"
+    }
+
+    fn propose<'b, 'c, 's, 'm, 'p>(
+        &self,
+        context: &mut crate::search::planner::PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
+        rng: &mut R,
+    ) -> Option<crate::state::plan::Plan<'p, T>> {
+        use crate::model::index::{BerthIndex, RequestIndex};
+        use crate::state::decisionvar::{Decision, DecisionVar};
+        use crate::state::terminal::terminalocc::FreeBerth;
+
+        let model = context.model();
+
+        // Collect assigned (ri, (berth, start))
+        let seed_builder = context.builder();
+        let assigned: Vec<(
+            RequestIndex,
+            (BerthIndex, berth_alloc_core::prelude::TimePoint<T>),
+        )> = seed_builder.with_explorer(|ex| {
+            ex.decision_vars()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, dv)| {
+                    if let DecisionVar::Assigned(Decision {
+                        berth_index,
+                        start_time,
+                    }) = *dv
+                    {
+                        Some((RequestIndex::new(i), (berth_index, start_time)))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        });
+        if assigned.len() < 2 {
+            return None;
+        }
+
+        // Neighborhood restriction or fallback
+        let (mut pool, _seed) =
+            restrict_to_neighborhood_or_fallback(rng, &assigned, &self.neighbor_callback);
+
+        // Need at least two different berths in pool
+        let mut seen = std::collections::BTreeSet::new();
+        for (_, (b, _)) in &pool {
+            seen.insert(*b);
+        }
+        if seen.len() < 2 {
+            pool = assigned.clone();
+        }
+
+        let attempts =
+            clamp_range_sample(rng, &self.number_of_pair_attempts_to_try_range, usize::MAX).max(1);
+
+        for _ in 0..attempts {
+            let mut shuffled = pool.clone();
+            shuffled.shuffle(rng);
+
+            // Find first cross-berth pair
+            let mut chosen = None;
+            'pick: for i in 0..(shuffled.len().saturating_sub(1)) {
+                for j in (i + 1)..shuffled.len() {
+                    let (ra, (bi_a, _sa)) = shuffled[i];
+                    let (rb, (bi_b, _sb)) = shuffled[j];
+                    if bi_a != bi_b {
+                        chosen = Some((ra, rb, bi_a, bi_b));
+                        break 'pick;
+                    }
+                }
+            }
+            let Some((ra, rb, bi_a, bi_b)) = chosen else {
+                continue;
+            };
+
+            // Fresh builder: unassign both, then reinsert each at best earliest on the other berth
+            let mut bld = context.builder();
+            let _ = bld.propose_unassignment(ra).ok()?;
+            let _ = bld.propose_unassignment(rb).ok()?;
+
+            // Best earliest for ra on bi_b
+            let opt_a = bld.with_explorer(|ex| {
+                let mut best: Option<(
+                    FreeBerth<T>,
+                    berth_alloc_core::prelude::TimePoint<T>,
+                    berth_alloc_core::prelude::Cost,
+                )> = None;
+                for free in ex.iter_free_for(ra).filter(|f| f.berth_index() == bi_b) {
+                    if let Some(pt) = model.processing_time(ra, bi_b) {
+                        let iv = free.interval();
+                        let s = iv.start();
+                        if s + pt <= iv.end()
+                            && let Some(c) = ex.peek_cost(ra, s, bi_b) {
+                                match best {
+                                    None => best = Some((free, s, c)),
+                                    Some((_, _, bc)) if c < bc => best = Some((free, s, c)),
+                                    _ => {}
+                                }
+                            }
+                    }
+                }
+                best
+            });
+            let Some((fb_a, s_a, _)) = opt_a else {
+                continue;
+            };
+
+            if bld.propose_assignment(ra, s_a, &fb_a).is_err() {
+                continue;
+            }
+
+            // Best earliest for rb on bi_a (after ra placed)
+            let opt_b = bld.with_explorer(|ex| {
+                let mut best: Option<(
+                    FreeBerth<T>,
+                    berth_alloc_core::prelude::TimePoint<T>,
+                    berth_alloc_core::prelude::Cost,
+                )> = None;
+                for free in ex.iter_free_for(rb).filter(|f| f.berth_index() == bi_a) {
+                    if let Some(pt) = model.processing_time(rb, bi_a) {
+                        let iv = free.interval();
+                        let s = iv.start();
+                        if s + pt <= iv.end()
+                            && let Some(c) = ex.peek_cost(rb, s, bi_a) {
+                                match best {
+                                    None => best = Some((free, s, c)),
+                                    Some((_, _, bc)) if c < bc => best = Some((free, s, c)),
+                                    _ => {}
+                                }
+                            }
+                    }
+                }
+                best
+            });
+            let Some((fb_b, s_b, _)) = opt_b else {
+                continue;
+            };
+
+            if bld.propose_assignment(rb, s_b, &fb_b).is_err() {
+                continue;
+            }
+
+            if !bld.has_changes() {
+                continue;
+            }
+            if bld.peek_fitness().is_none() {
+                continue;
+            }
+            return Some(bld.finalize());
+        }
+
+        None
+    }
+}
+
+#[derive(Clone)]
+pub struct RandomizedGreedyRelocateRcl {
+    pub number_of_candidates_to_try_range: std::ops::RangeInclusive<usize>,
+    pub rcl_alpha_range: std::ops::RangeInclusive<f64>,
+    pub neighbor_callback: Option<std::sync::Arc<crate::search::operator::NeighborFn>>,
+}
+
+impl RandomizedGreedyRelocateRcl {
+    pub fn new(k: std::ops::RangeInclusive<usize>, alpha: std::ops::RangeInclusive<f64>) -> Self {
+        assert!(!k.is_empty() && !alpha.is_empty());
+        Self {
+            number_of_candidates_to_try_range: k,
+            rcl_alpha_range: alpha,
+            neighbor_callback: None,
+        }
+    }
+    pub fn with_neighbors(
+        mut self,
+        cb: std::sync::Arc<crate::search::operator::NeighborFn>,
+    ) -> Self {
+        self.neighbor_callback = Some(cb);
+        self
+    }
+}
+
+impl<T, C, R> crate::search::operator::LocalMoveOperator<T, C, R> for RandomizedGreedyRelocateRcl
+where
+    T: Copy
+        + Ord
+        + num_traits::CheckedAdd
+        + num_traits::CheckedSub
+        + Into<berth_alloc_core::prelude::Cost>
+        + std::ops::Mul<Output = berth_alloc_core::prelude::Cost>,
+    C: crate::search::planner::CostEvaluator<T>,
+    R: rand::Rng,
+{
+    fn name(&self) -> &str {
+        "RandomizedGreedyRelocateRCL"
+    }
+
+    fn propose<'b, 'c, 's, 'm, 'p>(
+        &self,
+        context: &mut crate::search::planner::PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
+        rng: &mut R,
+    ) -> Option<crate::state::plan::Plan<'p, T>> {
+        use crate::model::index::RequestIndex;
+        use crate::state::decisionvar::{Decision, DecisionVar};
+        use crate::state::terminal::terminalocc::FreeBerth;
+
+        let model = context.model();
+        let seed = context.builder();
+        let assigned: Vec<(RequestIndex, ())> = seed.with_explorer(|ex| {
+            ex.decision_vars()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, dv)| {
+                    if let DecisionVar::Assigned(Decision { .. }) = *dv {
+                        Some((RequestIndex::new(i), ()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        });
+        if assigned.is_empty() {
+            return None;
+        }
+
+        let (mut pool, _seed) =
+            restrict_to_neighborhood_or_fallback(rng, &assigned, &self.neighbor_callback);
+        let k = clamp_range_sample(rng, &self.number_of_candidates_to_try_range, pool.len()).max(1);
+        pool.shuffle(rng);
+        pool.truncate(k);
+
+        let alpha = {
+            let lo = *self.rcl_alpha_range.start();
+            let hi = *self.rcl_alpha_range.end();
+            if (lo - hi).abs() < f64::EPSILON {
+                lo
+            } else {
+                rng.random_range(lo..=hi)
+            }
+        };
+
+        for (ri, _) in pool {
+            let mut bld = context.builder();
+            // enumerate earliest-feasible placements and rank by cost
+            let mut opts: Vec<(
+                FreeBerth<T>,
+                berth_alloc_core::prelude::TimePoint<T>,
+                berth_alloc_core::prelude::Cost,
+            )> = bld.with_explorer(|ex| {
+                let mut v = Vec::new();
+                for free in ex.iter_free_for(ri) {
+                    let b = free.berth_index();
+                    if let Some(pt) = model.processing_time(ri, b) {
+                        let iv = free.interval();
+                        let s = iv.start();
+                        if s + pt <= iv.end()
+                            && let Some(c) = ex.peek_cost(ri, s, b) {
+                                v.push((free, s, c));
+                            }
+                    }
+                }
+                v
+            });
+            if opts.is_empty() {
+                continue;
+            }
+            opts.sort_by_key(|(_, _, c)| *c);
+
+            let idx = rcl_index(opts.len(), alpha, rng);
+            let (fb, s, _c) = opts[idx].clone();
+
+            let _ = bld.propose_unassignment(ri).ok()?;
+            bld.propose_assignment(ri, s, &fb).ok()?;
+            if !bld.has_changes() {
+                continue;
+            }
+            if bld.peek_fitness().is_none() {
+                continue;
+            }
+            return Some(bld.finalize());
+        }
+
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -152,6 +152,8 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cos
     where
         T: std::fmt::Display + std::fmt::Debug,
     {
+        tracing::info!("Cost of solution: {}", self.fitness.cost);
+
         let flexible_assignments = self.make_flexible_assignments(solver_model);
         let fixed_assignments = solver_model
             .problem()

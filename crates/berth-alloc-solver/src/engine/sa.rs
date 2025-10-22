@@ -5,8 +5,7 @@
 // "Software"), to deal in the Software without restriction, including
 // without limitation the rights to use, copy, modify, merge, publish,
 // distribute, sublicense, and/or sell copies of the Software, and to
-// permit persons to whom the Software is furnished to do so, subject to
-// the following conditions:
+// permit persons to do so, subject to the following conditions:
 //
 // The above copyright notice and this permission notice shall be
 // included in all copies or substantial portions of the Software.
@@ -32,14 +31,19 @@ use crate::{
     search::{
         operator::LocalMoveOperator,
         operator_library::local::{
-            CrossExchangeAcrossBerths, HillClimbBestSwapSameBerth, HillClimbRelocateBest,
-            OrOptBlockRelocate, RandomRelocateAnywhere, RelocateSingleBest,
-            RelocateSingleBestAllowWorsening, ShiftEarlierOnSameBerth, SwapPairSameBerth,
+            CrossExchangeAcrossBerths, CrossExchangeBestAcrossBerths, HillClimbBestSwapSameBerth,
+            HillClimbRelocateBest, OrOptBlockRelocate, RandomRelocateAnywhere,
+            RandomizedGreedyRelocateRcl, RelocateSingleBest, RelocateSingleBestAllowWorsening,
+            ShiftEarlierOnSameBerth, SwapPairSameBerth,
         },
         planner::{DefaultCostEvaluator, PlanningContext},
     },
-    state::{fitness::Fitness, solver_state::SolverState},
+    state::{
+        fitness::Fitness,
+        solver_state::{SolverState, SolverStateView},
+    },
 };
+use berth_alloc_core::prelude::Cost;
 use std::sync::atomic::Ordering as AtomicOrdering;
 
 #[derive(Clone, Copy)]
@@ -112,7 +116,7 @@ where
     hard_refetch_every: usize,  // every N epochs; 0 => off
     hard_refetch_mode: HardRefetchMode,
 
-    // Reheat control: 0.0 => disabled; 1.0 => reset to init_temperature; (0,1) => partial
+    // Reheat control: 0.0 => disabled; 1.0 => reset to initial temperature on refetch; (0,1) => partial
     reheat_factor: f64,
 
     // ---- Adaptive operator scheduling (bandit-style) ----
@@ -391,7 +395,44 @@ where
                 );
                 tried_this_epoch = tried_this_epoch.saturating_add(1);
 
-                if let Some(plan) = op.propose(&mut pc, context.rng()) {
+                if let Some(mut plan) = op.propose(&mut pc, context.rng()) {
+                    // Recompute base delta for the plan before applying to keep Fitness true/base.
+                    use crate::model::index::RequestIndex;
+                    use crate::state::decisionvar::DecisionVar;
+                    use std::collections::HashMap;
+
+                    let mut base_delta: Cost = Cost::from(0);
+
+                    // Keep last patch per request if multiple appear
+                    let mut last: HashMap<usize, DecisionVar<T>> = HashMap::new();
+                    for p in &plan.decision_var_patches {
+                        last.insert(p.index.get(), p.patch);
+                    }
+
+                    for (ri_u, patch) in last {
+                        let ri = RequestIndex::new(ri_u);
+                        let old_dv = current.decision_variables()[ri.get()];
+
+                        // subtract old base cost
+                        if let DecisionVar::Assigned(old) = old_dv
+                            && let Some(c) =
+                                model.cost_of_assignment(ri, old.berth_index, old.start_time)
+                            {
+                                base_delta = base_delta.saturating_sub(c);
+                            }
+                        // add new base cost
+                        if let DecisionVar::Assigned(new_dec) = patch
+                            && let Some(c) = model.cost_of_assignment(
+                                ri,
+                                new_dec.berth_index,
+                                new_dec.start_time,
+                            ) {
+                                base_delta = base_delta.saturating_add(c);
+                            }
+                    }
+
+                    plan.delta_cost = base_delta;
+
                     let mut tmp = current.clone();
                     tmp.apply_plan(plan);
 
@@ -404,7 +445,7 @@ where
                         let mut reward = 0.6;
                         if self.true_acceptor.accept(best.fitness(), current.fitness()) {
                             best = current.clone();
-                            let _ = context.shared_incumbent().try_update(&best);
+                            let _ = context.shared_incumbent().try_update(&best, model);
                             improved_global_in_epoch = true;
                             reward = 1.0;
                         }
@@ -434,7 +475,7 @@ where
                             // Upgrade `best` only if true objective improves.
                             if self.true_acceptor.accept(best.fitness(), current.fitness()) {
                                 best = current.clone();
-                                let _ = context.shared_incumbent().try_update(&best);
+                                let _ = context.shared_incumbent().try_update(&best, model);
                                 improved_global_in_epoch = true;
 
                                 // Bonus: a bit more credit if a worse-by-energy
@@ -507,7 +548,7 @@ where
         }
 
         // Final publish (no-op if `best` doesn't beat the shared incumbent).
-        let _ = context.shared_incumbent().try_update(&best);
+        let _ = context.shared_incumbent().try_update(&best, model);
     }
 }
 
@@ -521,36 +562,36 @@ where
     let neighbors_direct_competitors = neighbors::direct_competitors(proximity_map);
     let neighbors_same_berth = neighbors::same_berth(proximity_map);
 
-    // Aggressive SA
+    // SA with tighter acceptance and partial reheat for steady progress
     SimulatedAnnealingStrategy::new()
-        .with_init_temp(1.0)
-        .with_cooling(0.999) // slower early cooling
-        .with_steps_per_temp(400) // more exploration per temp
-        .with_refetch_after_stale(64)
-        .with_hard_refetch_every(18)
+        .with_init_temp(1.7)
+        .with_cooling(0.99925)
+        .with_steps_per_temp(600)
+        .with_refetch_after_stale(60)
+        .with_hard_refetch_every(24)
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
-        .with_reheat_factor(8.0)
-        .with_op_ema_alpha(0.25)
-        .with_acceptance_targets(0.12, 0.60) // cool, hot
+        .with_reheat_factor(0.6)
+        .with_op_ema_alpha(0.30)
+        .with_op_min_weight(0.10)
+        .with_acceptance_targets(0.10, 0.52)
         .with_big_m_for_energy(1_250_000_000)
-        // ------------------------- Local improvement -------------------------
+        // ------------------------- Local operators -------------------------
         .with_local_op(Box::new(
             ShiftEarlierOnSameBerth::new(18..=52).with_neighbors(neighbors_same_berth.clone()),
         ))
         .with_local_op(Box::new(
-            RelocateSingleBest::new(18..=56).with_neighbors(neighbors_direct_competitors.clone()),
+            RelocateSingleBest::new(20..=64).with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            SwapPairSameBerth::new(32..=90).with_neighbors(neighbors_same_berth.clone()),
+            SwapPairSameBerth::new(36..=96).with_neighbors(neighbors_same_berth.clone()),
         ))
         .with_local_op(Box::new(
-            CrossExchangeAcrossBerths::new(32..=90)
+            CrossExchangeAcrossBerths::new(48..=128)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
-            OrOptBlockRelocate::new(3..=6, 1.5..=2.5).with_neighbors(neighbors_same_berth.clone()),
+            OrOptBlockRelocate::new(5..=9, 1.4..=1.9).with_neighbors(neighbors_same_berth.clone()),
         ))
-        // ------------------------- Diversification -------------------------
         .with_local_op(Box::new(
             RelocateSingleBestAllowWorsening::new(12..=24)
                 .with_neighbors(neighbors_direct_competitors.clone()),
@@ -558,12 +599,18 @@ where
         .with_local_op(Box::new(
             RandomRelocateAnywhere::new(12..=24).with_neighbors(neighbors_any.clone()),
         ))
-        // ------------------------- Hill climbers -------------------------
         .with_local_op(Box::new(
             HillClimbRelocateBest::new(24..=72)
                 .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_local_op(Box::new(
             HillClimbBestSwapSameBerth::new(48..=120).with_neighbors(neighbors_same_berth.clone()),
+        ))
+        .with_local_op(Box::new(
+            RandomizedGreedyRelocateRcl::new(18..=48, 1.5..=2.2)
+                .with_neighbors(neighbors_direct_competitors.clone()),
+        ))
+        .with_local_op(Box::new(
+            CrossExchangeBestAcrossBerths::new(32..=96).with_neighbors(neighbors_any.clone()),
         ))
 }
