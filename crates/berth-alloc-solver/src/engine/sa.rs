@@ -24,12 +24,17 @@ use crate::{
     core::numeric::SolveNumeric,
     engine::{
         acceptor::{Acceptor, LexStrictAcceptor},
+        adaptive::{
+            ops_book::OperatorBook,
+            selection::SoftmaxSelector,
+            tuning::{DefaultOperatorTuner, LocalCountTargetTuner, OrOptBlockKTuner},
+        },
         neighbors,
         search::{SearchContext, SearchStrategy},
     },
     model::solver_model::SolverModel,
     search::{
-        operator::LocalMoveOperator,
+        operator::{LocalMoveOperator, OperatorKind},
         operator_library::local::{
             CrossExchangeAcrossBerths, CrossExchangeBestAcrossBerths, HillClimbBestSwapSameBerth,
             HillClimbRelocateBest, OrOptBlockRelocate, RandomRelocateAnywhere,
@@ -52,9 +57,8 @@ pub enum HardRefetchMode {
     Always,
 }
 
-/// Energy-ordered acceptor used by SA for *deterministic* improvements.
+/// Energy-ordered acceptor used by SA for deterministic improvements.
 /// Uses a BIG-M scalarization to strongly prioritize fewer unassigned requests.
-/// Assumes Cost = i64.
 #[derive(Debug, Clone)]
 pub struct EnergyAcceptor {
     big_m: i64,
@@ -63,7 +67,7 @@ impl Default for EnergyAcceptor {
     fn default() -> Self {
         Self {
             big_m: 1_000_000_000,
-        } // strong priority on unassigned
+        }
     }
 }
 impl EnergyAcceptor {
@@ -89,7 +93,8 @@ impl Acceptor for EnergyAcceptor {
 }
 
 /// Simulated Annealing with:
-/// - bandit-style adaptive operator selection (EMA-weighted roulette)
+/// - adaptive operator selection (Softmax by EWMA improvement/ms)
+/// - per-operator tuning using OperatorTuning
 /// - acceptance-ratio guided temperature adaptation
 /// - lex-true upgrades for publishing/shared-incumbent
 pub struct SimulatedAnnealingStrategy<T, R>
@@ -99,6 +104,8 @@ where
 {
     // Local search operators (true objective via DefaultCostEvaluator).
     local_ops: Vec<Box<dyn LocalMoveOperator<T, DefaultCostEvaluator, R>>>,
+    // Adaptive operator book for locals
+    local_book: OperatorBook<T, R>,
 
     // Temperature schedule
     temperature: f64,
@@ -118,14 +125,6 @@ where
 
     // Reheat control: 0.0 => disabled; 1.0 => reset to initial temperature on refetch; (0,1) => partial
     reheat_factor: f64,
-
-    // ---- Adaptive operator scheduling (bandit-style) ----
-    // Per-operator positive weights used in weighted roulette selection.
-    op_weights: Vec<f64>,
-    // EMA step for weight updates (0,1]; higher -> faster adaptation.
-    op_ema_alpha: f64,
-    // Keep all operators selectable.
-    op_min_weight: f64,
 
     // ---- Adaptive acceptance targeting ----
     ar_target_low: f64,  // if acceptance ratio < low -> heat up a bit
@@ -150,6 +149,10 @@ where
     pub fn new() -> Self {
         Self {
             local_ops: Vec::new(),
+            local_book: OperatorBook::new(
+                OperatorKind::Local,
+                Box::new(SoftmaxSelector::default()),
+            ),
             temperature: 1.0,
             init_temperature: 1.0,
             cooling: 0.995,
@@ -161,10 +164,6 @@ where
             hard_refetch_every: 0,
             hard_refetch_mode: HardRefetchMode::IfBetter,
             reheat_factor: 1.0, // default: full reheat on refetch
-            // bandit defaults
-            op_weights: Vec::new(),
-            op_ema_alpha: 0.15,
-            op_min_weight: 0.05,
             // acceptance ratio guidance
             ar_target_low: 0.10,
             ar_target_high: 0.45,
@@ -176,6 +175,20 @@ where
         op: Box<dyn LocalMoveOperator<T, DefaultCostEvaluator, R>>,
     ) -> Self {
         self.local_ops.push(op);
+        // register default tuner for this operator slot
+        let _ = self
+            .local_book
+            .register_operator(Box::new(DefaultOperatorTuner::default()));
+        self
+    }
+
+    pub fn with_local_op_tuned(
+        mut self,
+        op: Box<dyn LocalMoveOperator<T, DefaultCostEvaluator, R>>,
+        tuner: Box<dyn crate::engine::adaptive::tuning::OperatorTuner<T>>,
+    ) -> Self {
+        self.local_ops.push(op);
+        let _ = self.local_book.register_operator(tuner);
         self
     }
 
@@ -216,21 +229,17 @@ where
         self
     }
 
+    pub fn with_min_temperature(mut self, t_min: f64) -> Self {
+        self.min_temperature = t_min.max(0.0);
+        self
+    }
+
     /// 0.0 => no reheat; 1.0 => reset to initial temperature on refetch; (0,1) => partial reheat.
     pub fn with_reheat_factor(mut self, f: f64) -> Self {
         self.reheat_factor = f.clamp(0.0, 1.0);
         self
     }
 
-    // (Optional) public tuners for bandit and acceptance targets:
-    pub fn with_op_ema_alpha(mut self, a: f64) -> Self {
-        self.op_ema_alpha = a.clamp(0.01, 0.9);
-        self
-    }
-    pub fn with_op_min_weight(mut self, w: f64) -> Self {
-        self.op_min_weight = w.clamp(0.0, 1.0);
-        self
-    }
     pub fn with_acceptance_targets(mut self, low: f64, high: f64) -> Self {
         self.ar_target_low = low.clamp(0.0, 1.0);
         self.ar_target_high = high.clamp(self.ar_target_low, 1.0);
@@ -256,32 +265,6 @@ where
             // raise to at least target, but do not reduce temperature if already higher
             *temp = temp.max(target);
         }
-    }
-
-    #[inline]
-    fn pick_operator_index(&self, rng: &mut R, weights: &[f64]) -> usize {
-        debug_assert!(!weights.is_empty());
-        let sum: f64 = weights.iter().copied().sum();
-        // fall back to uniform if degenerate
-        if !sum.is_finite() || sum <= 0.0 {
-            return rng.random_range(0..weights.len());
-        }
-        let mut r = rng.random::<f64>() * sum;
-        for (i, w) in weights.iter().enumerate() {
-            r -= *w;
-            if r <= 0.0 {
-                return i;
-            }
-        }
-        weights.len() - 1
-    }
-
-    #[inline]
-    fn update_weight(w: &mut f64, alpha: f64, reward: f64, min_w: f64) {
-        // Reward in [0,1]; EMA update then clamp to [min_w, +inf).
-        let base = if w.is_finite() && *w > 0.0 { *w } else { 1.0 };
-        let new_w = (1.0 - alpha) * base + alpha * (reward.max(0.0));
-        *w = new_w.max(min_w);
     }
 
     #[inline]
@@ -325,13 +308,6 @@ where
         let mut temp = self.temperature;
         let mut epoch: usize = 0;
         let mut stale_epochs_without_global_improve: usize = 0;
-
-        // Lazily initialize operator weights (all ones).
-        if self.op_weights.len() != self.local_ops.len() {
-            // NOTE: we do not mutate &self here; it is &mut self already inside run()
-            self.op_weights.clear();
-            self.op_weights.resize(self.local_ops.len(), 1.0);
-        }
 
         'outer: loop {
             if stop.load(AtomicOrdering::Relaxed) {
@@ -383,19 +359,44 @@ where
                     break 'outer;
                 }
 
-                // Pick a single operator by weighted roulette.
-                let oi = self.pick_operator_index(context.rng(), &self.op_weights);
-                let op = &self.local_ops[oi];
+                // Global stats for tuning/selection
+                let global_stats = current.stats(model);
 
+                // SA stagnation: epochs without global improvement relative to refetch threshold.
+                let denom = self.refetch_after_stale.max(1);
+                let stuck_factor =
+                    (stale_epochs_without_global_improve as f64 / denom as f64).min(1.0);
+                let stagnation = crate::engine::adaptive::tuning::Stagnation {
+                    stale_rounds: stale_epochs_without_global_improve,
+                    stuck_factor,
+                };
+
+                // Retune all local operators once per step
+                self.local_book.retune_all(&global_stats, &stagnation);
+                // Select operator index via adaptive selector (stagnation-aware)
+                let oi = self
+                    .local_book
+                    .select(&global_stats, &stagnation, context.rng());
+
+                let op = &mut self.local_ops[oi];
+
+                // Push tuning to operator
+                let tuning = *self.local_book.tuning_for(oi);
+                op.tune(&tuning, &global_stats);
+
+                tried_this_epoch = tried_this_epoch.saturating_add(1);
+
+                let t0 = self.local_book.propose_started();
                 let mut pc = PlanningContext::new(
                     model,
                     &current,
                     &DefaultCostEvaluator,
                     dv_buf.as_mut_slice(),
                 );
-                tried_this_epoch = tried_this_epoch.saturating_add(1);
 
                 if let Some(mut plan) = op.propose(&mut pc, context.rng()) {
+                    self.local_book.record_propose(oi, t0, true);
+
                     // Recompute base delta for the plan before applying to keep Fitness true/base.
                     use crate::model::index::RequestIndex;
                     use crate::state::decisionvar::DecisionVar;
@@ -417,18 +418,19 @@ where
                         if let DecisionVar::Assigned(old) = old_dv
                             && let Some(c) =
                                 model.cost_of_assignment(ri, old.berth_index, old.start_time)
-                            {
-                                base_delta = base_delta.saturating_sub(c);
-                            }
+                        {
+                            base_delta = base_delta.saturating_sub(c);
+                        }
                         // add new base cost
                         if let DecisionVar::Assigned(new_dec) = patch
                             && let Some(c) = model.cost_of_assignment(
                                 ri,
                                 new_dec.berth_index,
                                 new_dec.start_time,
-                            ) {
-                                base_delta = base_delta.saturating_add(c);
-                            }
+                            )
+                        {
+                            base_delta = base_delta.saturating_add(c);
+                        }
                     }
 
                     plan.delta_cost = base_delta;
@@ -441,20 +443,15 @@ where
                         current = tmp.clone();
                         accepted_this_epoch = accepted_this_epoch.saturating_add(1);
 
-                        // Bandit reward: strong credit for true improvement; moderate otherwise.
-                        let mut reward = 0.6;
+                        // Record accepted outcome (true/base delta)
+                        self.local_book.record_outcome(oi, true, base_delta as f64);
+
+                        // Upgrade global if true objective improves.
                         if self.true_acceptor.accept(best.fitness(), current.fitness()) {
                             best = current.clone();
                             let _ = context.shared_incumbent().try_update(&best, model);
                             improved_global_in_epoch = true;
-                            reward = 1.0;
                         }
-                        Self::update_weight(
-                            &mut self.op_weights[oi],
-                            self.op_ema_alpha,
-                            reward,
-                            self.op_min_weight,
-                        );
                     } else {
                         // Maybe accept worse probabilistically using SA energy.
                         let e0 = self.sa_acceptor.energy(current.fitness());
@@ -464,39 +461,23 @@ where
                             current = tmp;
                             accepted_this_epoch = accepted_this_epoch.saturating_add(1);
 
-                            // Small credit for accepted-worse (diversification).
-                            Self::update_weight(
-                                &mut self.op_weights[oi],
-                                self.op_ema_alpha,
-                                0.25,
-                                self.op_min_weight,
-                            );
+                            // Record accepted-but-worse outcome too (for stats)
+                            self.local_book.record_outcome(oi, true, base_delta as f64);
 
                             // Upgrade `best` only if true objective improves.
                             if self.true_acceptor.accept(best.fitness(), current.fitness()) {
                                 best = current.clone();
                                 let _ = context.shared_incumbent().try_update(&best, model);
                                 improved_global_in_epoch = true;
-
-                                // Bonus: a bit more credit if a worse-by-energy
-                                // move still improved the true objective.
-                                Self::update_weight(
-                                    &mut self.op_weights[oi],
-                                    self.op_ema_alpha,
-                                    0.5,
-                                    self.op_min_weight,
-                                );
                             }
                         } else {
-                            // Tiny penalty (do not drive to zero).
-                            Self::update_weight(
-                                &mut self.op_weights[oi],
-                                self.op_ema_alpha,
-                                0.0,
-                                self.op_min_weight,
-                            );
+                            // produced but rejected
+                            self.local_book.record_outcome(oi, false, 0.0);
                         }
                     }
+                } else {
+                    // No plan produced
+                    self.local_book.record_propose(oi, t0, false);
                 }
             }
 
@@ -552,65 +533,111 @@ where
     }
 }
 
+// ====================== SA (hot start, adaptive cool) =======================
 pub fn sa_strategy<T, R>(model: &SolverModel<T>) -> SimulatedAnnealingStrategy<T, R>
 where
     T: SolveNumeric + From<i32>,
     R: rand::Rng,
 {
+    use crate::engine::adaptive::tuning::{
+        LocalCountTargetTuner, OrOptBlockKTuner, WorkBudgetTuner,
+    };
+
     let proximity_map = model.proximity_map();
     let neighbors_any = neighbors::any(proximity_map);
     let neighbors_direct_competitors = neighbors::direct_competitors(proximity_map);
     let neighbors_same_berth = neighbors::same_berth(proximity_map);
 
-    // SA with tighter acceptance and partial reheat for steady progress
+    let heavy = || {
+        WorkBudgetTuner::default()
+            .with_soft_time_budget_ms(0.60)
+            .with_intensity_bounds(0.06, 0.36)
+            .with_max_greediness(0.65)
+            .with_max_locality(0.75)
+    };
+
     SimulatedAnnealingStrategy::new()
-        .with_init_temp(1.7)
-        .with_cooling(0.99925)
-        .with_steps_per_temp(600)
-        .with_refetch_after_stale(60)
+        .with_init_temp(1.55)
+        .with_cooling(0.9992)
+        .with_min_temperature(1e-4)
+        .with_steps_per_temp(520)
+        .with_refetch_after_stale(48)
         .with_hard_refetch_every(24)
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
-        .with_reheat_factor(0.6)
-        .with_op_ema_alpha(0.30)
-        .with_op_min_weight(0.10)
-        .with_acceptance_targets(0.10, 0.52)
+        .with_reheat_factor(0.70)
+        .with_acceptance_targets(0.12, 0.50)
         .with_big_m_for_energy(1_250_000_000)
-        // ------------------------- Local operators -------------------------
-        .with_local_op(Box::new(
-            ShiftEarlierOnSameBerth::new(18..=52).with_neighbors(neighbors_same_berth.clone()),
-        ))
-        .with_local_op(Box::new(
-            RelocateSingleBest::new(20..=64).with_neighbors(neighbors_direct_competitors.clone()),
-        ))
-        .with_local_op(Box::new(
-            SwapPairSameBerth::new(36..=96).with_neighbors(neighbors_same_berth.clone()),
-        ))
-        .with_local_op(Box::new(
-            CrossExchangeAcrossBerths::new(48..=128)
-                .with_neighbors(neighbors_direct_competitors.clone()),
-        ))
-        .with_local_op(Box::new(
-            OrOptBlockRelocate::new(5..=9, 1.4..=1.9).with_neighbors(neighbors_same_berth.clone()),
-        ))
-        .with_local_op(Box::new(
-            RelocateSingleBestAllowWorsening::new(12..=24)
-                .with_neighbors(neighbors_direct_competitors.clone()),
-        ))
-        .with_local_op(Box::new(
-            RandomRelocateAnywhere::new(12..=24).with_neighbors(neighbors_any.clone()),
-        ))
-        .with_local_op(Box::new(
-            HillClimbRelocateBest::new(24..=72)
-                .with_neighbors(neighbors_direct_competitors.clone()),
-        ))
-        .with_local_op(Box::new(
-            HillClimbBestSwapSameBerth::new(48..=120).with_neighbors(neighbors_same_berth.clone()),
-        ))
-        .with_local_op(Box::new(
-            RandomizedGreedyRelocateRcl::new(18..=48, 1.5..=2.2)
-                .with_neighbors(neighbors_direct_competitors.clone()),
-        ))
-        .with_local_op(Box::new(
-            CrossExchangeBestAcrossBerths::new(32..=96).with_neighbors(neighbors_any.clone()),
-        ))
+        // locals
+        .with_local_op_tuned(
+            Box::new(
+                ShiftEarlierOnSameBerth::new(1..=1).with_neighbors(neighbors_same_berth.clone()),
+            ),
+            Box::new(LocalCountTargetTuner::new(18.0, 52.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                RelocateSingleBest::new(1..=1).with_neighbors(neighbors_direct_competitors.clone()),
+            ),
+            Box::new(LocalCountTargetTuner::new(20.0, 64.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(SwapPairSameBerth::new(1..=1).with_neighbors(neighbors_same_berth.clone())),
+            Box::new(LocalCountTargetTuner::new(36.0, 96.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                CrossExchangeAcrossBerths::new(1..=1)
+                    .with_neighbors(neighbors_direct_competitors.clone()),
+            ),
+            Box::new(LocalCountTargetTuner::new(48.0, 128.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                OrOptBlockRelocate::new(2..=3, 1.50).with_neighbors(neighbors_same_berth.clone()),
+            ),
+            Box::new(OrOptBlockKTuner::default()),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                OrOptBlockRelocate::new(5..=9, 1.60).with_neighbors(neighbors_same_berth.clone()),
+            ),
+            Box::new(OrOptBlockKTuner::default()),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                RelocateSingleBestAllowWorsening::new(1..=1)
+                    .with_neighbors(neighbors_direct_competitors.clone()),
+            ),
+            Box::new(LocalCountTargetTuner::new(12.0, 24.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(RandomRelocateAnywhere::new(1..=1).with_neighbors(neighbors_any.clone())),
+            Box::new(LocalCountTargetTuner::new(12.0, 24.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                HillClimbRelocateBest::new(1..=1)
+                    .with_neighbors(neighbors_direct_competitors.clone()),
+            ),
+            Box::new(heavy()),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                HillClimbBestSwapSameBerth::new(1..=1).with_neighbors(neighbors_same_berth.clone()),
+            ),
+            Box::new(heavy()),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                RandomizedGreedyRelocateRcl::new(1..=1, 1.80)
+                    .with_neighbors(neighbors_direct_competitors.clone()),
+            ),
+            Box::new(heavy()),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                CrossExchangeBestAcrossBerths::new(1..=1).with_neighbors(neighbors_any.clone()),
+            ),
+            Box::new(heavy()),
+        )
 }

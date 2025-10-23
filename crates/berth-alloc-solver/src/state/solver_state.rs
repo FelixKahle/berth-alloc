@@ -28,7 +28,7 @@ use crate::{
         terminal::terminalocc::{TerminalOccupancy, TerminalWrite},
     },
 };
-use berth_alloc_core::prelude::Cost;
+use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval, TimePoint};
 use berth_alloc_model::{
     common::FlexibleKind,
     prelude::{AssignmentContainer, SolutionRef},
@@ -37,6 +37,116 @@ use berth_alloc_model::{
 };
 use num_traits::{CheckedAdd, CheckedSub};
 use std::ops::Mul;
+
+#[derive(Debug, Clone)]
+pub struct AdaptiveStats<'m, 'p, T>
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub,
+{
+    number_assigned_requests: usize,
+    number_berths_used: usize,
+    time_min: Option<TimePoint<T>>,
+    time_max: Option<TimePoint<T>>,
+    time_span: Option<TimeDelta<T>>,
+    model: &'m SolverModel<'p, T>,
+}
+
+impl<'m, 'p, T> AdaptiveStats<'m, 'p, T>
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub,
+{
+    #[inline]
+    pub fn model(&self) -> &'m SolverModel<'p, T> {
+        self.model
+    }
+
+    #[inline]
+    pub fn load(&self) -> f64 {
+        let total = self.number_requests() as f64;
+        if total > 0.0 {
+            (self.number_assigned_requests() as f64 / total).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    #[inline]
+    pub fn time_cover(&self) -> f64 {
+        let total = self.number_berths_total() as f64;
+        if total > 0.0 {
+            (self.number_berths_used() as f64 / total).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    #[inline]
+    pub fn berth_utilization(&self) -> f64
+    where
+        T: num_traits::ToPrimitive,
+    {
+        let span = self
+            .time_span()
+            .map(|d| num_traits::ToPrimitive::to_f64(&d.value()).unwrap_or(0.0))
+            .unwrap_or(0.0);
+
+        let hv: TimeDelta<T> = self.planning_horizon().measure();
+        let horizon = num_traits::ToPrimitive::to_f64(&hv.value()).unwrap_or(0.0);
+
+        if horizon <= 0.0 || span <= 0.0 {
+            0.0
+        } else {
+            (span / horizon).clamp(0.0, 1.0)
+        }
+    }
+
+    #[inline]
+    pub fn sample_width(&self) -> f64 {
+        // 1/sqrt(max(1, assigned)) — small when many are assigned
+        let assigned = self.number_assigned_requests() as f64;
+        1.0 / assigned.max(1.0).sqrt()
+    }
+
+    #[inline]
+    pub fn number_assigned_requests(&self) -> usize {
+        self.number_assigned_requests
+    }
+
+    #[inline]
+    pub fn number_requests(&self) -> usize {
+        self.model.flexible_requests_len()
+    }
+
+    #[inline]
+    pub fn number_berths_used(&self) -> usize {
+        self.number_berths_used
+    }
+
+    #[inline]
+    pub fn number_berths_total(&self) -> usize {
+        self.model.berths_len()
+    }
+
+    #[inline]
+    pub fn time_min(&self) -> Option<TimePoint<T>> {
+        self.time_min
+    }
+
+    #[inline]
+    pub fn time_max(&self) -> Option<TimePoint<T>> {
+        self.time_max
+    }
+
+    #[inline]
+    pub fn time_span(&self) -> Option<TimeDelta<T>> {
+        self.time_span
+    }
+
+    #[inline]
+    pub fn planning_horizon(&self) -> TimeInterval<T> {
+        self.model.planning_horizon()
+    }
+}
 
 pub trait SolverStateView<'p, T: Copy + Ord> {
     fn decision_variables(&self) -> &[DecisionVar<T>];
@@ -50,6 +160,10 @@ pub trait SolverStateView<'p, T: Copy + Ord> {
     fn cost(&self) -> Cost {
         self.fitness().cost
     }
+
+    fn stats<'m>(&self, model: &'m SolverModel<'p, T>) -> AdaptiveStats<'m, 'p, T>
+    where
+        T: CheckedAdd + CheckedSub;
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +360,11 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cos
 
 impl<'p, T: Copy + Ord> SolverStateView<'p, T> for SolverState<'p, T> {
     #[inline]
+    fn decision_variables(&self) -> &[DecisionVar<T>] {
+        &self.decision_variables
+    }
+
+    #[inline]
     fn terminal_occupancy(&self) -> &TerminalOccupancy<'p, T> {
         &self.terminal_occupancy
     }
@@ -256,8 +375,67 @@ impl<'p, T: Copy + Ord> SolverStateView<'p, T> for SolverState<'p, T> {
     }
 
     #[inline]
-    fn decision_variables(&self) -> &[DecisionVar<T>] {
-        &self.decision_variables
+    fn stats<'m>(&self, model: &'m SolverModel<'p, T>) -> AdaptiveStats<'m, 'p, T>
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        let number_berths_total = model.berths_len();
+        let mut number_assigned_requests = 0usize;
+        let mut berths_used_flags = vec![false; number_berths_total];
+        let mut number_berths_used = 0usize;
+
+        let mut time_min: Option<TimePoint<T>> = None;
+        let mut time_max: Option<TimePoint<T>> = None;
+
+        for dv in self.decision_variables() {
+            if let DecisionVar::Assigned(dec) = dv {
+                number_assigned_requests += 1;
+
+                let bi = dec.berth_index.get();
+                debug_assert!(bi < number_berths_total, "berth index out of range");
+
+                if bi < number_berths_total && !berths_used_flags[bi] {
+                    berths_used_flags[bi] = true;
+                    number_berths_used += 1;
+                }
+
+                let t = dec.start_time;
+                time_min = Some(match time_min {
+                    Some(mn) => {
+                        if t < mn {
+                            t
+                        } else {
+                            mn
+                        }
+                    }
+                    None => t,
+                });
+                time_max = Some(match time_max {
+                    Some(mx) => {
+                        if t > mx {
+                            t
+                        } else {
+                            mx
+                        }
+                    }
+                    None => t,
+                });
+            }
+        }
+
+        let time_span = match (time_min, time_max) {
+            (Some(a), Some(b)) => Some(b - a),
+            _ => None,
+        };
+
+        AdaptiveStats {
+            number_assigned_requests,
+            number_berths_used,
+            time_min,
+            time_max,
+            time_span,
+            model,
+        }
     }
 }
 
@@ -760,5 +938,83 @@ mod tests {
 
         let plan = Plan::new_delta(Vec::new(), delta, 0, 0);
         st.apply_plan(plan); // debug_assert!(res.is_ok()) panics
+    }
+
+    #[test]
+    fn test_stats_unassigned_and_horizon() {
+        // Berth 1: [0,10), Berth 2: [-5,50)
+        let b1 = berth(1, 0, 10);
+        let b2 = berth(2, -5, 50);
+
+        // Two flexible requests feasible on different berths
+        let r10 = flex_req(10, (0, 100), &[(1, 5)], 1);
+        let r20 = flex_req(20, (0, 100), &[(2, 5)], 1);
+
+        let mut builder = berth_alloc_model::problem::builder::ProblemBuilder::new();
+        builder.add_berth(b1);
+        builder.add_berth(b2);
+        builder.add_flexible(r10);
+        builder.add_flexible(r20);
+        let prob = builder.build().expect("valid problem");
+        let model = SolverModel::try_from(&prob).expect("model builds");
+
+        // All unassigned
+        let dv = DecisionVarVec::from(vec![DecisionVar::unassigned(), DecisionVar::unassigned()]);
+        let term = TerminalOccupancy::new(&[] as &[berth_alloc_model::prelude::Berth<i64>]);
+        let st = SolverState::new(dv, term, Fitness::new(0, 2));
+
+        let stats = st.stats(&model);
+        assert_eq!(stats.number_assigned_requests(), 0);
+        assert_eq!(stats.number_requests(), 2);
+        assert_eq!(stats.number_berths_used(), 0);
+        assert_eq!(stats.number_berths_total(), 2);
+        assert_eq!(stats.time_min(), None);
+        assert_eq!(stats.time_max(), None);
+        assert_eq!(stats.time_span(), None);
+        // Horizon spans min start to max end across berths
+        assert_eq!(stats.planning_horizon(), iv(-5, 50));
+    }
+
+    #[test]
+    fn test_stats_assigned_counts_times_and_horizon() {
+        // Two berths with windows [0,100) and [0,30)
+        let b1 = berth(1, 0, 100);
+        let b2 = berth(2, 0, 30);
+
+        // Three flexible requests
+        let r10 = flex_req(10, (0, 100), &[(1, 5)], 1); // feasible on berth 1
+        let r20 = flex_req(20, (0, 100), &[(2, 5)], 1); // feasible on berth 2
+        let r30 = flex_req(30, (0, 100), &[(1, 5), (2, 5)], 1); // feasible on both
+
+        let mut builder = berth_alloc_model::problem::builder::ProblemBuilder::new();
+        builder.add_berth(b1);
+        builder.add_berth(b2);
+        builder.add_flexible(r10);
+        builder.add_flexible(r20);
+        builder.add_flexible(r30);
+        let prob = builder.build().expect("valid");
+        let model = SolverModel::try_from(&prob).expect("model builds");
+
+        // Assigned on different berths at different times plus one unassigned.
+        let bi1 = model.index_manager().berth_index(bid(1)).unwrap();
+        let bi2 = model.index_manager().berth_index(bid(2)).unwrap();
+        let dv = DecisionVarVec::from(vec![
+            DecisionVar::assigned(bi1, tp(10)), // assigned on berth 1 at t=10
+            DecisionVar::assigned(bi2, tp(25)), // assigned on berth 2 at t=25
+            DecisionVar::unassigned(),          // one unassigned
+        ]);
+        let term = TerminalOccupancy::new(&[] as &[berth_alloc_model::prelude::Berth<i64>]);
+        let st = SolverState::new(dv, term, Fitness::new(0, 1));
+
+        let stats = st.stats(&model);
+        assert_eq!(stats.number_assigned_requests(), 2);
+        assert_eq!(stats.number_requests(), 3);
+        assert_eq!(stats.number_berths_used(), 2);
+        assert_eq!(stats.number_berths_total(), 2);
+        assert_eq!(stats.time_min(), Some(tp(10)));
+        assert_eq!(stats.time_max(), Some(tp(25)));
+        assert_eq!(stats.time_span(), Some(td(15)));
+        // Planning horizon comes from berths: [0,100)
+        assert_eq!(stats.planning_horizon(), iv(0, 100));
     }
 }

@@ -22,10 +22,10 @@
 use crate::{
     model::index::RequestIndex,
     search::{
-        operator::RepairOperator,
+        operator::{OperatorTuning, RepairOperator},
         planner::{CostEvaluator, PlanBuilder, PlanExplorer, PlanningContext},
     },
-    state::{plan::Plan, terminal::terminalocc::FreeBerth},
+    state::{plan::Plan, solver_state::AdaptiveStats, terminal::terminalocc::FreeBerth},
 };
 use berth_alloc_core::prelude::{Cost, TimePoint};
 use num_traits::{CheckedAdd, CheckedSub, Zero};
@@ -35,8 +35,27 @@ use std::{
     ops::{Mul, RangeInclusive},
 };
 
+// ---------- shared tiny helpers (inputs-only; no magic numbers) ----------
+#[inline]
+fn clamp01(x: f64) -> f64 {
+    if x <= 0.0 {
+        0.0
+    } else if x >= 1.0 {
+        1.0
+    } else {
+        x
+    }
+}
+
+/// Map (greediness, sample_width) → strictly-positive alpha without baked constants.
+/// If both are zero, fall back to MIN_POSITIVE to keep powf well-defined.
+#[inline]
+fn alpha_from_inputs(greediness: f64, sample_width: f64) -> f64 {
+    let a = clamp01(greediness) + clamp01(sample_width);
+    if a > 0.0 { a } else { f64::MIN_POSITIVE }
+}
+
 // Type aliases to make intent explicit
-type AlphaRange = RangeInclusive<f64>;
 type KRange = RangeInclusive<usize>;
 
 /// Randomized–greedy index selector used by RCL-style insertion.
@@ -122,23 +141,20 @@ where
 }
 
 // ======================================================================
-// RandomizedGreedyInsertion (now with alpha range)
+// RandomizedGreedyInsertion
 // ======================================================================
 
 #[derive(Clone, Debug)]
 pub struct RandomizedGreedyInsertion {
-    /// Randomized greediness exponent range (α ≥ 1.0). α=1 → uniform; larger → greedier.
-    pub greediness_alpha_range: AlphaRange,
+    /// Randomized greediness exponent (α ≥ 1.0). α=1 → uniform; larger → greedier.
+    pub greediness_alpha: f64,
 }
 
 impl RandomizedGreedyInsertion {
-    pub fn new(greediness_alpha_range: AlphaRange) -> Self {
-        assert!(greediness_alpha_range.start().is_finite());
-        assert!(greediness_alpha_range.end().is_finite());
-        assert!(*greediness_alpha_range.start() >= 1.0);
-        Self {
-            greediness_alpha_range,
-        }
+    pub fn new(greediness_alpha: f64) -> Self {
+        assert!(greediness_alpha.is_finite());
+        assert!(greediness_alpha >= 1.0);
+        Self { greediness_alpha }
     }
 }
 
@@ -152,6 +168,10 @@ where
         "RandomizedGreedyInsertion"
     }
 
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        self.greediness_alpha = alpha_from_inputs(t.greediness, stats.sample_width());
+    }
+
     fn repair<'b, 'c, 's, 'm, 'p>(
         &self,
         planning_context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
@@ -159,9 +179,6 @@ where
     ) -> Option<Plan<'p, T>> {
         let solver_model = planning_context.model();
         let mut plan_builder: PlanBuilder<'_, 'c, 's, 'm, 'p, T, C> = planning_context.builder();
-
-        // Sample α once for this repair phase to keep behavior coherent within a step.
-        let sampled_greediness_alpha: f64 = rng.random_range(self.greediness_alpha_range.clone());
 
         loop {
             let mut unassigned_request_indices: Vec<RequestIndex> = plan_builder
@@ -201,7 +218,7 @@ where
 
             let chosen_index = randomized_greedy_index(
                 unassigned_request_indices.len(),
-                sampled_greediness_alpha,
+                self.greediness_alpha,
                 rng,
             );
             let request_index = unassigned_request_indices.remove(chosen_index);
@@ -258,6 +275,16 @@ where
 {
     fn name(&self) -> &str {
         "KRegretInsertion"
+    }
+
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, _stats: &AdaptiveStats<'m, 'p, T>) {
+        // intensity gates “how many alternatives to inspect”
+        // 0 → no work; >0 → allow any k, later truncated by available options at runtime.
+        self.k_choice_range = if clamp01(t.intensity) == 0.0 {
+            0..=0
+        } else {
+            1..=usize::MAX
+        };
     }
 
     fn repair<'b, 'c, 's, 'm, 'p>(
@@ -392,6 +419,10 @@ where
         "GreedyInsertion"
     }
 
+    fn tune<'m, 'p>(&mut self, _t: &OperatorTuning, _stats: &AdaptiveStats<'m, 'p, T>) {
+        // no fields to set
+    }
+
     fn repair<'b, 'c, 's, 'm, 'p>(
         &self,
         planning_context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
@@ -472,6 +503,10 @@ where
 {
     fn name(&self) -> &str {
         "EarliestWindowInsertion"
+    }
+
+    fn tune<'m, 'p>(&mut self, _t: &OperatorTuning, _stats: &AdaptiveStats<'m, 'p, T>) {
+        // no fields to set
     }
 
     fn repair<'b, 'c, 's, 'm, 'p>(
@@ -609,7 +644,7 @@ mod tests {
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(1337);
 
-        let op = RandomizedGreedyInsertion::new(1.6..=2.2);
+        let op = RandomizedGreedyInsertion::new(1.6);
         let plan = op.repair(&mut ctx, &mut rng).expect("plan expected");
 
         assert!(!plan.decision_var_patches.is_empty());
@@ -702,7 +737,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
 
         assert!(
-            RandomizedGreedyInsertion::new(1.2..=1.2)
+            RandomizedGreedyInsertion::new(1.2)
                 .repair(&mut ctx, &mut rng)
                 .is_none()
         );

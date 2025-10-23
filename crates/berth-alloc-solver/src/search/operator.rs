@@ -19,50 +19,92 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+use num_traits::{CheckedAdd, CheckedSub};
+
 use crate::{
     model::index::RequestIndex,
     search::planner::{CostEvaluator, PlanningContext},
-    state::plan::Plan,
+    state::{plan::Plan, solver_state::AdaptiveStats},
 };
+
+/// Knobs the loop pushes into the operators each iteration.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OperatorTuning {
+    /// 0..1 — “how much work” a move/operator does (e.g., neighborhood size, inner loops).
+    /// 0 = no work, 1 = full work.
+    pub intensity: f64,
+    /// 0..1 — random ←→ greedy selection pressure.
+    pub greediness: f64,
+    /// 0..1 — global ←→ local bias.
+    pub locality: f64,
+    /// 0..1 — diversification / shake strength.
+    pub perturb: f64,
+}
 
 // Some operators can be restricted to "nearby" candidates via callbacks.
 // If none are provided, we revert to the full space (i.e., all berths / all slots).
 pub type NeighborFn = dyn Fn(RequestIndex) -> Vec<RequestIndex> + Send + Sync;
 
-pub trait Operator<T: Copy + Ord, C: CostEvaluator<T>, R: rand::Rng>: Send + Sync {
-    fn name(&self) -> &str;
-    fn propose<'b, 'c, 's, 'm, 'p>(
-        &self,
-        context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
-        rng: &mut R,
-    ) -> Option<Plan<'p, T>>;
-}
-
-pub trait LocalMoveOperator<T: Copy + Ord, C: CostEvaluator<T>, R: rand::Rng>: Send + Sync {
+pub trait LocalMoveOperator<
+    T: Copy + Ord + CheckedAdd + CheckedSub,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+>: Send + Sync
+{
     fn name(&self) -> &str;
     fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
         ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>>;
+
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>);
 }
 
-pub trait DestroyOperator<T: Copy + Ord, C: CostEvaluator<T>, R: rand::Rng>: Send + Sync {
+pub trait DestroyOperator<
+    T: Copy + Ord + CheckedAdd + CheckedSub,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+>: Send + Sync
+{
     fn name(&self) -> &str;
     fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
         ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>>;
+
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>);
 }
 
-pub trait RepairOperator<T: Copy + Ord, C: CostEvaluator<T>, R: rand::Rng>: Send + Sync {
+pub trait RepairOperator<T: Copy + Ord + CheckedAdd + CheckedSub, C: CostEvaluator<T>, R: rand::Rng>:
+    Send + Sync
+{
     fn name(&self) -> &str;
     fn repair<'b, 'c, 's, 'm, 'p>(
         &self,
         ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>>;
+
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum OperatorKind {
+    Local,
+    Destroy,
+    Repair,
+}
+
+impl std::fmt::Display for OperatorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OperatorKind::Local => write!(f, "Local"),
+            OperatorKind::Destroy => write!(f, "Destroy"),
+            OperatorKind::Repair => write!(f, "Repair"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -75,8 +117,6 @@ mod static_assertions {
     macro_rules! test_integer_types {
         ($($t:ty),* $(,)?) => {
             $(
-                assert_obj_safe!(Operator<$t, DefaultCostEvaluator, ChaCha8Rng>);
-                assert_impl_all!(dyn Operator<$t, DefaultCostEvaluator, ChaCha8Rng> + Send + Sync: Send, Sync);
                 assert_obj_safe!(LocalMoveOperator<$t, DefaultCostEvaluator, ChaCha8Rng>);
                 assert_impl_all!(dyn LocalMoveOperator<$t, DefaultCostEvaluator, ChaCha8Rng> + Send + Sync: Send, Sync);
                 assert_obj_safe!(DestroyOperator<$t, DefaultCostEvaluator, ChaCha8Rng>);

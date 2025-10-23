@@ -20,6 +20,7 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 pub mod acceptor;
+pub mod adaptive;
 pub mod feature_signal;
 pub mod gls;
 pub mod greedy_opening;

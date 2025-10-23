@@ -22,12 +22,13 @@
 use crate::{
     model::index::{BerthIndex, RequestIndex},
     search::{
-        operator::{LocalMoveOperator, NeighborFn},
+        operator::{LocalMoveOperator, NeighborFn, OperatorTuning},
         planner::{CostEvaluator, PlanBuilder, PlanExplorer, PlanningContext},
     },
     state::{
         decisionvar::{Decision, DecisionVar},
         plan::Plan,
+        solver_state::AdaptiveStats,
         terminal::terminalocc::FreeBerth,
     },
 };
@@ -40,6 +41,35 @@ use std::{
     ops::RangeInclusive,
     sync::Arc,
 };
+
+#[inline]
+fn clamp01(x: f64) -> f64 {
+    if x <= 0.0 {
+        0.0
+    } else if x >= 1.0 {
+        1.0
+    } else {
+        x
+    }
+}
+
+#[inline]
+fn alpha_from_inputs(g: f64, w: f64) -> f64 {
+    // strictly positive; proportional to inputs only
+    let a = clamp01(g) + clamp01(w);
+    if a > 0.0 { a } else { f64::MIN_POSITIVE }
+}
+
+// When we don't know pool size at tune-time, we let propose() clamp.
+// intensity==0 → 0..=0 (no work). intensity>0 → 1..=usize::MAX (full allowance, later clamped).
+#[inline]
+fn range_for_work_from_intensity(intensity: f64) -> std::ops::RangeInclusive<usize> {
+    if clamp01(intensity) == 0.0 {
+        0..=0
+    } else {
+        1..=usize::MAX
+    }
+}
 
 /// Best (lowest-cost) insertion for `ri` right now via explorer.
 /// Returns `(FreeBerth, start, cost)` for the earliest feasible start in each free interval.
@@ -172,6 +202,13 @@ where
         "ShiftEarlierOnSameBerth"
     }
 
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        // Model-based pool size (solver provides a consistent sample width)
+        let pool = stats.sample_width().max(0f64) as usize;
+        let cap = ((pool as f64) * t.intensity.clamp(0.0, 1.0)).ceil() as usize;
+        self.number_of_candidates_to_try_range = if cap == 0 { 0..=0 } else { 1..=cap };
+    }
+
     fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
         context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
@@ -266,7 +303,7 @@ where
 }
 
 // ======================================================================
-// RelocateSingleBest  (range-based sampling)
+// RelocateSingleBest (range-based sampling)
 // ======================================================================
 
 #[derive(Clone)]
@@ -298,6 +335,12 @@ where
 {
     fn name(&self) -> &str {
         "RelocateSingleBest"
+    }
+
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        let pool = stats.sample_width().max(0f64) as usize;
+        let cap = ((pool as f64) * t.intensity.clamp(0.0, 1.0)).ceil() as usize;
+        self.number_of_candidates_to_try_range = if cap == 0 { 0..=0 } else { 1..=cap };
     }
 
     fn propose<'b, 'c, 's, 'm, 'p>(
@@ -382,7 +425,7 @@ where
 }
 
 // ======================================================================
-// SwapPairSameBerth  (range-based pair attempts; fresh builder per attempt)
+// SwapPairSameBerth (range-based pair attempts; fresh builder per attempt)
 // ======================================================================
 
 #[derive(Clone)]
@@ -414,6 +457,12 @@ where
 {
     fn name(&self) -> &str {
         "SwapPairSameBerth"
+    }
+
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        let pool = stats.sample_width().max(0f64) as usize;
+        let cap = ((pool as f64) * t.intensity.clamp(0.0, 1.0)).ceil() as usize;
+        self.number_of_pair_attempts_to_try_range = if cap == 0 { 0..=0 } else { 1..=cap };
     }
 
     fn propose<'b, 'c, 's, 'm, 'p>(
@@ -551,7 +600,7 @@ where
 }
 
 // ======================================================================
-// CrossExchangeAcrossBerths  (range-based pair attempts; fresh builder per attempt)
+// CrossExchangeAcrossBerths (range-based pair attempts; fresh builder per attempt)
 // ======================================================================
 
 #[derive(Clone)]
@@ -583,6 +632,12 @@ where
 {
     fn name(&self) -> &str {
         "CrossExchangeAcrossBerths"
+    }
+
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        let pool = stats.sample_width().max(0f64) as usize;
+        let cap = ((pool as f64) * t.intensity.clamp(0.0, 1.0)).ceil() as usize;
+        self.number_of_pair_attempts_to_try_range = if cap == 0 { 0..=0 } else { 1..=cap };
     }
 
     fn propose<'b, 'c, 's, 'm, 'p>(
@@ -715,33 +770,29 @@ where
 }
 
 // ======================================================================
-// OrOptBlockRelocate  (ranges for block length + RCL alpha)
+// OrOptBlockRelocate (ranges for block length + RCL alpha)
 // ======================================================================
 
 #[derive(Clone)]
 pub struct OrOptBlockRelocate {
     /// Inclusive range for the contiguous block length (k) to relocate.
     pub block_length_to_relocate_range: RangeInclusive<usize>,
-    /// Inclusive range for RCL alpha when picking the block's starting index.
-    pub rcl_alpha_range: RangeInclusive<f64>,
+    /// RCL alpha when picking the block's starting index.
+    pub rcl_alpha: f64,
     pub neighbor_callback: Option<Arc<NeighborFn>>,
 }
 
 impl OrOptBlockRelocate {
-    pub fn new(
-        block_length_to_relocate_range: RangeInclusive<usize>,
-        rcl_alpha_range: RangeInclusive<f64>,
-    ) -> Self {
+    pub fn new(block_length_to_relocate_range: RangeInclusive<usize>, rcl_alpha: f64) -> Self {
         assert!(!block_length_to_relocate_range.is_empty());
-        assert!(!rcl_alpha_range.is_empty());
         assert!(
             *block_length_to_relocate_range.start() >= 2,
             "Or-Opt requires k >= 2"
         );
-        assert!(*rcl_alpha_range.start() > 0.0 && rcl_alpha_range.end().is_finite());
+        assert!(rcl_alpha > 0.0 && rcl_alpha.is_finite());
         Self {
             block_length_to_relocate_range,
-            rcl_alpha_range,
+            rcl_alpha,
             neighbor_callback: None,
         }
     }
@@ -759,6 +810,14 @@ where
 {
     fn name(&self) -> &str {
         "OrOptBlockRelocate"
+    }
+
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        // k-range from model-driven pool and intensity (no hard-coded limits)
+        let pool = stats.sample_width().max(0f64) as usize;
+        let cap_k = ((pool as f64) * t.intensity.clamp(0.0, 1.0)).ceil() as usize;
+        self.block_length_to_relocate_range = if cap_k < 2 { 0..=0 } else { 2..=cap_k };
+        self.rcl_alpha = alpha_from_inputs(t.greediness, stats.sample_width());
     }
 
     fn propose<'b, 'c, 's, 'm, 'p>(
@@ -805,15 +864,7 @@ where
         if sampled_k > max_k {
             return None;
         }
-        let alpha_sample = {
-            let a_lo = *self.rcl_alpha_range.start();
-            let a_hi = *self.rcl_alpha_range.end();
-            if (a_lo - a_hi).abs() < f64::EPSILON {
-                a_lo
-            } else {
-                rng.random_range(a_lo..=a_hi)
-            }
-        };
+        let alpha_sample = self.rcl_alpha;
 
         // Neighborhood within this berth (seed ∪ neighbors). Fallback to full berth if
         // neighborhood is smaller than k.
@@ -888,7 +939,7 @@ where
 }
 
 // ======================================================================
-// RelocateSingleBestAllowWorsening  (same as RelocateSingleBest but allows worsening)
+// RelocateSingleBestAllowWorsening (same as RelocateSingleBest but allows worsening)
 // ======================================================================
 
 #[derive(Clone)]
@@ -920,6 +971,12 @@ where
 {
     fn name(&self) -> &str {
         "RelocateSingleBestAllowWorsening"
+    }
+
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        let pool = stats.sample_width().max(0f64) as usize;
+        let cap = ((pool as f64) * t.intensity.clamp(0.0, 1.0)).ceil() as usize;
+        self.number_of_candidates_to_try_range = if cap == 0 { 0..=0 } else { 1..=cap };
     }
 
     fn propose<'b, 'c, 's, 'm, 'p>(
@@ -994,7 +1051,7 @@ where
 }
 
 // ======================================================================
-// RandomRelocateAnywhere  (random feasible reinsert; can worsen on purpose)
+// RandomRelocateAnywhere (random feasible reinsert; can worsen on purpose)
 // ======================================================================
 
 #[derive(Clone)]
@@ -1026,6 +1083,12 @@ where
 {
     fn name(&self) -> &str {
         "RandomRelocateAnywhere"
+    }
+
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        let pool = stats.sample_width().max(0f64) as usize;
+        let cap = ((pool as f64) * t.intensity.clamp(0.0, 1.0)).ceil() as usize;
+        self.number_of_candidates_to_try_range = if cap == 0 { 0..=0 } else { 1..=cap };
     }
 
     fn propose<'b, 'c, 's, 'm, 'p>(
@@ -1114,7 +1177,7 @@ where
 }
 
 // ======================================================================
-// HillClimbRelocateBest  (best improving relocate among sampled requests)
+// HillClimbRelocateBest (best improving relocate among sampled requests)
 // ======================================================================
 
 #[derive(Clone)]
@@ -1146,6 +1209,12 @@ where
 {
     fn name(&self) -> &str {
         "HillClimbRelocateBest"
+    }
+
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        let pool = stats.sample_width().max(0f64) as usize;
+        let cap = ((pool as f64) * t.intensity.clamp(0.0, 1.0)).ceil() as usize;
+        self.number_of_candidates_to_try_range = if cap == 0 { 0..=0 } else { 1..=cap };
     }
 
     fn propose<'b, 'c, 's, 'm, 'p>(
@@ -1252,7 +1321,7 @@ where
 }
 
 // ======================================================================
-// HillClimbBestSwapSameBerth  (best improving swap among sampled same-berth pairs)
+// HillClimbBestSwapSameBerth (best improving swap among sampled same-berth pairs)
 // ======================================================================
 
 #[derive(Clone)]
@@ -1284,6 +1353,12 @@ where
 {
     fn name(&self) -> &str {
         "HillClimbBestSwapSameBerth"
+    }
+
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        let pool = stats.sample_width().max(0f64) as usize;
+        let cap = ((pool as f64) * t.intensity.clamp(0.0, 1.0)).ceil() as usize;
+        self.number_of_pair_attempts_to_try_range = if cap == 0 { 0..=0 } else { 1..=cap };
     }
 
     fn propose<'b, 'c, 's, 'm, 'p>(
@@ -1463,6 +1538,10 @@ where
         "CrossExchangeBestAcrossBerths"
     }
 
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, _stats: &AdaptiveStats<'m, 'p, T>) {
+        self.number_of_pair_attempts_to_try_range = range_for_work_from_intensity(t.intensity);
+    }
+
     fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
         context: &mut crate::search::planner::PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
@@ -1553,13 +1632,14 @@ where
                         let iv = free.interval();
                         let s = iv.start();
                         if s + pt <= iv.end()
-                            && let Some(c) = ex.peek_cost(ra, s, bi_b) {
-                                match best {
-                                    None => best = Some((free, s, c)),
-                                    Some((_, _, bc)) if c < bc => best = Some((free, s, c)),
-                                    _ => {}
-                                }
+                            && let Some(c) = ex.peek_cost(ra, s, bi_b)
+                        {
+                            match best {
+                                None => best = Some((free, s, c)),
+                                Some((_, _, bc)) if c < bc => best = Some((free, s, c)),
+                                _ => {}
                             }
+                        }
                     }
                 }
                 best
@@ -1584,13 +1664,14 @@ where
                         let iv = free.interval();
                         let s = iv.start();
                         if s + pt <= iv.end()
-                            && let Some(c) = ex.peek_cost(rb, s, bi_a) {
-                                match best {
-                                    None => best = Some((free, s, c)),
-                                    Some((_, _, bc)) if c < bc => best = Some((free, s, c)),
-                                    _ => {}
-                                }
+                            && let Some(c) = ex.peek_cost(rb, s, bi_a)
+                        {
+                            match best {
+                                None => best = Some((free, s, c)),
+                                Some((_, _, bc)) if c < bc => best = Some((free, s, c)),
+                                _ => {}
                             }
+                        }
                     }
                 }
                 best
@@ -1619,16 +1700,16 @@ where
 #[derive(Clone)]
 pub struct RandomizedGreedyRelocateRcl {
     pub number_of_candidates_to_try_range: std::ops::RangeInclusive<usize>,
-    pub rcl_alpha_range: std::ops::RangeInclusive<f64>,
+    pub rcl_alpha: f64,
     pub neighbor_callback: Option<std::sync::Arc<crate::search::operator::NeighborFn>>,
 }
 
 impl RandomizedGreedyRelocateRcl {
-    pub fn new(k: std::ops::RangeInclusive<usize>, alpha: std::ops::RangeInclusive<f64>) -> Self {
-        assert!(!k.is_empty() && !alpha.is_empty());
+    pub fn new(k: std::ops::RangeInclusive<usize>, alpha: f64) -> Self {
+        assert!(!k.is_empty() && alpha > 0.0 && alpha.is_finite());
         Self {
             number_of_candidates_to_try_range: k,
-            rcl_alpha_range: alpha,
+            rcl_alpha: alpha,
             neighbor_callback: None,
         }
     }
@@ -1654,6 +1735,13 @@ where
 {
     fn name(&self) -> &str {
         "RandomizedGreedyRelocateRCL"
+    }
+
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        let pool = stats.sample_width().max(0f64) as usize;
+        let cap = ((pool as f64) * t.intensity.clamp(0.0, 1.0)).ceil() as usize;
+        self.number_of_candidates_to_try_range = if cap == 0 { 0..=0 } else { 1..=cap };
+        self.rcl_alpha = alpha_from_inputs(t.greediness, stats.sample_width());
     }
 
     fn propose<'b, 'c, 's, 'm, 'p>(
@@ -1690,15 +1778,7 @@ where
         pool.shuffle(rng);
         pool.truncate(k);
 
-        let alpha = {
-            let lo = *self.rcl_alpha_range.start();
-            let hi = *self.rcl_alpha_range.end();
-            if (lo - hi).abs() < f64::EPSILON {
-                lo
-            } else {
-                rng.random_range(lo..=hi)
-            }
-        };
+        let alpha = self.rcl_alpha;
 
         for (ri, _) in pool {
             let mut bld = context.builder();
@@ -1715,9 +1795,10 @@ where
                         let iv = free.interval();
                         let s = iv.start();
                         if s + pt <= iv.end()
-                            && let Some(c) = ex.peek_cost(ri, s, b) {
-                                v.push((free, s, c));
-                            }
+                            && let Some(c) = ex.peek_cost(ri, s, b)
+                        {
+                            v.push((free, s, c));
+                        }
                     }
                 }
                 v
@@ -1996,7 +2077,7 @@ mod tests {
 
         let op = OrOptBlockRelocate {
             block_length_to_relocate_range: 2..=2,
-            rcl_alpha_range: 1.7..=1.7,
+            rcl_alpha: 1.7,
             neighbor_callback: Some(Arc::new(neighbor_pm1)),
         };
 

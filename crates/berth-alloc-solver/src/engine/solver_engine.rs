@@ -264,7 +264,6 @@ where
                         let high = rng.random_range(0.60_f64..=0.70).max(low + 0.06);
 
                         // Faster EMA for bandit and full/none reheat
-                        let ema = rng.random_range(0.25_f64..=0.40);
                         let reheat = if rng.random_bool(0.5) { 1.0 } else { 0.0 };
                         let big_m = [1_000_000_000_i64, 1_250_000_000, 1_500_000_000]
                             .choose(rng)
@@ -276,7 +275,6 @@ where
                             .with_cooling(cooling)
                             .with_steps_per_temp(steps)
                             .with_acceptance_targets(low, high)
-                            .with_op_ema_alpha(ema)
                             .with_reheat_factor(reheat) // 0.0 or 1.0
                             .with_big_m_for_energy(big_m);
 

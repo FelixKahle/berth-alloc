@@ -20,19 +20,24 @@
 
 #![allow(clippy::needless_return)]
 
-use crate::engine::acceptor::Acceptor;
-use crate::engine::neighbors;
+use crate::engine::adaptive::tuning::{LocalCountTargetTuner, OrOptBlockKTuner};
 use crate::search::operator_library::local::{
     CrossExchangeBestAcrossBerths, HillClimbBestSwapSameBerth, HillClimbRelocateBest,
     RandomRelocateAnywhere, RandomizedGreedyRelocateRcl, RelocateSingleBestAllowWorsening,
 };
-use crate::state::solver_state::SolverStateView;
 use crate::{
     core::numeric::SolveNumeric,
-    engine::search::{SearchContext, SearchStrategy},
+    engine::{
+        acceptor::{Acceptor, LexStrictAcceptor},
+        adaptive::{
+            ops_book::OperatorBook, selection::SoftmaxSelector, tuning::DefaultOperatorTuner,
+        },
+        neighbors,
+        search::{SearchContext, SearchStrategy},
+    },
     model::index::RequestIndex,
     search::{
-        operator::LocalMoveOperator,
+        operator::{LocalMoveOperator, OperatorKind},
         operator_library::local::{
             CrossExchangeAcrossBerths, OrOptBlockRelocate, RelocateSingleBest,
             ShiftEarlierOnSameBerth, SwapPairSameBerth,
@@ -42,7 +47,7 @@ use crate::{
     state::{
         decisionvar::{Decision, DecisionVar},
         fitness::Fitness,
-        solver_state::SolverState,
+        solver_state::{SolverState, SolverStateView},
     },
 };
 use berth_alloc_core::prelude::{Cost, TimePoint};
@@ -102,6 +107,9 @@ where
         >,
     >,
 
+    // Adaptive operator book for local ops (augmented evaluator)
+    local_book: OperatorBook<T, R>,
+
     // Tabu parameters
     tabu_tenure_rounds: RangeInclusive<usize>,
     max_local_steps: usize,
@@ -120,7 +128,7 @@ where
     // Acceptors:
     // - true_acceptor: lexicographic on TRUE objective (publish/best_true)
     // - lex_aug: lexicographic on augmented objective (walker ranking)
-    true_acceptor: crate::engine::acceptor::LexStrictAcceptor,
+    true_acceptor: LexStrictAcceptor,
     lex_aug: LexAugAcceptor,
 
     // ILS-like sync/refetch knobs
@@ -143,6 +151,10 @@ where
     pub fn new(feature_extractor: Arc<FX>) -> Self {
         Self {
             local_ops: Vec::new(),
+            local_book: OperatorBook::new(
+                OperatorKind::Local,
+                Box::new(SoftmaxSelector::default()),
+            ),
             tabu_tenure_rounds: 16..=32,
             max_local_steps: 512,
             samples_per_step: 96,
@@ -153,7 +165,7 @@ where
             penalty_store: PenaltyStore::new()
                 .with_decay(DecayMode::Multiplicative { num: 9, den: 10 }),
             feature_extractor,
-            true_acceptor: crate::engine::acceptor::LexStrictAcceptor,
+            true_acceptor: LexStrictAcceptor,
             lex_aug: LexAugAcceptor,
             refetch_after_stale: 128,
             hard_refetch_every: 0,
@@ -173,8 +185,27 @@ where
         >,
     ) -> Self {
         self.local_ops.push(op);
+        // Register a default tuner for this operator slot
+        let _ = self
+            .local_book
+            .register_operator(Box::new(DefaultOperatorTuner::default()));
         self
     }
+
+    pub fn with_local_op_tuned(
+        mut self,
+        op: Box<
+            dyn LocalMoveOperator<T, AugmentedCostEvaluator<DefaultCostEvaluator, T, FX>, R>
+                + Send
+                + Sync,
+        >,
+        tuner: Box<dyn crate::engine::adaptive::tuning::OperatorTuner<T>>,
+    ) -> Self {
+        self.local_ops.push(op);
+        let _ = self.local_book.register_operator(tuner);
+        self
+    }
+
     pub fn with_tabu_tenure(mut self, rounds: RangeInclusive<usize>) -> Self {
         self.tabu_tenure_rounds = rounds;
         self
@@ -298,17 +329,18 @@ where
                             if let DecisionVar::Assigned(old) = old_dv
                                 && let Some(c) =
                                     model.cost_of_assignment(ri, old.berth_index, old.start_time)
-                                {
-                                    base_delta = base_delta.saturating_sub(c);
-                                }
+                            {
+                                base_delta = base_delta.saturating_sub(c);
+                            }
                             if let DecisionVar::Assigned(new_dec) = patch
                                 && let Some(c) = model.cost_of_assignment(
                                     ri,
                                     new_dec.berth_index,
                                     new_dec.start_time,
-                                ) {
-                                    base_delta = base_delta.saturating_add(c);
-                                }
+                                )
+                            {
+                                base_delta = base_delta.saturating_add(c);
+                            }
                         }
                         plan.delta_cost = base_delta;
 
@@ -381,9 +413,7 @@ where
             if self.should_hard_refetch(round) {
                 let inc = context.shared_incumbent().peek();
                 let do_fetch = match self.hard_refetch_mode {
-                    HardRefetchMode::IfBetter => {
-                        crate::engine::acceptor::LexStrictAcceptor.accept(current.fitness(), &inc)
-                    }
+                    HardRefetchMode::IfBetter => LexStrictAcceptor.accept(current.fitness(), &inc),
                     HardRefetchMode::Always => true,
                 };
                 if do_fetch {
@@ -395,9 +425,7 @@ where
                     );
                     let snap = context.shared_incumbent().snapshot();
                     current = snap.clone();
-                    if crate::engine::acceptor::LexStrictAcceptor
-                        .accept(best_true.fitness(), snap.fitness())
-                    {
+                    if LexStrictAcceptor.accept(best_true.fitness(), snap.fitness()) {
                         best_true = snap;
                     }
                     last_best_current = current.fitness().clone();
@@ -433,35 +461,77 @@ where
                     break 'outer;
                 }
 
-                // Randomized operator order for sampling
-                let mut op_order: Vec<usize> = (0..self.local_ops.len()).collect();
-                op_order.shuffle(context.rng());
+                // Retune locals once per step using global stats from current
+                let global_stats = current.stats(model);
 
-                // Candidate buffers (carry augmented metric + true fitness for aspiration)
+                let stuck_factor =
+                    (stale_rounds as f64 / self.stagnation_rounds_before_pulse as f64).min(1.0);
+                let stagnation = crate::engine::adaptive::tuning::Stagnation {
+                    stale_rounds,
+                    stuck_factor,
+                };
+
+                self.local_book.retune_all(&global_stats, &stagnation);
+
+                // Candidate buffers (augmented lex metric + true fitness for aspiration)
                 struct Cand<'p, T: SolveNumeric> {
                     state: SolverState<'p, T>, // candidate state after applying plan
                     moved: Vec<usize>,
                     aug_unassigned: usize,
                     aug_cost: Cost,
                     true_fit: Fitness,
+                    op_index: usize,
+                    base_delta: Cost,
+                    seq_id: usize,
                 }
 
                 let mut best_admissible: Option<Cand<'p, T>> = None;
                 let mut best_overall: Option<Cand<'p, T>> = None;
+                let mut proposals: Vec<(
+                    usize, /*seq*/
+                    usize, /*op*/
+                    f64,   /*base_delta*/
+                )> = Vec::new();
+                let mut seq: usize = 0;
 
                 // Sample a subset of neighborhood
-                for s in 0..self.samples_per_step {
+                for _ in 0..self.samples_per_step {
                     if stop.load(AtomicOrdering::Relaxed) {
                         break 'outer;
                     }
 
-                    let oi = op_order[s % op_order.len()];
-                    let op = &self.local_ops[oi];
+                    // Retune locals once per step using global stats from current
+                    let global_stats = current.stats(model);
 
+                    let stuck_factor =
+                        (stale_rounds as f64 / self.stagnation_rounds_before_pulse as f64).min(1.0);
+                    let stagnation = crate::engine::adaptive::tuning::Stagnation {
+                        stale_rounds,
+                        stuck_factor,
+                    };
+
+                    self.local_book.retune_all(&global_stats, &stagnation);
+
+                    // Select operator index via adaptive selector
+                    let oi = self
+                        .local_book
+                        .select(&global_stats, &stagnation, context.rng());
+
+                    let op = &mut self.local_ops[oi];
+
+                    // Push tuning to operator
+                    let tuning = *self.local_book.tuning_for(oi);
+                    op.tune(&tuning, &global_stats);
+
+                    // Build planner on augmented evaluator
                     let mut pc =
                         PlanningContext::new(model, &current, &aug_eval, dv_buf.as_mut_slice());
 
+                    // Time proposal
+                    let t0 = self.local_book.propose_started();
                     if let Some(mut plan) = op.propose(&mut pc, context.rng()) {
+                        self.local_book.record_propose(oi, t0, true);
+
                         // Collect moved request IDs
                         let mut moved: HashSet<usize> = HashSet::new();
                         for p in &plan.decision_var_patches {
@@ -486,17 +556,18 @@ where
                             if let DecisionVar::Assigned(old) = old_dv
                                 && let Some(c) =
                                     model.cost_of_assignment(ri, old.berth_index, old.start_time)
-                                {
-                                    base_delta = base_delta.saturating_sub(c);
-                                }
+                            {
+                                base_delta = base_delta.saturating_sub(c);
+                            }
                             if let DecisionVar::Assigned(new_dec) = patch
                                 && let Some(c) = model.cost_of_assignment(
                                     ri,
                                     new_dec.berth_index,
                                     new_dec.start_time,
-                                ) {
-                                    base_delta = base_delta.saturating_add(c);
-                                }
+                                )
+                            {
+                                base_delta = base_delta.saturating_add(c);
+                            }
                         }
                         plan.delta_cost = base_delta;
 
@@ -527,12 +598,19 @@ where
                             .true_acceptor
                             .accept(&context.shared_incumbent().peek(), &true_fit);
 
+                        let seq_id = seq;
+                        seq = seq.saturating_add(1);
+                        proposals.push((seq_id, oi, base_delta as f64));
+
                         let cand_rec = Cand {
                             state: cand,
                             moved: moved.iter().copied().collect(),
                             aug_unassigned,
                             aug_cost,
                             true_fit,
+                            op_index: oi,
+                            base_delta,
+                            seq_id,
                         };
 
                         // Update best_overall (ignoring tabu) on augmented lex metric
@@ -552,6 +630,9 @@ where
                                 aug_unassigned: cand_rec.aug_unassigned,
                                 aug_cost: cand_rec.aug_cost,
                                 true_fit: cand_rec.true_fit.clone(),
+                                op_index: cand_rec.op_index,
+                                base_delta: cand_rec.base_delta,
+                                seq_id: cand_rec.seq_id,
                             });
                         }
 
@@ -570,6 +651,8 @@ where
                                 best_admissible = Some(cand_rec);
                             }
                         }
+                    } else {
+                        self.local_book.record_propose(oi, t0, false);
                     }
                 }
 
@@ -581,6 +664,11 @@ where
                 };
 
                 let Some(ch) = chosen else {
+                    // Record outcomes for proposals (all rejected)
+                    for (seq_id, oi, base_delta) in proposals.drain(..) {
+                        let _ = seq_id; // unused here
+                        self.local_book.record_outcome(oi, false, base_delta);
+                    }
                     break; // no candidates this step
                 };
 
@@ -592,6 +680,22 @@ where
 
                 // Commit the chosen candidate as current
                 current = ch.state;
+
+                // Record outcomes for all proposals: chosen = accepted; others rejected
+                let mut accepted_recorded = false;
+                for (seq_id, oi, base_delta) in proposals.drain(..) {
+                    if !accepted_recorded && seq_id == ch.seq_id {
+                        self.local_book.record_outcome(oi, true, base_delta);
+                        accepted_recorded = true;
+                    } else {
+                        self.local_book.record_outcome(oi, false, base_delta);
+                    }
+                }
+                if !accepted_recorded {
+                    // Fallback in unlikely case chosen wasn't in proposals buffer
+                    self.local_book
+                        .record_outcome(ch.op_index, true, ch.base_delta as f64);
+                }
 
                 // If TRUE objective improved, publish and (optionally) restart around best basin
                 if self
@@ -721,25 +825,24 @@ where
     }
 }
 
+// ================= Tabu (shorter tenure, quicker samples) ===================
 pub fn tabu_strategy<T, R>(
     model: &crate::model::solver_model::SolverModel<T>,
 ) -> TabuSearchStrategy<T, R, DefaultFeatureExtractor<T>>
 where
-    T: SolveNumeric + ToPrimitive + Copy + From<i32>,
+    T: SolveNumeric + num_traits::ToPrimitive + Copy + From<i32>,
     R: rand::Rng,
 {
+    use crate::engine::adaptive::tuning::{
+        LocalCountTargetTuner, OrOptBlockKTuner, WorkBudgetTuner,
+    };
+
     let proximity_map = model.proximity_map();
     let neighbors_any = neighbors::any(proximity_map);
     let neighbors_direct_competitors = neighbors::direct_competitors(proximity_map);
     let neighbors_same_berth = neighbors::same_berth(proximity_map);
 
-    let bucketizer: fn(TimePoint<T>) -> i64 = |t: TimePoint<T>| {
-        let v = t
-            .value()
-            .to_i64()
-            .expect("TimePoint<T>::value() must be convertible to i64 for bucketing");
-        v / 90
-    };
+    let bucketizer: fn(TimePoint<T>) -> i64 = |t| t.value().to_i64().unwrap() / 90;
 
     let feats = DefaultFeatureExtractor::new(bucketizer)
         .set_include_req_berth(true)
@@ -749,60 +852,102 @@ where
         .set_include_berth(true)
         .set_include_request(true);
 
-    let feats_arc = Arc::new(feats);
+    let feats_arc = std::sync::Arc::new(feats);
 
-    // Tabu tuned for intensification with modest diversification
+    let ultra = || {
+        WorkBudgetTuner::default()
+            .with_soft_time_budget_ms(0.55)
+            .with_intensity_bounds(0.04, 0.30)
+            .with_max_greediness(0.62)
+            .with_max_locality(0.70)
+    };
+
     TabuSearchStrategy::new(feats_arc)
         .with_lambda(7)
         .with_penalty_step(2)
         .with_decay(DecayMode::Multiplicative { num: 94, den: 100 })
         .with_max_penalty(1_000_000_000)
-        .with_max_local_steps(2000)
-        .with_tabu_tenure(36..=60)
-        .with_samples_per_step(140)
-        .with_refetch_after_stale(60)
+        .with_max_local_steps(1800)
+        .with_tabu_tenure(34..=54)
+        .with_samples_per_step(120)
+        .with_refetch_after_stale(52)
         .with_hard_refetch_every(24)
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
         .with_restart_on_publish(true)
         .with_reset_on_refetch(true)
-        .with_kick_steps_on_reset(6)
-        .with_pulse_params(8, 18)
-        // ------------------------- Local operators -------------------------
-        .with_local_op(Box::new(
-            ShiftEarlierOnSameBerth::new(18..=52).with_neighbors(neighbors_same_berth.clone()),
-        ))
-        .with_local_op(Box::new(
-            RelocateSingleBest::new(20..=64).with_neighbors(neighbors_direct_competitors.clone()),
-        ))
-        .with_local_op(Box::new(
-            SwapPairSameBerth::new(36..=96).with_neighbors(neighbors_same_berth.clone()),
-        ))
-        .with_local_op(Box::new(
-            CrossExchangeAcrossBerths::new(48..=128)
-                .with_neighbors(neighbors_direct_competitors.clone()),
-        ))
-        .with_local_op(Box::new(
-            OrOptBlockRelocate::new(5..=9, 1.4..=1.9).with_neighbors(neighbors_same_berth.clone()),
-        ))
-        .with_local_op(Box::new(
-            RelocateSingleBestAllowWorsening::new(12..=24)
-                .with_neighbors(neighbors_direct_competitors.clone()),
-        ))
-        .with_local_op(Box::new(
-            RandomRelocateAnywhere::new(12..=24).with_neighbors(neighbors_any.clone()),
-        ))
-        .with_local_op(Box::new(
-            HillClimbRelocateBest::new(24..=72)
-                .with_neighbors(neighbors_direct_competitors.clone()),
-        ))
-        .with_local_op(Box::new(
-            HillClimbBestSwapSameBerth::new(48..=120).with_neighbors(neighbors_same_berth.clone()),
-        ))
-        .with_local_op(Box::new(
-            RandomizedGreedyRelocateRcl::new(18..=48, 1.5..=2.2)
-                .with_neighbors(neighbors_direct_competitors.clone()),
-        ))
-        .with_local_op(Box::new(
-            CrossExchangeBestAcrossBerths::new(32..=96).with_neighbors(neighbors_any.clone()),
-        ))
+        .with_kick_steps_on_reset(5)
+        .with_pulse_params(6, 16)
+        // locals
+        .with_local_op_tuned(
+            Box::new(
+                ShiftEarlierOnSameBerth::new(1..=1).with_neighbors(neighbors_same_berth.clone()),
+            ),
+            Box::new(LocalCountTargetTuner::new(18.0, 52.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                RelocateSingleBest::new(1..=1).with_neighbors(neighbors_direct_competitors.clone()),
+            ),
+            Box::new(LocalCountTargetTuner::new(20.0, 64.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(SwapPairSameBerth::new(1..=1).with_neighbors(neighbors_same_berth.clone())),
+            Box::new(LocalCountTargetTuner::new(36.0, 96.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                CrossExchangeAcrossBerths::new(1..=1)
+                    .with_neighbors(neighbors_direct_competitors.clone()),
+            ),
+            Box::new(LocalCountTargetTuner::new(48.0, 128.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                OrOptBlockRelocate::new(2..=3, 1.48).with_neighbors(neighbors_same_berth.clone()),
+            ),
+            Box::new(OrOptBlockKTuner::default()),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                OrOptBlockRelocate::new(5..=9, 1.60).with_neighbors(neighbors_same_berth.clone()),
+            ),
+            Box::new(OrOptBlockKTuner::default()),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                RelocateSingleBestAllowWorsening::new(1..=1)
+                    .with_neighbors(neighbors_direct_competitors.clone()),
+            ),
+            Box::new(LocalCountTargetTuner::new(12.0, 24.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(RandomRelocateAnywhere::new(1..=1).with_neighbors(neighbors_any.clone())),
+            Box::new(LocalCountTargetTuner::new(12.0, 24.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                HillClimbRelocateBest::new(1..=1)
+                    .with_neighbors(neighbors_direct_competitors.clone()),
+            ),
+            Box::new(ultra()),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                HillClimbBestSwapSameBerth::new(1..=1).with_neighbors(neighbors_same_berth.clone()),
+            ),
+            Box::new(ultra()),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                RandomizedGreedyRelocateRcl::new(1..=1, 1.80)
+                    .with_neighbors(neighbors_direct_competitors.clone()),
+            ),
+            Box::new(ultra()),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                CrossExchangeBestAcrossBerths::new(1..=1).with_neighbors(neighbors_any.clone()),
+            ),
+            Box::new(ultra()),
+        )
 }

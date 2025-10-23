@@ -22,12 +22,13 @@
 use crate::{
     model::index::{BerthIndex, RequestIndex},
     search::{
-        operator::{DestroyOperator, NeighborFn},
+        operator::{DestroyOperator, NeighborFn, OperatorTuning},
         planner::{CostEvaluator, PlanBuilder, PlanExplorer, PlanningContext},
     },
     state::{
         decisionvar::{Decision, DecisionVar},
         plan::Plan,
+        solver_state::AdaptiveStats,
     },
 };
 use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval};
@@ -36,19 +37,26 @@ use rand::{
     Rng,
     seq::{IteratorRandom, SliceRandom},
 };
-use std::{ops::RangeInclusive, sync::Arc};
+use std::sync::Arc;
 
-// ---------------------------------------------------------------------
-// Type aliases for nicer, explicit APIs
-// ---------------------------------------------------------------------
-
-type RatioRange = RangeInclusive<f64>;
-type AlphaRange = RangeInclusive<f64>;
-
-/// Sample a value from an inclusive f64 range using the provided RNG.
 #[inline]
-fn sample_f64_inclusive<R: Rng>(range: &RangeInclusive<f64>, rng: &mut R) -> f64 {
-    rng.random_range(range.clone())
+fn clamp01(x: f64) -> f64 {
+    if x <= 0.0 {
+        0.0
+    } else if x >= 1.0 {
+        1.0
+    } else {
+        x
+    }
+}
+
+#[inline]
+fn alpha_from_inputs(greediness: f64, sample_width: f64) -> f64 {
+    // Use only inputs; ensure strictly > 0 without a magic epsilon
+    // by using the platform's semantic minimum positive float.
+    let raw = greediness + sample_width;
+    let a = clamp01(raw);
+    if a > 0.0 { a } else { f64::MIN_POSITIVE }
 }
 
 /// Randomized–greedy index selector (RCL) used in Shaw-style operators.
@@ -137,20 +145,20 @@ where
 // Destroy Operators (range-based configuration)
 // ======================================================================
 
-/// Randomly removes a `ratio` fraction of currently assigned requests (ratio sampled from range).
+/// Randomly removes a `ratio` fraction of currently assigned requests.
 /// If `neighbor_callback` is provided and returns assigned neighbors for a random seed,
 /// the removal is sampled from that localized pool; otherwise falls back to all assigned.
 #[derive(Clone)]
 pub struct RandomKRatioDestroy {
-    ratio_range: RatioRange,
+    ratio: f64,
     neighbor_callback: Option<Arc<NeighborFn>>,
 }
 
 impl RandomKRatioDestroy {
-    pub fn new(ratio_range: RatioRange) -> Self {
-        assert!(*ratio_range.start() >= 0.0 && *ratio_range.end() <= 1.0);
+    pub fn new(ratio: f64) -> Self {
+        assert!((0.0..=1.0).contains(&ratio));
         Self {
-            ratio_range,
+            ratio,
             neighbor_callback: None,
         }
     }
@@ -170,13 +178,18 @@ where
         "RandomKRatioDestroy"
     }
 
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, _stats: &AdaptiveStats<'m, 'p, T>) {
+        // 0 → remove nothing; 1 → remove all assigned
+        self.ratio = clamp01(t.intensity);
+        // neighbor_callback is an injected topology; not tuned here.
+    }
+
     fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
         ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
-        let sampled_ratio = sample_f64_inclusive(&self.ratio_range, rng);
-        if sampled_ratio == 0.0 {
+        if self.ratio == 0.0 {
             return None;
         }
 
@@ -203,8 +216,7 @@ where
             return None;
         }
 
-        let target_removal_count =
-            ((assigned_indices.len() as f64) * sampled_ratio).ceil() as usize;
+        let target_removal_count = ((assigned_indices.len() as f64) * self.ratio).ceil() as usize;
         let target_removal_count = target_removal_count.clamp(1, assigned_indices.len());
 
         let &seed_request = assigned_indices.iter().choose(rng)?;
@@ -266,19 +278,19 @@ where
 }
 
 /// Removes the top `ratio` fraction of assigned requests by *current assignment cost*,
-/// optionally restricted to a local neighborhood. Ratio is sampled from range.
+/// optionally restricted to a local neighborhood.
 /// If the callback yields no candidates, falls back to all assigned.
 #[derive(Clone)]
 pub struct WorstCostDestroy {
-    ratio_range: RatioRange,
+    ratio: f64,
     neighbor_callback: Option<Arc<NeighborFn>>,
 }
 
 impl WorstCostDestroy {
-    pub fn new(ratio_range: RatioRange) -> Self {
-        assert!(*ratio_range.start() >= 0.0 && *ratio_range.end() <= 1.0);
+    pub fn new(ratio: f64) -> Self {
+        assert!((0.0..=1.0).contains(&ratio));
         Self {
-            ratio_range,
+            ratio,
             neighbor_callback: None,
         }
     }
@@ -298,13 +310,16 @@ where
         "WorstCostDestroy"
     }
 
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, _stats: &AdaptiveStats<'m, 'p, T>) {
+        self.ratio = clamp01(t.intensity);
+    }
+
     fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
         ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
-        let sampled_ratio = sample_f64_inclusive(&self.ratio_range, rng);
-        if sampled_ratio == 0.0 {
+        if self.ratio == 0.0 {
             return None;
         }
 
@@ -331,7 +346,7 @@ where
             return None;
         }
 
-        let global_target_count = ((assigned_indices.len() as f64) * sampled_ratio).ceil() as usize;
+        let global_target_count = ((assigned_indices.len() as f64) * self.ratio).ceil() as usize;
         let global_target_count = global_target_count.clamp(1, assigned_indices.len());
 
         // Seed for neighborhood restriction (when a callback exists).
@@ -414,11 +429,11 @@ where
 
 /// Shaw-style relatedness removal around a seed, guided by
 /// weighted absolute start/end time gaps and a berth mismatch penalty.
-/// Uses randomized–greedy selection with `alpha` sampled from range.
+/// Uses randomized–greedy selection with a configured `alpha`.
 #[derive(Clone)]
 pub struct ShawRelatedDestroy {
-    ratio_range: RatioRange,
-    alpha_range: AlphaRange,
+    ratio: f64,
+    alpha: f64,
     weight_abs_start_gap: Cost,
     weight_abs_end_gap: Cost,
     penalty_berth_mismatch: Cost,
@@ -427,17 +442,17 @@ pub struct ShawRelatedDestroy {
 
 impl ShawRelatedDestroy {
     pub fn new(
-        ratio_range: RatioRange,
-        alpha_range: AlphaRange,
+        ratio: f64,
+        alpha: f64,
         weight_abs_start_gap: Cost,
         weight_abs_end_gap: Cost,
         penalty_berth_mismatch: Cost,
     ) -> Self {
-        assert!(*ratio_range.start() >= 0.0 && *ratio_range.end() <= 1.0);
-        assert!(*alpha_range.start() > 0.0 && alpha_range.end().is_finite());
+        assert!((0.0..=1.0).contains(&ratio));
+        assert!(alpha > 0.0 && alpha.is_finite());
         Self {
-            ratio_range,
-            alpha_range,
+            ratio,
+            alpha,
             weight_abs_start_gap,
             weight_abs_end_gap,
             penalty_berth_mismatch,
@@ -460,14 +475,18 @@ where
         "ShawRelatedDestroy"
     }
 
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        self.ratio = clamp01(t.intensity);
+        self.alpha = alpha_from_inputs(t.greediness, stats.sample_width());
+        // weights/penalties are design-time constants; not derived from (t, stats).
+    }
+
     fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
         ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
-        let sampled_ratio = sample_f64_inclusive(&self.ratio_range, rng);
-        let sampled_alpha = sample_f64_inclusive(&self.alpha_range, rng);
-        if sampled_ratio == 0.0 {
+        if self.ratio == 0.0 {
             return None;
         }
 
@@ -488,9 +507,9 @@ where
             return None;
         }
 
-        let target_removal_count = ((full_pool.len() as f64) * sampled_ratio).ceil() as usize;
+        let target_removal_count = ((full_pool.len() as f64) * self.ratio).ceil() as usize;
 
-        let seed_idx = randomized_greedy_index(full_pool.len(), sampled_alpha, rng);
+        let seed_idx = randomized_greedy_index(full_pool.len(), self.alpha, rng);
         let (seed_request, seed_berth, seed_interval) = full_pool[seed_idx];
 
         let mut candidate_pool = plan_builder.with_explorer(|explorer| {
@@ -567,7 +586,7 @@ where
             }
 
             scored.sort_by(|a, b| a.1.cmp(&b.1));
-            let pick = randomized_greedy_index(scored.len(), sampled_alpha, rng);
+            let pick = randomized_greedy_index(scored.len(), self.alpha, rng);
             let idx_in_pool = scored[pick].0;
             let (ri, berth, iv) = candidate_pool[idx_in_pool];
             selected_for_removal.push(ri);
@@ -597,18 +616,18 @@ where
 /// the neighborhood defaults to “same berth as the seed, sorted by |Δstart|”.
 #[derive(Clone)]
 pub struct BerthNeighborsDestroy {
-    ratio_range: RatioRange,
-    alpha_range: AlphaRange,
+    ratio: f64,
+    alpha: f64,
     neighbor_callback: Option<Arc<NeighborFn>>,
 }
 
 impl BerthNeighborsDestroy {
-    pub fn new(ratio_range: RatioRange, alpha_range: AlphaRange) -> Self {
-        assert!(*ratio_range.start() >= 0.0 && *ratio_range.end() <= 1.0);
-        assert!(*alpha_range.start() > 0.0 && alpha_range.end().is_finite());
+    pub fn new(ratio: f64, alpha: f64) -> Self {
+        assert!((0.0..=1.0).contains(&ratio));
+        assert!(alpha > 0.0 && alpha.is_finite());
         Self {
-            ratio_range,
-            alpha_range,
+            ratio,
+            alpha,
             neighbor_callback: None,
         }
     }
@@ -628,14 +647,17 @@ where
         "BerthNeighborsDestroy"
     }
 
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        self.ratio = clamp01(t.intensity);
+        self.alpha = alpha_from_inputs(t.greediness, stats.sample_width());
+    }
+
     fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
         ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
-        let sampled_ratio = sample_f64_inclusive(&self.ratio_range, rng);
-        let sampled_alpha = sample_f64_inclusive(&self.alpha_range, rng);
-        if sampled_ratio == 0.0 {
+        if self.ratio == 0.0 {
             return None;
         }
 
@@ -655,10 +677,10 @@ where
             return None;
         }
 
-        let target_removal_count = ((full_pool.len() as f64) * sampled_ratio).ceil() as usize;
+        let target_removal_count = ((full_pool.len() as f64) * self.ratio).ceil() as usize;
         let target_removal_count = target_removal_count.clamp(1, full_pool.len());
 
-        let seed_idx = randomized_greedy_index(full_pool.len(), sampled_alpha, rng);
+        let seed_idx = randomized_greedy_index(full_pool.len(), self.alpha, rng);
         let (seed_request, seed_berth, seed_interval) = full_pool[seed_idx];
 
         let mut candidate_pool = plan_builder.with_explorer(|explorer| {
@@ -733,9 +755,9 @@ where
 #[derive(Clone)]
 pub struct TimeWindowBandDestroy<T> {
     /// fraction of currently assigned to remove (0,1]; clamped to [1, |pool|]
-    pub ratio_range: RatioRange,
+    pub ratio: f64,
     /// Shaw-style randomized greediness for picking the seed among longer rectangles
-    pub alpha_for_seed_range: AlphaRange,
+    pub alpha_for_seed: f64,
     /// Half-width of the time band to remove around the seed's [start,end]
     pub half_band: berth_alloc_core::prelude::TimeDelta<T>,
     /// Optional neighborhood restriction
@@ -744,15 +766,15 @@ pub struct TimeWindowBandDestroy<T> {
 
 impl<T> TimeWindowBandDestroy<T> {
     pub fn new(
-        ratio_range: RatioRange,
-        alpha_for_seed_range: AlphaRange,
+        ratio: f64,
+        alpha_for_seed: f64,
         half_band: berth_alloc_core::prelude::TimeDelta<T>,
     ) -> Self {
-        assert!(*ratio_range.start() >= 0.0 && *ratio_range.end() <= 1.0);
-        assert!(*alpha_for_seed_range.start() > 0.0 && alpha_for_seed_range.end().is_finite());
+        assert!((0.0..=1.0).contains(&ratio));
+        assert!(alpha_for_seed > 0.0 && alpha_for_seed.is_finite());
         Self {
-            ratio_range,
-            alpha_for_seed_range,
+            ratio,
+            alpha_for_seed,
             half_band,
             neighbors: None,
         }
@@ -780,14 +802,18 @@ where
         "TimeWindowBandDestroy"
     }
 
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        self.ratio = clamp01(t.intensity);
+        self.alpha_for_seed = alpha_from_inputs(t.greediness, stats.sample_width());
+        // half_band stays as configured; no hidden constants introduced.
+    }
+
     fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
         ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
-        let sampled_ratio = sample_f64_inclusive(&self.ratio_range, rng);
-        let sampled_alpha = sample_f64_inclusive(&self.alpha_for_seed_range, rng);
-        if sampled_ratio == 0.0 {
+        if self.ratio == 0.0 {
             return None;
         }
 
@@ -807,9 +833,9 @@ where
             return None;
         }
 
-        let target_count = ((full.len() as f64) * sampled_ratio).ceil() as usize;
+        let target_count = ((full.len() as f64) * self.ratio).ceil() as usize;
 
-        let seed_idx = randomized_greedy_index(full.len(), sampled_alpha, rng);
+        let seed_idx = randomized_greedy_index(full.len(), self.alpha_for_seed, rng);
         let (seed_req, seed_berth, seed_iv) = full[seed_idx];
 
         // Candidate pool = neighbor(seed) if provided/non-empty else full
@@ -863,9 +889,9 @@ where
 #[derive(Clone)]
 pub struct BerthBandDestroy {
     /// fraction of assigned to remove (0,1]; clamped
-    pub ratio_range: RatioRange,
+    pub ratio: f64,
     /// seed greediness among longer rectangles
-    pub alpha_for_seed_range: AlphaRange,
+    pub alpha_for_seed: f64,
     /// half-width in berth-index units (inclusive)
     pub half_berth_span: u32,
     /// optional neighbor restriction
@@ -873,16 +899,12 @@ pub struct BerthBandDestroy {
 }
 
 impl BerthBandDestroy {
-    pub fn new(
-        ratio_range: RatioRange,
-        alpha_for_seed_range: AlphaRange,
-        half_berth_span: u32,
-    ) -> Self {
-        assert!(*ratio_range.start() >= 0.0 && *ratio_range.end() <= 1.0);
-        assert!(*alpha_for_seed_range.start() > 0.0 && alpha_for_seed_range.end().is_finite());
+    pub fn new(ratio: f64, alpha_for_seed: f64, half_berth_span: u32) -> Self {
+        assert!((0.0..=1.0).contains(&ratio));
+        assert!(alpha_for_seed > 0.0 && alpha_for_seed.is_finite());
         Self {
-            ratio_range,
-            alpha_for_seed_range,
+            ratio,
+            alpha_for_seed,
             half_berth_span,
             neighbors: None,
         }
@@ -903,14 +925,18 @@ where
         "BerthBandDestroy"
     }
 
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        self.ratio = clamp01(t.intensity);
+        self.alpha_for_seed = alpha_from_inputs(t.greediness, stats.sample_width());
+        // half_berth_span unchanged (depends on topology, not (t, stats) directly).
+    }
+
     fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
         ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<Plan<'p, T>> {
-        let sampled_ratio = sample_f64_inclusive(&self.ratio_range, rng);
-        let sampled_alpha = sample_f64_inclusive(&self.alpha_for_seed_range, rng);
-        if sampled_ratio == 0.0 {
+        if self.ratio == 0.0 {
             return None;
         }
 
@@ -930,9 +956,9 @@ where
             return None;
         }
 
-        let target_count = ((full.len() as f64) * sampled_ratio).ceil() as usize;
+        let target_count = ((full.len() as f64) * self.ratio).ceil() as usize;
 
-        let seed_idx = randomized_greedy_index(full.len(), sampled_alpha, rng);
+        let seed_idx = randomized_greedy_index(full.len(), self.alpha_for_seed, rng);
         let (seed_req, seed_berth, seed_iv) = full[seed_idx];
 
         // Candidate pool: neighbors(seed) else same-berth
@@ -998,20 +1024,20 @@ where
 #[derive(Clone)]
 pub struct ProcessingTimeClusterDestroy {
     /// fraction of assigned to remove (0,1]; clamped
-    pub ratio_range: RatioRange,
+    pub ratio: f64,
     /// seed greediness among longer rectangles
-    pub alpha_for_seed_range: AlphaRange,
+    pub alpha_for_seed: f64,
     /// optional neighbor restriction
     pub neighbors: Option<Arc<NeighborFn>>,
 }
 
 impl ProcessingTimeClusterDestroy {
-    pub fn new(ratio_range: RatioRange, alpha_for_seed_range: AlphaRange) -> Self {
-        assert!(*ratio_range.start() >= 0.0 && *ratio_range.end() <= 1.0);
-        assert!(*alpha_for_seed_range.start() > 0.0 && alpha_for_seed_range.end().is_finite());
+    pub fn new(ratio: f64, alpha_for_seed: f64) -> Self {
+        assert!((0.0..=1.0).contains(&ratio));
+        assert!(alpha_for_seed > 0.0 && alpha_for_seed.is_finite());
         Self {
-            ratio_range,
-            alpha_for_seed_range,
+            ratio,
+            alpha_for_seed,
             neighbors: None,
         }
     }
@@ -1031,13 +1057,17 @@ where
         "ProcessingTimeClusterDestroy"
     }
 
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        self.ratio = clamp01(t.intensity);
+        self.alpha_for_seed = alpha_from_inputs(t.greediness, stats.sample_width());
+    }
+
     fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
         ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         _rng: &mut R,
     ) -> Option<Plan<'p, T>> {
-        let sampled_ratio = *self.ratio_range.start(); // deterministic if caller wants; or sample externally
-        if sampled_ratio == 0.0 {
+        if self.ratio == 0.0 {
             return None;
         }
 
@@ -1053,7 +1083,7 @@ where
             return None;
         }
 
-        let target_count = ((full.len() as f64) * sampled_ratio).ceil() as usize;
+        let target_count = ((full.len() as f64) * self.ratio).ceil() as usize;
 
         // prefer longest:
         let (seed_ri, seed_bi, seed_iv) = *full.last().unwrap();
@@ -1113,25 +1143,25 @@ where
 /// to let repair re-pack many jobs tightly.
 #[derive(Clone)]
 pub struct TimeClusterDestroy<T> {
-    ratio_range: RatioRange,          // (0,1]
-    half_window: TimeDelta<T>,        // band half-width
-    alpha_for_seed_range: AlphaRange, // RCL greediness for seed among longer rectangles
+    ratio: f64,                // (0,1]
+    half_window: TimeDelta<T>, // band half-width
+    alpha_for_seed: f64,       // RCL greediness for seed among longer rectangles
     neighbors: Option<Arc<NeighborFn>>,
 }
 
 impl<T> TimeClusterDestroy<T> {
-    pub fn new(ratio_range: RatioRange, half_window: TimeDelta<T>) -> Self {
-        assert!(*ratio_range.start() >= 0.0 && *ratio_range.end() <= 1.0);
+    pub fn new(ratio: f64, half_window: TimeDelta<T>) -> Self {
+        assert!((0.0..=1.0).contains(&ratio));
         Self {
-            ratio_range,
+            ratio,
             half_window,
-            alpha_for_seed_range: 1.7..=1.7,
+            alpha_for_seed: 1.7,
             neighbors: None,
         }
     }
-    pub fn with_alpha(mut self, alpha_range: AlphaRange) -> Self {
-        assert!(*alpha_range.start() > 0.0 && alpha_range.end().is_finite());
-        self.alpha_for_seed_range = alpha_range;
+    pub fn with_alpha(mut self, alpha: f64) -> Self {
+        assert!(alpha > 0.0 && alpha.is_finite());
+        self.alpha_for_seed = alpha;
         self
     }
     pub fn with_neighbors(mut self, callback: Arc<NeighborFn>) -> Self {
@@ -1159,14 +1189,18 @@ where
         "TimeClusterDestroy"
     }
 
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        self.ratio = clamp01(t.intensity);
+        self.alpha_for_seed = alpha_from_inputs(t.greediness, stats.sample_width());
+        // half_window unchanged (time-scale of instance).
+    }
+
     fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
         ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<crate::state::plan::Plan<'p, T>> {
-        let sampled_ratio = sample_f64_inclusive(&self.ratio_range, rng);
-        let sampled_alpha = sample_f64_inclusive(&self.alpha_for_seed_range, rng);
-        if sampled_ratio == 0.0 {
+        if self.ratio == 0.0 {
             return None;
         }
 
@@ -1209,7 +1243,7 @@ where
         let mut sorted = assigned.clone();
         sorted.sort_by_key(|(_, _, iv)| (iv.end() - iv.start()).value());
         // RCL from the tail:
-        let seed_index_from_end = randomized_greedy_index(sorted.len(), sampled_alpha, rng);
+        let seed_index_from_end = randomized_greedy_index(sorted.len(), self.alpha_for_seed, rng);
         let seed_index = sorted.len() - 1 - seed_index_from_end;
         let (seed_request, _, seed_interval) = sorted[seed_index];
 
@@ -1264,7 +1298,7 @@ where
 
         let mut removed_count = 0usize;
         let target_count =
-            (((pool.len() as f64) * sampled_ratio).ceil() as usize).clamp(1, pool.len());
+            (((pool.len() as f64) * self.ratio).ceil() as usize).clamp(1, pool.len());
 
         for (ri, _bi, iv) in pool.into_iter() {
             if removed_count >= target_count {
@@ -1291,26 +1325,25 @@ where
 /// regret/greedy repair rebuild a better pack.
 ///
 /// `ratio` controls the block length relative to the number of assigned on that berth.
-/// Both ratio and alpha are sampled from ranges.
 #[derive(Clone)]
 pub struct StringBlockDestroy {
-    ratio_range: RatioRange,
-    alpha_for_seed_range: AlphaRange,
+    ratio: f64,
+    alpha_for_seed: f64,
     neighbors: Option<Arc<NeighborFn>>,
 }
 
 impl StringBlockDestroy {
-    pub fn new(ratio_range: RatioRange) -> Self {
-        assert!(*ratio_range.start() >= 0.0 && *ratio_range.end() <= 1.0);
+    pub fn new(ratio: f64) -> Self {
+        assert!((0.0..=1.0).contains(&ratio));
         Self {
-            ratio_range,
-            alpha_for_seed_range: 1.7..=1.7,
+            ratio,
+            alpha_for_seed: 1.7,
             neighbors: None,
         }
     }
-    pub fn with_alpha(mut self, alpha_range: AlphaRange) -> Self {
-        assert!(*alpha_range.start() > 0.0 && alpha_range.end().is_finite());
-        self.alpha_for_seed_range = alpha_range;
+    pub fn with_alpha(mut self, alpha: f64) -> Self {
+        assert!(alpha > 0.0 && alpha.is_finite());
+        self.alpha_for_seed = alpha;
         self
     }
     pub fn with_neighbors(mut self, callback: Arc<NeighborFn>) -> Self {
@@ -1329,14 +1362,17 @@ where
         "StringBlockDestroy"
     }
 
+    fn tune<'m, 'p>(&mut self, t: &OperatorTuning, stats: &AdaptiveStats<'m, 'p, T>) {
+        self.ratio = clamp01(t.intensity);
+        self.alpha_for_seed = alpha_from_inputs(t.greediness, stats.sample_width());
+    }
+
     fn propose<'b, 'c, 's, 'm, 'p>(
         &self,
         ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
         rng: &mut R,
     ) -> Option<crate::state::plan::Plan<'p, T>> {
-        let sampled_ratio = sample_f64_inclusive(&self.ratio_range, rng);
-        let sampled_alpha = sample_f64_inclusive(&self.alpha_for_seed_range, rng);
-        if sampled_ratio == 0.0 {
+        if self.ratio == 0.0 {
             return None;
         }
 
@@ -1378,7 +1414,7 @@ where
         // Prefer longer rectangles for the seed; pick via RCL.
         let mut sorted = assigned.clone();
         sorted.sort_by_key(|(_, _, iv)| (iv.end() - iv.start()).value());
-        let seed_idx = randomized_greedy_index(sorted.len(), sampled_alpha, rng);
+        let seed_idx = randomized_greedy_index(sorted.len(), self.alpha_for_seed, rng);
         let (seed_request, seed_berth, _) = sorted[seed_idx];
 
         // Limit pool to same berth as seed (or a neighbor fn if provided & non-empty).
@@ -1436,8 +1472,8 @@ where
             .unwrap_or(0);
 
         // Block length target
-        let target_count = (((same_berth.len() as f64) * sampled_ratio).ceil() as usize)
-            .clamp(1, same_berth.len());
+        let target_count =
+            (((same_berth.len() as f64) * self.ratio).ceil() as usize).clamp(1, same_berth.len());
 
         // Center block around seed (shift if needed to stay within bounds)
         let half = target_count / 2;
@@ -1458,10 +1494,6 @@ where
         Some(plan_builder.finalize())
     }
 }
-
-// ======================================================================
-// Tests (updated for range-based API: use x..=x for determinism)
-// ======================================================================
 
 #[cfg(test)]
 mod tests {
@@ -1617,7 +1649,7 @@ mod tests {
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(42);
 
-        let op = RandomKRatioDestroy::new(1.0..=1.0);
+        let op = RandomKRatioDestroy::new(1.0);
         assert!(op.propose(&mut ctx, &mut rng).is_none());
     }
 
@@ -1630,7 +1662,7 @@ mod tests {
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(7);
 
-        let op = RandomKRatioDestroy::new(0.0..=0.0);
+        let op = RandomKRatioDestroy::new(0.0);
         assert!(op.propose(&mut ctx, &mut rng).is_none());
     }
 
@@ -1644,7 +1676,7 @@ mod tests {
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(123);
 
-        let op = RandomKRatioDestroy::new(1.0..=1.0);
+        let op = RandomKRatioDestroy::new(1.0);
         let plan = op.propose(&mut ctx, &mut rng).expect("plan expected");
 
         assert_eq!(plan.decision_var_patches.len(), k_assigned);
@@ -1666,7 +1698,7 @@ mod tests {
         // Neighbor callback that returns only itself (very tiny local pool) → operator will top up.
         let cb: Arc<NeighborFn> = Arc::new(|seed| vec![seed]);
 
-        let ratio = 0.5..=0.5; // remove ceil(6 * 0.5) = 3
+        let ratio = 0.5; // remove ceil(6 * 0.5) = 3
         let op = RandomKRatioDestroy::new(ratio).with_neighbors(cb);
         let plan = op.propose(&mut ctx, &mut rng).expect("plan expected");
         assert_eq!(plan.decision_var_patches.len(), 3);
@@ -1681,7 +1713,7 @@ mod tests {
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(1);
 
-        let op = WorstCostDestroy::new(0.4..=0.4);
+        let op = WorstCostDestroy::new(0.4);
         let plan = op.propose(&mut ctx, &mut rng).expect("plan expected");
         // removes ceil(5 * 0.4) = 2
         assert_eq!(plan.decision_var_patches.len(), 2);
@@ -1698,8 +1730,8 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(9);
 
         let op = ShawRelatedDestroy::new(
-            0.3..=0.3, // ceil(7*0.3) = 3
-            2.0..=2.0,
+            0.3, // ceil(7*0.3) = 3
+            2.0,
             1.into(),
             1.into(),
             5.into(),
@@ -1718,7 +1750,7 @@ mod tests {
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(77);
 
-        let op = BerthNeighborsDestroy::new(0.5..=0.5, 2.0..=2.0); // ceil(6*0.5)=3
+        let op = BerthNeighborsDestroy::new(0.5, 2.0); // ceil(6*0.5)=3
         let plan = op.propose(&mut ctx, &mut rng).expect("plan expected");
         assert_eq!(plan.decision_var_patches.len(), 3);
     }
@@ -1744,7 +1776,7 @@ mod tests {
             v
         });
 
-        let op = WorstCostDestroy::new(0.5..=0.5).with_neighbors(cb);
+        let op = WorstCostDestroy::new(0.5).with_neighbors(cb);
         let plan = op.propose(&mut ctx, &mut rng).expect("plan expected");
         assert_eq!(plan.delta_unassigned, 3); // ceil(6*0.5)
     }
@@ -1758,7 +1790,7 @@ mod tests {
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
 
         let mut rng = StdRng::seed_from_u64(1);
-        let op = TimeWindowBandDestroy::new(0.5..=0.5, 1.7..=1.7, TimeDelta::new(5));
+        let op = TimeWindowBandDestroy::new(0.5, 1.7, TimeDelta::new(5));
         let plan = op.propose(&mut ctx, &mut rng).expect("plan");
         let expected = (((6_usize) as f64) * 0.5_f64).ceil() as usize;
         assert_eq!(plan.decision_var_patches.len(), expected);
@@ -1774,7 +1806,7 @@ mod tests {
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
 
         let mut rng = StdRng::seed_from_u64(2);
-        let op = BerthBandDestroy::new(0.4..=0.4, 1.3..=1.3, 0); // same-berth only
+        let op = BerthBandDestroy::new(0.4, 1.3, 0); // same-berth only
         let plan = op.propose(&mut ctx, &mut rng).expect("plan");
         let expected = (((7_usize) as f64) * 0.4_f64).ceil() as usize;
         assert_eq!(plan.decision_var_patches.len(), expected);
@@ -1790,7 +1822,7 @@ mod tests {
 
         // deterministic via degenerate range
         let mut rng = StdRng::seed_from_u64(3);
-        let op = ProcessingTimeClusterDestroy::new(0.33..=0.33, 2.0..=2.0);
+        let op = ProcessingTimeClusterDestroy::new(0.33, 2.0);
         let plan = op.propose(&mut ctx, &mut rng).expect("plan");
         let expected = (((9_usize) as f64) * 0.33_f64).ceil() as usize;
         assert_eq!(plan.decision_var_patches.len(), expected);
@@ -1819,8 +1851,7 @@ mod tests {
         });
 
         let mut rng = StdRng::seed_from_u64(4);
-        let op =
-            TimeWindowBandDestroy::new(0.5..=0.5, 1.2..=1.2, TimeDelta::new(5)).with_neighbors(cb);
+        let op = TimeWindowBandDestroy::new(0.5, 1.2, TimeDelta::new(5)).with_neighbors(cb);
         let plan = op.propose(&mut ctx, &mut rng).expect("plan");
 
         // Pool restricted by callback should still reach the requested ratio (topped-up if needed)
@@ -1837,7 +1868,7 @@ mod tests {
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(11);
 
-        let op = TimeClusterDestroy::new(0.25..=0.25, TimeDelta::new(5)).with_alpha(1.7..=1.7);
+        let op = TimeClusterDestroy::new(0.25, TimeDelta::new(5)).with_alpha(1.7);
         let plan = op.propose(&mut ctx, &mut rng).expect("plan");
         let expected = (((8_usize) as f64) * 0.25_f64).ceil() as usize;
         assert_eq!(plan.decision_var_patches.len(), expected);
@@ -1852,7 +1883,7 @@ mod tests {
         let mut ctx = make_ctx(&model, &DefaultCostEvaluator, &state, &mut buffer);
         let mut rng = StdRng::seed_from_u64(22);
 
-        let op = StringBlockDestroy::new(0.3..=0.3).with_alpha(2.0..=2.0);
+        let op = StringBlockDestroy::new(0.3).with_alpha(2.0);
         let plan = op.propose(&mut ctx, &mut rng).expect("plan");
         let expected = (((10_usize) as f64) * 0.3_f64).ceil() as usize;
         assert_eq!(plan.decision_var_patches.len(), expected);

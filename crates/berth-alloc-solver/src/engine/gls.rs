@@ -5,8 +5,7 @@
 // "Software"), to deal in the Software without restriction, including
 // without limitation the rights to use, copy, modify, merge, publish,
 // distribute, sublicense, and/or sell copies of the Software, and to
-// permit persons to whom the Software is furnished to do so, subject to
-// the following conditions:
+// permit persons to do so, subject to the following conditions:
 //
 // The above copyright notice and this permission notice shall be
 // included in all copies or substantial portions of the Software.
@@ -23,6 +22,13 @@ use crate::{
     core::numeric::SolveNumeric,
     engine::{
         acceptor::{Acceptor, LexStrictAcceptor},
+        adaptive::{
+            ops_book::OperatorBook,
+            selection::SoftmaxSelector,
+            tuning::{
+                DefaultOperatorTuner, LocalCountTargetTuner, OrOptBlockKTuner, WorkBudgetTuner,
+            },
+        },
         neighbors,
         search::{SearchContext, SearchStrategy},
     },
@@ -31,7 +37,7 @@ use crate::{
         solver_model::SolverModel,
     },
     search::{
-        operator::LocalMoveOperator,
+        operator::{LocalMoveOperator, OperatorKind},
         operator_library::local::{
             CrossExchangeAcrossBerths, CrossExchangeBestAcrossBerths, HillClimbBestSwapSameBerth,
             HillClimbRelocateBest, OrOptBlockRelocate, RandomRelocateAnywhere,
@@ -393,6 +399,9 @@ where
         >,
     >,
 
+    // Adaptive operator book for local ops
+    local_book: OperatorBook<T, R>,
+
     // GLS parameters
     lambda: i64,
     penalty_step: i64,
@@ -428,6 +437,10 @@ where
     pub fn new(feature_extractor: Arc<FX>) -> Self {
         Self {
             local_ops: Vec::new(),
+            local_book: OperatorBook::new(
+                OperatorKind::Local,
+                Box::new(SoftmaxSelector::default()),
+            ),
             lambda: 4,
             penalty_step: 1,
             stagnation_rounds_before_pulse: 16,
@@ -456,8 +469,27 @@ where
         >,
     ) -> Self {
         self.local_ops.push(op);
+        // Register a default tuner for this operator slot
+        let _ = self
+            .local_book
+            .register_operator(Box::new(DefaultOperatorTuner::default()));
         self
     }
+
+    pub fn with_local_op_tuned(
+        mut self,
+        op: Box<
+            dyn LocalMoveOperator<T, AugmentedCostEvaluator<DefaultCostEvaluator, T, FX>, R>
+                + Send
+                + Sync,
+        >,
+        tuner: Box<dyn crate::engine::adaptive::tuning::OperatorTuner<T>>,
+    ) -> Self {
+        self.local_ops.push(op);
+        let _ = self.local_book.register_operator(tuner);
+        self
+    }
+
     pub fn with_lambda(mut self, lambda: i64) -> Self {
         self.lambda = lambda;
         self
@@ -629,17 +661,18 @@ where
                             if let DecisionVar::Assigned(old) = old_dv
                                 && let Some(c) =
                                     model.cost_of_assignment(ri, old.berth_index, old.start_time)
-                                {
-                                    base_delta = base_delta.saturating_sub(c);
-                                }
+                            {
+                                base_delta = base_delta.saturating_sub(c);
+                            }
                             if let DecisionVar::Assigned(new_dec) = patch
                                 && let Some(c) = model.cost_of_assignment(
                                     ri,
                                     new_dec.berth_index,
                                     new_dec.start_time,
-                                ) {
-                                    base_delta = base_delta.saturating_add(c);
-                                }
+                                )
+                            {
+                                base_delta = base_delta.saturating_add(c);
+                            }
                         }
                         plan.delta_cost = base_delta;
                         // -------------------------------------------------------
@@ -729,21 +762,46 @@ where
                     break 'outer;
                 }
 
-                let mut order: Vec<usize> = (0..self.local_ops.len()).collect();
-                order.shuffle(context.rng());
-
                 let mut step_taken = false;
 
-                for &i in &order {
-                    let op = &self.local_ops[i];
-                    // Keep using augmented planner for operator proposal (selection uses augmented)
+                // Global stats for tuning/selection
+                let global_stats = current.stats(model);
+
+                // Engine stagnation signal (normalize by pulse threshold).
+                let stuck_factor =
+                    (stale as f64 / self.stagnation_rounds_before_pulse as f64).min(1.0);
+                let stagnation = crate::engine::adaptive::tuning::Stagnation {
+                    stale_rounds: stale,
+                    stuck_factor,
+                };
+
+                // Retune all local operators once per step
+                self.local_book.retune_all(&global_stats, &stagnation);
+
+                // Try up to N attempts this step (N = number of local operators)
+                let attempts = self.local_ops.len().max(1);
+                for _try in 0..attempts {
+                    // Select operator index via adaptive selector (stagnation-aware)
+                    let i = self
+                        .local_book
+                        .select(&global_stats, &stagnation, context.rng());
+                    let op = &mut self.local_ops[i];
+
+                    // Push tuning to operator
+                    let tuning = *self.local_book.tuning_for(i);
+                    op.tune(&tuning, &global_stats);
+
+                    // Keep using augmented planner for operator proposal
                     let mut pc =
                         PlanningContext::new(model, &current, &aug_eval, dv_buf.as_mut_slice());
 
+                    // Time proposal
+                    let t0 = self.local_book.propose_started();
                     if let Some(mut plan) = op.propose(&mut pc, context.rng()) {
+                        self.local_book.record_propose(i, t0, true);
+
                         // --- Recompute TRUE/base delta with “last patch per request wins” ---
                         use crate::model::index::RequestIndex;
-                        use crate::state::decisionvar::DecisionVar;
                         use std::collections::HashMap;
 
                         let mut base_delta: Cost = Cost::from(0);
@@ -762,18 +820,19 @@ where
                             if let DecisionVar::Assigned(old) = old_dv
                                 && let Some(c) =
                                     model.cost_of_assignment(ri, old.berth_index, old.start_time)
-                                {
-                                    base_delta = base_delta.saturating_sub(c);
-                                }
+                            {
+                                base_delta = base_delta.saturating_sub(c);
+                            }
                             // add new base cost
                             if let DecisionVar::Assigned(new_dec) = patch
                                 && let Some(c) = model.cost_of_assignment(
                                     ri,
                                     new_dec.berth_index,
                                     new_dec.start_time,
-                                ) {
-                                    base_delta = base_delta.saturating_add(c);
-                                }
+                                )
+                            {
+                                base_delta = base_delta.saturating_add(c);
+                            }
                         }
 
                         // Carry the base delta so Fitness stays TRUE/base-accurate
@@ -800,12 +859,18 @@ where
                         let cur_unassigned = current.fitness().unassigned_requests;
                         let cand_unassigned = cand.fitness().unassigned_requests;
 
-                        if self.gls_acceptor.accept_aug(
+                        let accepted = self.gls_acceptor.accept_aug(
                             cur_unassigned,
                             cur_aug,
                             cand_unassigned,
                             cand_aug,
-                        ) {
+                        );
+
+                        // Record outcome (true/base delta as f64)
+                        self.local_book
+                            .record_outcome(i, accepted, base_delta as f64);
+
+                        if accepted {
                             current = cand;
 
                             // TRUE objective for best publishing (unchanged)
@@ -833,6 +898,8 @@ where
                             accepted_any = true;
                             break; // restart local climb from new state
                         }
+                    } else {
+                        self.local_book.record_propose(i, t0, false);
                     }
                 }
 
@@ -916,22 +983,18 @@ where
     }
 }
 
-#[allow(clippy::type_complexity)]
+// =================== GLS (faster pulses, clamped heavies) ===================
 pub fn gls_strategy<T, R>(
     model: &crate::model::solver_model::SolverModel<T>,
 ) -> GuidedLocalSearchStrategy<T, R, DefaultFeatureExtractor<T, fn(TimePoint<T>) -> i64>>
 where
-    T: SolveNumeric + ToPrimitive + Copy + From<i32>,
+    T: SolveNumeric + num_traits::ToPrimitive + Copy + From<i32>,
     R: rand::Rng,
 {
-    // Slightly finer buckets to better target conflicts with PT 12–30
-    let bucketizer: fn(TimePoint<T>) -> i64 = |t: TimePoint<T>| -> i64 {
-        let v_i64 = t
-            .value()
-            .to_i64()
-            .expect("TimePoint<T>::value() must be convertible to i64 for bucketing");
-        v_i64 / 75
-    };
+    use crate::engine::adaptive::tuning::{LocalCountTargetTuner, WorkBudgetTuner};
+
+    let bucketizer: fn(TimePoint<T>) -> i64 =
+        |t| t.value().to_i64().expect("TimePoint to i64") / 75;
 
     let feats = DefaultFeatureExtractor::new(bucketizer)
         .set_include_req_berth(true)
@@ -948,56 +1011,98 @@ where
     let neighbors_direct_competitors = neighbors::direct_competitors(proximity_map);
     let neighbors_same_berth = neighbors::same_berth(proximity_map);
 
-    // Guidance tuned to intensify without over-penalizing
+    let ultra = || {
+        WorkBudgetTuner::default()
+            .with_soft_time_budget_ms(0.55)
+            .with_intensity_bounds(0.04, 0.30)
+            .with_max_greediness(0.62)
+            .with_max_locality(0.70)
+    };
+
     GuidedLocalSearchStrategy::new(feats_arc)
-        .with_lambda(9)
+        .with_lambda(8)
         .with_penalty_step(2)
         .with_decay(DecayMode::Multiplicative { num: 95, den: 100 })
         .with_max_penalty(1_000_000_000)
-        .with_pulse_params(8, 20)
-        .with_max_local_steps(2100)
-        .with_refetch_after_stale(60)
+        .with_pulse_params(6, 16)
+        .with_max_local_steps(1800)
+        .with_refetch_after_stale(45)
         .with_hard_refetch_every(24)
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
         .with_restart_on_publish(true)
         .with_reset_on_refetch(true)
-        .with_kick_steps_on_reset(6)
-        // ------------------------- Local operators -------------------------
-        .with_local_op(Box::new(
-            ShiftEarlierOnSameBerth::new(18..=52).with_neighbors(neighbors_same_berth.clone()),
-        ))
-        .with_local_op(Box::new(
-            RelocateSingleBest::new(20..=64).with_neighbors(neighbors_direct_competitors.clone()),
-        ))
-        .with_local_op(Box::new(
-            SwapPairSameBerth::new(36..=96).with_neighbors(neighbors_same_berth.clone()),
-        ))
-        .with_local_op(Box::new(
-            CrossExchangeAcrossBerths::new(48..=128)
-                .with_neighbors(neighbors_direct_competitors.clone()),
-        ))
-        .with_local_op(Box::new(
-            OrOptBlockRelocate::new(5..=9, 1.4..=1.9).with_neighbors(neighbors_same_berth.clone()),
-        ))
-        .with_local_op(Box::new(
-            RelocateSingleBestAllowWorsening::new(12..=24)
-                .with_neighbors(neighbors_direct_competitors.clone()),
-        ))
-        .with_local_op(Box::new(
-            RandomRelocateAnywhere::new(12..=24).with_neighbors(neighbors_any.clone()),
-        ))
-        .with_local_op(Box::new(
-            HillClimbRelocateBest::new(24..=72)
-                .with_neighbors(neighbors_direct_competitors.clone()),
-        ))
-        .with_local_op(Box::new(
-            HillClimbBestSwapSameBerth::new(48..=120).with_neighbors(neighbors_same_berth.clone()),
-        ))
-        .with_local_op(Box::new(
-            RandomizedGreedyRelocateRcl::new(18..=48, 1.5..=2.2)
-                .with_neighbors(neighbors_direct_competitors.clone()),
-        ))
-        .with_local_op(Box::new(
-            CrossExchangeBestAcrossBerths::new(32..=96).with_neighbors(neighbors_any.clone()),
-        ))
+        .with_kick_steps_on_reset(4)
+        // locals
+        .with_local_op_tuned(
+            Box::new(
+                ShiftEarlierOnSameBerth::new(1..=1).with_neighbors(neighbors_same_berth.clone()),
+            ),
+            Box::new(LocalCountTargetTuner::new(18.0, 52.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                RelocateSingleBest::new(1..=1).with_neighbors(neighbors_direct_competitors.clone()),
+            ),
+            Box::new(LocalCountTargetTuner::new(20.0, 64.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(SwapPairSameBerth::new(1..=1).with_neighbors(neighbors_same_berth.clone())),
+            Box::new(LocalCountTargetTuner::new(36.0, 96.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                CrossExchangeAcrossBerths::new(1..=1)
+                    .with_neighbors(neighbors_direct_competitors.clone()),
+            ),
+            Box::new(LocalCountTargetTuner::new(48.0, 128.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                OrOptBlockRelocate::new(2..=3, 1.50).with_neighbors(neighbors_same_berth.clone()),
+            ),
+            Box::new(OrOptBlockKTuner::default()),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                OrOptBlockRelocate::new(5..=9, 1.60).with_neighbors(neighbors_same_berth.clone()),
+            ),
+            Box::new(OrOptBlockKTuner::default()),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                RelocateSingleBestAllowWorsening::new(1..=1)
+                    .with_neighbors(neighbors_direct_competitors.clone()),
+            ),
+            Box::new(LocalCountTargetTuner::new(12.0, 24.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(RandomRelocateAnywhere::new(1..=1).with_neighbors(neighbors_any.clone())),
+            Box::new(LocalCountTargetTuner::new(12.0, 24.0)),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                HillClimbRelocateBest::new(1..=1)
+                    .with_neighbors(neighbors_direct_competitors.clone()),
+            ),
+            Box::new(ultra()),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                HillClimbBestSwapSameBerth::new(1..=1).with_neighbors(neighbors_same_berth.clone()),
+            ),
+            Box::new(ultra()),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                RandomizedGreedyRelocateRcl::new(1..=1, 1.80)
+                    .with_neighbors(neighbors_direct_competitors.clone()),
+            ),
+            Box::new(ultra()),
+        )
+        .with_local_op_tuned(
+            Box::new(
+                CrossExchangeBestAcrossBerths::new(1..=1).with_neighbors(neighbors_any.clone()),
+            ),
+            Box::new(ultra()),
+        )
 }

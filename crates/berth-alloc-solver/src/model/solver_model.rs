@@ -48,7 +48,8 @@ pub struct SolverModel<'problem, T: Copy + Ord> {
     berths: Vec<Berth<T>>,                       // len = B
     allowed_berth_indices: Vec<Vec<BerthIndex>>, // len = R
     proximity_map: ProximityMap,                 // Neighborhood info
-    problem: &'problem Problem<T>,               // reference to original problem
+    planning_horizon: TimeInterval<T>,
+    problem: &'problem Problem<T>, // reference to original problem
 }
 
 impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T> {
@@ -93,6 +94,11 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
         debug_assert!(index < self.processing_times.len());
 
         self.processing_times[index]
+    }
+
+    #[inline]
+    pub fn planning_horizon(&self) -> TimeInterval<T> {
+        self.planning_horizon
     }
 
     #[inline(always)]
@@ -295,6 +301,42 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
             proximity_map_config,
         );
 
+        // Compute planning horizon across all berths' availability windows
+        let mut ph_start: Option<TimePoint<T>> = None;
+        let mut ph_end: Option<TimePoint<T>> = None;
+        for b in &berths {
+            for w in b.iter_availability_windows() {
+                let (s, e) = w.into_inner();
+                ph_start = Some(match ph_start {
+                    Some(curr) => {
+                        if s < curr {
+                            s
+                        } else {
+                            curr
+                        }
+                    }
+                    None => s,
+                });
+                ph_end = Some(match ph_end {
+                    Some(curr) => {
+                        if e > curr {
+                            e
+                        } else {
+                            curr
+                        }
+                    }
+                    None => e,
+                });
+            }
+        }
+        let planning_horizon = match (ph_start, ph_end) {
+            (Some(s), Some(e)) => TimeInterval::new(s, e),
+            _ => {
+                let z = TimePoint::new(T::zero());
+                TimeInterval::new(z, z)
+            }
+        };
+
         Ok(SolverModel {
             index_manager,
             allowed_berth_indices,
@@ -305,6 +347,7 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
             requests_len,
             calendars,
             berths,
+            planning_horizon,
             proximity_map,
             problem: p,
         })
@@ -658,5 +701,52 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn test_planning_horizon_single_berth() {
+        // One berth with [10, 100)
+        let b = Berth::from_windows(bid(1), [iv(10, 100)]);
+        let mut builder = ProblemBuilder::new();
+        builder.add_berth(b);
+        let p = builder.build().expect("valid problem");
+        let m = SolverModel::try_from(&p).expect("model builds");
+
+        assert_eq!(m.planning_horizon(), iv(10, 100));
+    }
+
+    #[test]
+    fn test_planning_horizon_multiple_berths_mixed_windows() {
+        // b1 has two windows [0,10), [40,50)
+        let b1 = Berth::from_windows(bid(1), vec![iv(0, 10), iv(40, 50)]);
+        // b2 has one window [-5, 20)
+        let b2 = Berth::from_windows(bid(2), vec![iv(-5, 20)]);
+
+        let mut builder = ProblemBuilder::new();
+        builder.add_berth(b1);
+        builder.add_berth(b2);
+
+        let p = builder.build().expect("valid problem");
+        let m = SolverModel::try_from(&p).expect("model builds");
+
+        // Horizon spans min start to max end across all windows: [-5, 50)
+        assert_eq!(m.planning_horizon(), iv(-5, 50));
+    }
+
+    #[test]
+    fn test_planning_horizon_empty_availability_defaults_zero() {
+        // A berth with no availability windows
+        let b_empty = Berth::from_windows(bid(99), Vec::<TimeInterval<i64>>::new());
+
+        let mut builder = ProblemBuilder::new();
+        builder.add_berth(b_empty);
+
+        let p = builder
+            .build()
+            .expect("valid problem with empty availability");
+        let m = SolverModel::try_from(&p).expect("model builds");
+
+        // When there are no availability windows across berths, horizon defaults to [0,0)
+        assert_eq!(m.planning_horizon(), iv(0, 0));
     }
 }
