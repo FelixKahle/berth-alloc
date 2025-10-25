@@ -1,10 +1,29 @@
 // Copyright (c) 2025 Felix Kahle.
-// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+//
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+use crate::engine::acceptor::Acceptor;
 use crate::{
     core::numeric::SolveNumeric,
     engine::{
-        acceptor::{Acceptor, LexStrictAcceptor},
+        acceptor::LexStrictAcceptor,
         neighbors,
         operators::{LocalPool, SoftmaxSelector},
         search::{SearchContext, SearchStrategy},
@@ -19,10 +38,11 @@ use crate::{
     search::{
         operator::LocalMoveOperator,
         operator_library::local::{
-            CrossExchangeAcrossBerths, CrossExchangeBestAcrossBerths, HillClimbBestSwapSameBerth,
-            HillClimbRelocateBest, OrOptBlockRelocate, RandomRelocateAnywhere,
-            RandomizedGreedyRelocateRcl, RelocateSingleBest, RelocateSingleBestAllowWorsening,
-            ShiftEarlierOnSameBerth, SwapPairSameBerth,
+            CascadeInsertPolicy, CascadeRelocateK, CrossExchangeAcrossBerths,
+            CrossExchangeBestAcrossBerths, HillClimbBestSwapSameBerth, HillClimbRelocateBest,
+            OrOptBlockRelocate, RandomRelocateAnywhere, RandomizedGreedyRelocateRcl,
+            RelocateSingleBest, RelocateSingleBestAllowWorsening, ShiftEarlierOnSameBerth,
+            SwapPairSameBerth,
         },
         planner::{CostEvaluator, DefaultCostEvaluator, PlanningContext},
     },
@@ -33,13 +53,11 @@ use crate::{
 };
 use berth_alloc_core::prelude::{Cost, TimePoint};
 use num_traits::ToPrimitive;
-use rand::seq::SliceRandom;
-use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::Ordering as AtomicOrdering};
 
 // ===============================
-// Features & penalties
+// Feature extraction & penalties
 // ===============================
 
 /// Generalized penalizable feature.
@@ -66,7 +84,7 @@ pub trait FeatureExtractor<T> {
         request: RequestIndex,
         berth: BerthIndex,
         start_time: TimePoint<T>,
-        out: &mut SmallVec<[Feature; 6]>,
+        out: &mut smallvec::SmallVec<[Feature; 6]>,
     );
 }
 
@@ -139,7 +157,7 @@ where
         req: RequestIndex,
         berth: BerthIndex,
         start_time: TimePoint<T>,
-        out: &mut SmallVec<[Feature; 6]>,
+        out: &mut smallvec::SmallVec<[Feature; 6]>,
     ) {
         let r = req.get();
         let b = berth.get();
@@ -291,7 +309,7 @@ where
         let base = self
             .base
             .eval_request(model, request, start_time, berth_index)?;
-        let mut buf: SmallVec<[Feature; 6]> = SmallVec::new();
+        let mut buf: smallvec::SmallVec<[Feature; 6]> = smallvec::SmallVec::new();
         self.feats
             .features_for(request, berth_index, start_time, &mut buf);
         let pen_sum = self.penalties.sum(buf.iter()) as Cost;
@@ -300,40 +318,53 @@ where
 }
 
 // ===============================
-// Acceptors & helpers
+// Small pure helpers (testable)
 // ===============================
 
-trait AugmentedAcceptor {
-    fn name(&self) -> &str;
-    fn accept_aug(
-        &self,
-        cur_unassigned: usize,
-        cur_aug_cost: Cost,
-        cand_unassigned: usize,
-        cand_aug_cost: Cost,
-    ) -> bool;
-}
-
-#[derive(Debug, Default, Clone)]
-struct GlsLexStrictAcceptor;
-impl AugmentedAcceptor for GlsLexStrictAcceptor {
-    fn name(&self) -> &str {
-        "GlsLexStrictAcceptor"
-    }
-    #[inline]
-    fn accept_aug(
-        &self,
-        cur_unassigned: usize,
-        cur_aug_cost: Cost,
-        cand_unassigned: usize,
-        cand_aug_cost: Cost,
-    ) -> bool {
-        (cand_unassigned < cur_unassigned)
-            || (cand_unassigned == cur_unassigned && cand_aug_cost < cur_aug_cost)
-    }
-}
-
 #[inline]
+fn gls_lex_accept(
+    cur_unassigned: usize,
+    cur_aug_cost: Cost,
+    cand_unassigned: usize,
+    cand_aug: Cost,
+) -> bool {
+    (cand_unassigned < cur_unassigned)
+        || (cand_unassigned == cur_unassigned && cand_aug < cur_aug_cost)
+}
+
+/// Recompute true/base delta for a plan using “last patch wins”.
+fn recompute_true_delta<T>(
+    model: &SolverModel<'_, T>,
+    before: &SolverState<'_, T>,
+    patches: &[(crate::model::index::RequestIndex, DecisionVar<T>)],
+) -> Cost
+where
+    T: SolveNumeric,
+{
+    let mut base_delta: Cost = 0.into();
+    let mut last: HashMap<usize, DecisionVar<T>> = HashMap::with_capacity(patches.len());
+    for (ri, dv) in patches {
+        last.insert(ri.get(), *dv);
+    }
+
+    for (ri_u, patch) in last {
+        let ri = RequestIndex::new(ri_u);
+        let old_dv = before.decision_variables()[ri.get()];
+        if let DecisionVar::Assigned(old) = old_dv
+            && let Some(c) = model.cost_of_assignment(ri, old.berth_index, old.start_time)
+        {
+            base_delta = base_delta.saturating_sub(c);
+        }
+        if let DecisionVar::Assigned(new_dec) = patch
+            && let Some(c) = model.cost_of_assignment(ri, new_dec.berth_index, new_dec.start_time)
+        {
+            base_delta = base_delta.saturating_add(c);
+        }
+    }
+    base_delta
+}
+
+/// Compute augmented cost of a state given penalties and feature extractor.
 fn augmented_cost_of_state<T, FX>(
     state: &SolverState<'_, T>,
     feats: &FX,
@@ -344,6 +375,7 @@ where
     T: Copy + Ord,
     FX: FeatureExtractor<T> + ?Sized,
 {
+    use smallvec::SmallVec;
     let mut buf: SmallVec<[Feature; 6]> = SmallVec::new();
     let mut p_sum: i64 = 0;
 
@@ -362,6 +394,60 @@ where
         .fitness()
         .cost
         .saturating_add(lambda_cost.saturating_mul(p_sum as Cost))
+}
+
+/// Pulse penalties when stalled: compute utilities per feature and add step to top_k.
+fn pulse_penalties<T, FX>(
+    model: &SolverModel<'_, T>,
+    current: &SolverState<'_, T>,
+    feats: &FX,
+    store: &mut PenaltyStore,
+    top_k: usize,
+    step: i64,
+    dv_buf: &mut [DecisionVar<T>],
+) where
+    T: SolveNumeric,
+    FX: FeatureExtractor<T> + ?Sized,
+{
+    let base_eval = DefaultCostEvaluator;
+    let mut pc = PlanningContext::new(model, current, &base_eval, dv_buf);
+
+    let mut util_by_feature: HashMap<Feature, i128> = HashMap::new();
+
+    pc.builder().with_explorer(|ex| {
+        let mut feats_buf: smallvec::SmallVec<[Feature; 6]> = smallvec::SmallVec::new();
+        for (i, dv) in ex.decision_vars().iter().enumerate() {
+            if let DecisionVar::Assigned(Decision {
+                berth_index,
+                start_time,
+            }) = *dv
+                && let Some(base) = ex.peek_cost(RequestIndex::new(i), start_time, berth_index)
+            {
+                feats_buf.clear();
+                feats.features_for(
+                    RequestIndex::new(i),
+                    berth_index,
+                    start_time,
+                    &mut feats_buf,
+                );
+                for f in feats_buf.iter().cloned() {
+                    let p = *store.map.get(&f).unwrap_or(&0) as i128;
+                    // GLS proxy utility: higher base & lower current penalty -> higher utility
+                    let u = (base as i128) / (1 + p);
+                    *util_by_feature.entry(f).or_insert(0) += u;
+                }
+            }
+        }
+    });
+
+    let mut items: Vec<(Feature, i128)> = util_by_feature.into_iter().collect();
+    items.sort_by_key(|&(_, u)| -u);
+    for (rank, (f, _)) in items.into_iter().enumerate() {
+        if rank >= top_k {
+            break;
+        }
+        store.add_one(f, step);
+    }
 }
 
 // ===============================
@@ -395,8 +481,7 @@ where
     feature_extractor: Arc<FX>,
 
     // Acceptance
-    gls_acceptor: GlsLexStrictAcceptor, // augmented objective
-    true_acceptor: LexStrictAcceptor,   // true objective
+    true_acceptor: LexStrictAcceptor, // TRUE objective (for publish)
 
     // Refetch knobs
     refetch_after_stale: usize, // 0 => derive from pulse threshold
@@ -431,7 +516,6 @@ where
             penalty_store: PenaltyStore::new()
                 .with_decay(DecayMode::Multiplicative { num: 9, den: 10 }),
             feature_extractor,
-            gls_acceptor: GlsLexStrictAcceptor,
             true_acceptor: LexStrictAcceptor,
             refetch_after_stale: 0, // derive from pulse threshold by default
             hard_refetch_every: 0,
@@ -583,8 +667,8 @@ where
         false
     }
 
-    /// Reset local climb state around `current` and optionally apply a few random kick moves
-    /// using the *augmented* evaluator (penalties preserved).
+    /// Apply up to `kick_steps_on_reset` local proposals from the pool with the augmented evaluator.
+    /// Uses neutral reward and recomputes TRUE delta to keep state consistent.
     fn reset_state<'p>(
         &mut self,
         model: &SolverModel<'p, T>,
@@ -593,65 +677,38 @@ where
         current: &mut SolverState<'p, T>,
         label: &str,
     ) {
-        if self.kick_steps_on_reset > 0 && self.pool.len() > 0 {
-            let aug_eval = AugmentedCostEvaluator::new(
-                DefaultCostEvaluator,
-                self.penalty_store.clone(),
-                self.lambda as Cost,
-                self.feature_extractor.clone(),
-            );
-            for _ in 0..self.kick_steps_on_reset {
-                let mut indices: Vec<usize> = (0..self.pool.len()).collect();
-                indices.shuffle(rng);
+        if self.kick_steps_on_reset == 0 || self.pool.is_empty() {
+            tracing::debug!("GLS: reset ({}) — no kick", label);
+            return;
+        }
 
-                let mut kicked = false;
-                for oi in indices {
-                    // propose through pool
-                    let mut pc = PlanningContext::new(model, current, &aug_eval, dv_buf);
-                    let mut prop = self.pool.apply(&mut pc, rng, None);
-                    if let Some(mut plan) = prop.take_plan() {
-                        // recompute TRUE/base delta via "last patch wins"
-                        use std::collections::HashMap;
+        let aug_eval = AugmentedCostEvaluator::new(
+            DefaultCostEvaluator,
+            self.penalty_store.clone(),
+            self.lambda as Cost,
+            self.feature_extractor.clone(),
+        );
 
-                        let mut base_delta: Cost = 0.into();
-                        let mut last: HashMap<usize, DecisionVar<T>> =
-                            HashMap::with_capacity(plan.decision_var_patches.len());
-                        for p in &plan.decision_var_patches {
-                            last.insert(p.index.get(), p.patch);
-                        }
-                        for (ri_u, patch) in last {
-                            let ri = RequestIndex::new(ri_u);
-                            let old_dv = current.decision_variables()[ri.get()];
-                            if let DecisionVar::Assigned(old) = old_dv
-                                && let Some(c) =
-                                    model.cost_of_assignment(ri, old.berth_index, old.start_time)
-                            {
-                                base_delta = base_delta.saturating_sub(c);
-                            }
-                            if let DecisionVar::Assigned(new_dec) = patch
-                                && let Some(c) = model.cost_of_assignment(
-                                    ri,
-                                    new_dec.berth_index,
-                                    new_dec.start_time,
-                                )
-                            {
-                                base_delta = base_delta.saturating_add(c);
-                            }
-                        }
-                        plan.delta_cost = base_delta;
+        for _ in 0..self.kick_steps_on_reset {
+            let mut pc = PlanningContext::new(model, current, &aug_eval, dv_buf);
+            let mut prop = self.pool.apply(&mut pc, rng, None);
 
-                        current.apply_plan(plan);
-                        // treat as neutral reward (we didn't recompute true delta vs previous)
-                        prop.accept(0);
-                        kicked = true;
-                        break;
-                    } else {
-                        prop.reject();
-                    }
-                }
-                if !kicked {
-                    break;
-                }
+            if let Some(mut plan) = prop.take_plan() {
+                // Build patches list
+                let patches: Vec<(RequestIndex, DecisionVar<T>)> = plan
+                    .decision_var_patches
+                    .iter()
+                    .map(|p| (p.index, p.patch))
+                    .collect();
+
+                let delta = recompute_true_delta(model, current, &patches);
+                plan.delta_cost = delta;
+
+                current.apply_plan(plan);
+                prop.accept(0); // neutral reward for kick
+            } else {
+                prop.reject();
+                // Try next step regardless (pool will vary selection)
             }
         }
 
@@ -677,7 +734,7 @@ where
     fn run<'e, 'm, 'p>(&mut self, context: &mut SearchContext<'e, 'm, 'p, T, R>) {
         let stop = context.stop();
         let model = context.model();
-        if self.pool.len() == 0 {
+        if self.pool.is_empty() {
             tracing::warn!("GLS: no local operators configured");
             return;
         }
@@ -751,51 +808,25 @@ where
                     PlanningContext::new(model, &current, &aug_eval, dv_buf.as_mut_slice());
                 let mut prop = self.pool.apply(&mut pc, context.rng(), None);
 
-                // If no plan, reject and continue.
+                // If no plan, reject and continue to pulse/refetch logic.
                 let Some(mut plan) = prop.take_plan() else {
                     prop.reject();
                     break;
                 };
 
-                // --- Recompute TRUE/base delta with “last patch per request wins” ---
-                use std::collections::HashMap;
-
-                let mut base_delta: Cost = Cost::from(0);
-
-                // Keep only the final patch per request
-                let mut last: HashMap<usize, DecisionVar<T>> = HashMap::new();
-                for p in &plan.decision_var_patches {
-                    last.insert(p.index.get(), p.patch);
-                }
-
-                for (ri_u, patch) in last {
-                    let ri = RequestIndex::new(ri_u);
-                    let old_dv = current.decision_variables()[ri.get()];
-
-                    // subtract old base cost
-                    if let DecisionVar::Assigned(old) = old_dv
-                        && let Some(c) =
-                            model.cost_of_assignment(ri, old.berth_index, old.start_time)
-                    {
-                        base_delta = base_delta.saturating_sub(c);
-                    }
-                    // add new base cost
-                    if let DecisionVar::Assigned(new_dec) = patch
-                        && let Some(c) =
-                            model.cost_of_assignment(ri, new_dec.berth_index, new_dec.start_time)
-                    {
-                        base_delta = base_delta.saturating_add(c);
-                    }
-                }
-
-                // Carry the base delta so Fitness stays TRUE/base-accurate
+                // Recompute TRUE/base delta (last-patch-wins)
+                let patches: Vec<(RequestIndex, DecisionVar<T>)> = plan
+                    .decision_var_patches
+                    .iter()
+                    .map(|p| (p.index, p.patch))
+                    .collect();
+                let base_delta = recompute_true_delta(model, &current, &patches);
                 plan.delta_cost = base_delta;
-                // ---------------------------------------------------------------------
 
                 let mut cand = current.clone();
                 cand.apply_plan(plan);
 
-                // GLS acceptor on augmented objective
+                // GLS acceptor on augmented objective (pure function)
                 let cur_aug = augmented_cost_of_state(
                     &current,
                     self.feature_extractor.as_ref(),
@@ -819,14 +850,10 @@ where
                     .saturating_sub(cand.fitness().cost)
                     .max(0);
 
-                if self
-                    .gls_acceptor
-                    .accept_aug(cur_unassigned, cur_aug, cand_unassigned, cand_aug)
-                {
+                if gls_lex_accept(cur_unassigned, cur_aug, cand_unassigned, cand_aug) {
                     // Accept on augmented; reward by TRUE improvement
                     current = cand;
-
-                    prop.accept(true_improvement as i64);
+                    prop.accept(true_improvement);
 
                     // TRUE objective for best publishing + ε-history
                     if self
@@ -856,11 +883,10 @@ where
                     }
 
                     accepted_any = true;
-                    // Restart local climb from the new state
+                    // restart local climb from updated state
                 } else {
                     // Rejected on augmented objective
                     prop.reject();
-                    // stop this inner attempt; let outer loop check pulse/refetch
                     break;
                 }
             }
@@ -881,49 +907,15 @@ where
 
             // Pulse penalties when local search stalls (independent of refetch)
             if pulse_stale_rounds >= self.stagnation_rounds_before_pulse {
-                // Build utilities per FEATURE on base evaluator.
-                let base_eval = DefaultCostEvaluator;
-                let mut pc =
-                    PlanningContext::new(model, &current, &base_eval, dv_buf.as_mut_slice());
-
-                let mut util_by_feature: HashMap<Feature, i128> = HashMap::new();
-
-                pc.builder().with_explorer(|ex| {
-                    let mut feats_buf: SmallVec<[Feature; 6]> = SmallVec::new();
-                    for (i, dv) in ex.decision_vars().iter().enumerate() {
-                        if let DecisionVar::Assigned(Decision {
-                            berth_index,
-                            start_time,
-                        }) = *dv
-                            && let Some(base) =
-                                ex.peek_cost(RequestIndex::new(i), start_time, berth_index)
-                        {
-                            feats_buf.clear();
-                            self.feature_extractor.features_for(
-                                RequestIndex::new(i),
-                                berth_index,
-                                start_time,
-                                &mut feats_buf,
-                            );
-                            for f in feats_buf.iter().cloned() {
-                                let p = *self.penalty_store.map.get(&f).unwrap_or(&0) as i128;
-                                // GLS proxy utility: higher base & lower current penalty -> higher utility
-                                let u = (base as i128) / (1 + p);
-                                *util_by_feature.entry(f).or_insert(0) += u;
-                            }
-                        }
-                    }
-                });
-
-                let mut items: Vec<(Feature, i128)> = util_by_feature.into_iter().collect();
-                items.sort_by_key(|&(_, u)| -u);
-                for (rank, (f, _)) in items.into_iter().enumerate() {
-                    if rank >= self.pulse_top_k {
-                        break;
-                    }
-                    self.penalty_store.add_one(f, self.penalty_step);
-                }
-
+                pulse_penalties(
+                    model,
+                    &current,
+                    self.feature_extractor.as_ref(),
+                    &mut self.penalty_store,
+                    self.pulse_top_k,
+                    self.penalty_step,
+                    dv_buf.as_mut_slice(),
+                );
                 pulse_stale_rounds = 0;
                 tracing::trace!(
                     "GLS: penalty pulse (top_k={}, step={})",
@@ -1044,5 +1036,10 @@ where
         ))
         .with_local_op(Box::new(
             CrossExchangeBestAcrossBerths::new(32..=96).with_neighbors(neighbors_any.clone()),
+        ))
+        .with_local_op(Box::new(
+            CascadeRelocateK::new(3..=4, 8..=12, 12..=24)
+                .with_neighbors(neighbors_direct_competitors.clone())
+                .with_insert_policy(CascadeInsertPolicy::BestEarliest), // greedy & cheap
         ))
 }

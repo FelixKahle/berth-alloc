@@ -124,7 +124,7 @@ where
     {
         // Snapshot first to avoid TOCTOU with a mutating candidate.
         let snapshot = candidate_state.clone();
-        let candidate_fitness_value = snapshot.fitness().clone(); // Fitness is cheap to clone
+        let candidate_fitness_value = *snapshot.fitness(); // Fitness is cheap to clone
 
         // Fast pre-check using atomics (best-effort, race-tolerant).
         let best_atomic_snapshot_fitness = self.peek();
@@ -134,7 +134,7 @@ where
 
         // Definitive check under the lock.
         let mut best_state_guard = self.best_state.lock();
-        let current_best_fitness_locked = best_state_guard.fitness().clone();
+        let current_best_fitness_locked = *best_state_guard.fitness();
 
         if candidate_fitness_value < current_best_fitness_locked {
             tracing::info!(

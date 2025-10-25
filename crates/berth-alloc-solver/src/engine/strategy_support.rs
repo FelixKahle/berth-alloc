@@ -39,7 +39,7 @@ impl RollingImprovements {
     pub fn new(capacity: usize) -> Self {
         let cap = capacity.max(1);
         Self {
-            data: Vec::from(vec![0; cap]),
+            data: vec![0; cap],
             head: 0,
             len: 0,
             cap,
@@ -56,6 +56,12 @@ impl RollingImprovements {
     pub fn len(&self) -> usize {
         self.len
     }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Snapshot of current values (unsorted).
     #[inline]
     pub fn values(&self) -> Vec<i64> {
@@ -78,7 +84,7 @@ pub fn median_i64(mut xs: Vec<i64>) -> i64 {
         return 0;
     }
     let mid = xs.len() / 2;
-    xs.select_nth_unstable(mid).1.clone()
+    *xs.select_nth_unstable(mid).1
 }
 
 /// Data-driven epsilon = median of last improvements, with a minimum floor.
@@ -269,15 +275,6 @@ pub fn deterministic_kick<A: ApplyOnceByIndex>(ops: &mut A, k: usize) -> usize {
     applied
 }
 
-/// Patience derived from generic *per-round exploration work* (strategy-agnostic).
-///
-/// - `exploration_batches_per_round`: how many distinct exploration attempts
-///    you make in one outer round (plateaus, perturbation trials, etc.).
-/// - `inner_steps_mean`: average inner steps per round (if you have an inner loop).
-/// - `reshuffle_each_step`: whether you reshuffle operator order each inner step
-///    (more unique orderings → more coverage per round).
-///
-/// Computes a patience S that says: “I’ve likely exhausted this space.”
 #[inline]
 pub fn patience_from_exploration_budget(
     exploration_batches_per_round: usize,

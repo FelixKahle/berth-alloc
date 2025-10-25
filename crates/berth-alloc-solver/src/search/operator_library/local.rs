@@ -1202,7 +1202,7 @@ where
         cand_reqs.truncate(k);
 
         // Track best improving plan by candidate fitness (true objective).
-        let current_fit = context.state().fitness().clone();
+        let current_fit = *context.state().fitness();
         let mut best_fit: Option<crate::state::fitness::Fitness> = None;
         let mut best_plan: Option<Plan<'p, T>> = None;
 
@@ -1385,7 +1385,7 @@ where
         pairs.truncate(attempts);
 
         // Track best improving swap plan by candidate fitness.
-        let current_fit = context.state().fitness().clone();
+        let current_fit = *context.state().fitness();
         let mut best_fit: Option<crate::state::fitness::Fitness> = None;
         let mut best_plan: Option<Plan<'p, T>> = None;
 
@@ -1887,11 +1887,10 @@ where
                         if let Some(pt) = model.processing_time(ri, b) {
                             let iv = free.interval();
                             let s = iv.start();
-                            if s + pt <= iv.end() {
-                                if let Some(c) = ex.peek_cost(ri, s, b) {
+                            if s + pt <= iv.end()
+                                && let Some(c) = ex.peek_cost(ri, s, b) {
                                     v.push((free, s, c));
                                 }
-                            }
                         }
                     }
                     v
@@ -1944,8 +1943,8 @@ where
                             .collect()
                     });
                     let mut pool: Vec<(RequestIndex, ())> = seed_list.clone();
-                    if let Some(cb) = &self.neighbor_callback {
-                        if let Some(&anchor) = frontier.last() {
+                    if let Some(cb) = &self.neighbor_callback
+                        && let Some(&anchor) = frontier.last() {
                             let mut set = std::collections::HashSet::new();
                             set.insert(anchor.get());
                             for n in cb(anchor) {
@@ -1959,7 +1958,6 @@ where
                                 pool = filtered;
                             }
                         }
-                    }
                     // cap candidates per step
                     let max_c = {
                         let lo = *self.candidates_per_step_range.start();
@@ -2068,8 +2066,8 @@ where
                         }
                     } else {
                         // allow small worsening per step
-                        if let (Some(after), Some(before)) = (bld.peek_fitness(), Some(before)) {
-                            if after.cost > before.cost + self.max_single_step_worsening {
+                        if let (Some(after), Some(before)) = (bld.peek_fitness(), Some(before))
+                            && after.cost > before.cost + self.max_single_step_worsening {
                                 // revert path like above
                                 bld = context.builder();
                                 for &ri_m in &moved {
@@ -2084,7 +2082,6 @@ where
                                 }
                                 continue;
                             }
-                        }
                     }
 
                     // commit this step

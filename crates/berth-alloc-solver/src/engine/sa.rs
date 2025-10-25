@@ -30,20 +30,21 @@ use crate::{
     engine::{
         acceptor::{Acceptor, LexStrictAcceptor},
         neighbors,
+        operators::{LocalPool, SoftmaxSelector},
         search::{SearchContext, SearchStrategy},
         strategy_support::{
-            ApplyOnceByIndex, MedianHistoryEpsilon, StaleTracker, deterministic_kick,
-            materially_better, patience_from_cooling_halving,
+            MedianHistoryEpsilon, StaleTracker, materially_better, patience_from_cooling_halving,
         },
     },
     model::solver_model::SolverModel,
     search::{
         operator::LocalMoveOperator,
         operator_library::local::{
-            CrossExchangeAcrossBerths, CrossExchangeBestAcrossBerths, HillClimbBestSwapSameBerth,
-            HillClimbRelocateBest, OrOptBlockRelocate, RandomRelocateAnywhere,
-            RandomizedGreedyRelocateRcl, RelocateSingleBest, RelocateSingleBestAllowWorsening,
-            ShiftEarlierOnSameBerth, SwapPairSameBerth,
+            CascadeInsertPolicy, CascadeRelocateK, CrossExchangeAcrossBerths,
+            CrossExchangeBestAcrossBerths, HillClimbBestSwapSameBerth, HillClimbRelocateBest,
+            OrOptBlockRelocate, RandomRelocateAnywhere, RandomizedGreedyRelocateRcl,
+            RelocateSingleBest, RelocateSingleBestAllowWorsening, ShiftEarlierOnSameBerth,
+            SwapPairSameBerth,
         },
         planner::{CostEvaluator, DefaultCostEvaluator, PlanningContext},
     },
@@ -95,18 +96,18 @@ impl Acceptor for EnergyAcceptor {
     }
 }
 
-/// Simulated Annealing with:
+/// Simulated Annealing with operator pool:
+/// - Proposals from LocalPool (softmax on EMA score; temp wired to pool for exploration)
 /// - Standard Metropolis acceptance on an “energy” (BIG-M + cost)
-/// - Geometric cooling + AR-guided nudges (classic practice)
-/// - Data-driven staleness/epsilon via helpers, incumbent refetch + reheat
-/// - Bandit EMA for operator choice (keeps all operators live)
+/// - Geometric cooling + acceptance-ratio nudges
+/// - ε-guarded refetch of incumbent + reheat + small kick via pool
 pub struct SimulatedAnnealingStrategy<T, R>
 where
     T: SolveNumeric,
     R: rand::Rng,
 {
-    // Operators evaluated on the TRUE/Base objective
-    local_ops: Vec<Box<dyn LocalMoveOperator<T, DefaultCostEvaluator, R>>>,
+    // Pool of local operators (evaluated on TRUE/Base objective)
+    local_pool: LocalPool<T, DefaultCostEvaluator, R>,
 
     // Temperature schedule (geometric cooling)
     temperature: f64,
@@ -124,16 +125,15 @@ where
     hard_refetch_every: usize,
     hard_refetch_mode: HardRefetchMode,
     reheat_factor: f64, // 0..1; fraction of init T to reheat to on refetch
-    kick_ops_after_refetch: usize, // deterministic kick count after refetch
-
-    // Bandit scheduling (EMA)
-    op_weights: Vec<f64>,
-    op_ema_alpha: f64,
-    op_min_weight: f64,
+    kick_ops_after_refetch: usize, // kick count via pool after refetch
 
     // Acceptance ratio guidance (nudges, not replacement of geometric cooling)
     ar_target_low: f64,
     ar_target_high: f64,
+
+    // Kept for API compatibility (no longer used with pool-based selection)
+    _op_ema_alpha: f64,
+    _op_min_weight: f64,
 }
 
 // -------------- Builder --------------
@@ -152,8 +152,13 @@ where
     R: rand::Rng,
 {
     pub fn new() -> Self {
+        let selector = SoftmaxSelector::default()
+            .with_base_temp(1.0)
+            .with_min_p(1e-6)
+            .with_power(1.0);
+
         Self {
-            local_ops: Vec::new(),
+            local_pool: LocalPool::new().with_selector(selector),
             // schedule
             temperature: 1.6,
             init_temperature: 1.6,
@@ -169,13 +174,12 @@ where
             hard_refetch_mode: HardRefetchMode::IfBetter,
             reheat_factor: 0.6,
             kick_ops_after_refetch: 8,
-            // bandit
-            op_weights: Vec::new(),
-            op_ema_alpha: 0.25,
-            op_min_weight: 0.05,
-            // AR guidance
+            // AR targets
             ar_target_low: 0.10,
             ar_target_high: 0.50,
+            // legacy (unused, kept for builder compatibility)
+            _op_ema_alpha: 0.25,
+            _op_min_weight: 0.05,
         }
     }
 
@@ -183,7 +187,7 @@ where
         mut self,
         op: Box<dyn LocalMoveOperator<T, DefaultCostEvaluator, R>>,
     ) -> Self {
-        self.local_ops.push(op);
+        self.local_pool.push(op);
         self
     }
 
@@ -229,14 +233,16 @@ where
         self.energy_acceptor = self.energy_acceptor.clone().with_big_m(big_m);
         self
     }
+    // Legacy no-ops kept for config compatibility (bandit now handled by pool)
     pub fn with_op_ema_alpha(mut self, a: f64) -> Self {
-        self.op_ema_alpha = a.clamp(0.01, 0.9);
+        self._op_ema_alpha = a;
         self
     }
     pub fn with_op_min_weight(mut self, w: f64) -> Self {
-        self.op_min_weight = w.clamp(0.0, 1.0);
+        self._op_min_weight = w;
         self
     }
+
     pub fn with_acceptance_targets(mut self, low: f64, high: f64) -> Self {
         self.ar_target_low = low.clamp(0.0, 1.0);
         self.ar_target_high = high.clamp(self.ar_target_low, 1.0);
@@ -245,7 +251,7 @@ where
 
     // --------- internals ---------
     #[inline]
-    fn metropolis<RNG: rand::Rng>(&self, rng: &mut RNG, delta_energy: i64, temp: f64) -> bool {
+    fn metropolis<RNG: rand::Rng>(rng: &mut RNG, delta_energy: i64, temp: f64) -> bool {
         if delta_energy <= 0 {
             return true;
         }
@@ -275,79 +281,78 @@ where
         }
     }
 
-    #[inline]
-    fn pick_op_index(&self, rng: &mut R, weights: &[f64]) -> usize {
-        let s: f64 = weights.iter().copied().sum();
-        if !s.is_finite() || s <= 0.0 {
-            return rng.random_range(0..weights.len());
+    /// Small helper: try K local proposals via the pool and take any improving/sideways moves.
+    fn kick_with_local_pool<'p>(
+        &mut self,
+        k: usize,
+        model: &SolverModel<'p, T>,
+        eval: &DefaultCostEvaluator,
+        dv_buf: &mut [DecisionVar<T>],
+        state: &mut SolverState<'p, T>,
+        rng: &mut R,
+    ) {
+        if k == 0 || self.local_pool.is_empty() {
+            return;
         }
-        let mut r = rng.random::<f64>() * s;
-        for (i, w) in weights.iter().enumerate() {
-            r -= *w;
-            if r <= 0.0 {
-                return i;
+        for _ in 0..k {
+            let mut pc = PlanningContext::new(model, &*state, eval, dv_buf);
+            // pick a bit hotter to desync from incumbent
+            let mut prop = self.local_pool.apply(&mut pc, rng, Some(1.0));
+            let Some(mut plan) = prop.take_plan() else {
+                prop.reject();
+                continue;
+            };
+
+            set_plan_delta_via_eval(model, eval, state.decision_variables(), &mut plan);
+
+            let mut tmp = state.clone();
+            tmp.apply_plan(plan);
+
+            let cur_fit = state.fitness();
+            let tmp_fit = tmp.fitness();
+
+            let better = self.true_acceptor.accept(cur_fit, tmp_fit);
+            let sideways = tmp_fit == cur_fit;
+
+            if better || sideways {
+                let drop = cur_fit.cost.saturating_sub(tmp_fit.cost).max(0);
+                *state = tmp;
+                prop.accept(drop);
+            } else {
+                prop.reject();
             }
         }
-        weights.len() - 1
-    }
-
-    #[inline]
-    fn update_weight(w: &mut f64, alpha: f64, reward: f64, min_w: f64) {
-        let base = if w.is_finite() && *w > 0.0 { *w } else { 1.0 };
-        let nw = (1.0 - alpha) * base + alpha * reward.max(0.0);
-        *w = nw.max(min_w);
     }
 }
 
-// Adapter to run a deterministic kick by applying the first k local ops once.
-struct KickAdapter<'a, 'm, 'p, Tnum, Rng>
-where
-    Tnum: SolveNumeric,
-    Rng: rand::Rng,
-{
-    model: &'m SolverModel<'p, Tnum>,
-    eval: &'a DefaultCostEvaluator,
-    locals: &'a [Box<dyn LocalMoveOperator<Tnum, DefaultCostEvaluator, Rng>>],
-    state: &'a mut SolverState<'p, Tnum>,
-    dv_buf: &'a mut [DecisionVar<Tnum>],
-    rng: &'a mut Rng,
-}
-impl<'a, 'm, 'p, Tnum, Rng> ApplyOnceByIndex for KickAdapter<'a, 'm, 'p, Tnum, Rng>
-where
-    Tnum: SolveNumeric,
-    Rng: rand::Rng,
-{
-    fn apply_once(&mut self, index: usize) -> bool {
-        if index >= self.locals.len() {
-            return false;
+/* ----------------------------- small free helpers ----------------------------- */
+
+/// Build a new DV vector with “last patch wins”, compute base fitness delta by full evals,
+/// and write it into `plan.delta_cost`. Free function to avoid any `&self` borrow tangles.
+fn set_plan_delta_via_eval<'m, T: SolveNumeric>(
+    model: &SolverModel<'m, T>,
+    eval: &DefaultCostEvaluator,
+    current_vars: &[DecisionVar<T>],
+    plan: &mut crate::state::plan::Plan<'m, T>,
+) {
+    let mut new_vars = current_vars.to_vec();
+    for p in &plan.decision_var_patches {
+        let i = p.index.get();
+        if i < new_vars.len() {
+            new_vars[i] = p.patch;
         }
-        let op = &self.locals[index];
-        let mut pc = PlanningContext::new(self.model, &*self.state, self.eval, self.dv_buf);
-        if let Some(mut plan) = op.propose(&mut pc, self.rng) {
-            // Compute delta with evaluator fitness before/after
-            let cur_vars = self.state.decision_variables();
-            let mut new_vars = cur_vars.to_vec();
-            for p in &plan.decision_var_patches {
-                let i = p.index.get();
-                if i < new_vars.len() {
-                    new_vars[i] = p.patch;
-                }
-            }
-            let old_fit = self.eval.eval_fitness(self.model, cur_vars);
-            let new_fit = self.eval.eval_fitness(self.model, &new_vars);
-            plan.delta_cost = new_fit.cost.saturating_sub(old_fit.cost);
-            let prev = *self.state.fitness();
-            self.state.apply_plan(plan);
-            return *self.state.fitness() != prev;
-        }
-        false
     }
+    let old_fit: Fitness = eval.eval_fitness(model, current_vars);
+    let new_fit: Fitness = eval.eval_fitness(model, &new_vars);
+    plan.delta_cost = new_fit.cost.saturating_sub(old_fit.cost);
 }
+
+/* ----------------------------- strategy impl ----------------------------- */
 
 impl<T, R> SearchStrategy<T, R> for SimulatedAnnealingStrategy<T, R>
 where
     T: SolveNumeric,
-    R: rand::Rng,
+    R: rand::Rng + Send + Sync,
 {
     fn name(&self) -> &str {
         "Simulated Annealing"
@@ -357,7 +362,7 @@ where
     fn run<'e, 'm, 'p>(&mut self, context: &mut SearchContext<'e, 'm, 'p, T, R>) {
         let stop = context.stop();
         let model = context.model();
-        if self.local_ops.is_empty() {
+        if self.local_pool.is_empty() {
             tracing::warn!("SA: no local operators configured");
             return;
         }
@@ -378,12 +383,6 @@ where
         let patience_epochs = self
             .refetch_after_stale_override
             .unwrap_or_else(|| patience_from_cooling_halving(self.cooling));
-
-        // Bandit weights: lazy init to 1.0 each
-        if self.op_weights.len() != self.local_ops.len() {
-            self.op_weights.clear();
-            self.op_weights.resize(self.local_ops.len(), 1.0);
-        }
 
         let eval = DefaultCostEvaluator;
         let mut temp = self.temperature;
@@ -411,18 +410,16 @@ where
                     );
                     let mut snap = context.shared_incumbent().snapshot();
 
-                    // Deterministic kick to avoid synchronization lock
-                    if self.kick_ops_after_refetch > 0 && !self.local_ops.is_empty() {
-                        let k = self.kick_ops_after_refetch.min(self.local_ops.len());
-                        let mut adapter = KickAdapter {
+                    // Kick a few times via pool to avoid synchronization lock
+                    if self.kick_ops_after_refetch > 0 && !self.local_pool.is_empty() {
+                        self.kick_with_local_pool(
+                            self.kick_ops_after_refetch.min(self.local_pool.len()),
                             model,
-                            eval: &eval,
-                            locals: &self.local_ops,
-                            state: &mut snap,
-                            dv_buf: dv_buf.as_mut_slice(),
-                            rng: context.rng(),
-                        };
-                        let _applied = deterministic_kick(&mut adapter, k);
+                            &eval,
+                            dv_buf.as_mut_slice(),
+                            &mut snap,
+                            context.rng(),
+                        );
                     }
 
                     if self.true_acceptor.accept(best.fitness(), snap.fitness()) {
@@ -446,14 +443,18 @@ where
                     break 'outer;
                 }
 
-                let oi = self.pick_op_index(context.rng(), &self.op_weights);
-                let op = &self.local_ops[oi];
-
                 let mut pc = PlanningContext::new(model, &current, &eval, dv_buf.as_mut_slice());
+                // Wire temp into pool to control exploration among operators
+                let mut prop = self.local_pool.apply(
+                    &mut pc,
+                    context.rng(),
+                    Some(temp.max(self.min_temperature)),
+                );
+
                 tried = tried.saturating_add(1);
 
-                if let Some(mut plan) = op.propose(&mut pc, context.rng()) {
-                    // Recompute TRUE/base delta so Fitness stays consistent
+                if let Some(mut plan) = prop.take_plan() {
+                    // Compute TRUE/base delta quickly with "last patch wins"
                     use crate::model::index::RequestIndex;
                     use crate::state::decisionvar::DecisionVar;
                     use std::collections::HashMap;
@@ -495,41 +496,38 @@ where
 
                     // Temperature floor behavior: still allow exp(-Δ/Tmin)
                     let t_eff = temp.max(self.min_temperature);
-                    let accept = self.metropolis(context.rng(), delta_e, t_eff);
+                    let accept = Self::metropolis(context.rng(), delta_e, t_eff);
 
                     if accept {
                         current = next;
                         accepted = accepted.saturating_add(1);
 
-                        // Credit operator (accepted)
-                        Self::update_weight(
-                            &mut self.op_weights[oi],
-                            self.op_ema_alpha,
-                            if delta_e <= 0 { 0.9 } else { 0.25 },
-                            self.op_min_weight,
-                        );
+                        // Reward pool by TRUE improvement only (nonnegative)
+                        let drop = best
+                            .fitness()
+                            .cost
+                            .saturating_sub(current.fitness().cost)
+                            .max(0);
+                        prop.accept(drop);
 
                         // If TRUE/base objective improved best → publish & record epsilon-stat
                         if self.true_acceptor.accept(best.fitness(), current.fitness()) {
-                            let drop = best
+                            let drop_best = best
                                 .fitness()
                                 .cost
                                 .saturating_sub(current.fitness().cost)
                                 .max(0);
-                            eps_src.record(drop);
+                            eps_src.record(drop_best);
 
                             best = current.clone();
                             let _ = context.shared_incumbent().try_update(&best, model);
                         }
                     } else {
-                        // Small decay for unsuccessful proposal
-                        Self::update_weight(
-                            &mut self.op_weights[oi],
-                            self.op_ema_alpha,
-                            0.0,
-                            self.op_min_weight,
-                        );
+                        prop.reject();
                     }
+                } else {
+                    // pool had no plan; count as tried but not accepted
+                    prop.reject();
                 }
             }
 
@@ -546,7 +544,7 @@ where
 
                 let allowed = match self.hard_refetch_mode {
                     HardRefetchMode::Always => true,
-                    HardRefetchMode::IfBetter => material, // require material better if-guard
+                    HardRefetchMode::IfBetter => material,
                 };
 
                 if allowed && material {
@@ -560,18 +558,16 @@ where
                     );
                     let mut snap = context.shared_incumbent().snapshot();
 
-                    // Deterministic kick after refetch
-                    if self.kick_ops_after_refetch > 0 && !self.local_ops.is_empty() {
-                        let k = self.kick_ops_after_refetch.min(self.local_ops.len());
-                        let mut adapter = KickAdapter {
+                    // Kick via pool
+                    if self.kick_ops_after_refetch > 0 && !self.local_pool.is_empty() {
+                        self.kick_with_local_pool(
+                            self.kick_ops_after_refetch.min(self.local_pool.len()),
                             model,
-                            eval: &eval,
-                            locals: &self.local_ops,
-                            state: &mut snap,
-                            dv_buf: dv_buf.as_mut_slice(),
-                            rng: context.rng(),
-                        };
-                        let _applied = deterministic_kick(&mut adapter, k);
+                            &eval,
+                            dv_buf.as_mut_slice(),
+                            &mut snap,
+                            context.rng(),
+                        );
                     }
 
                     if self.true_acceptor.accept(best.fitness(), snap.fitness()) {
@@ -591,7 +587,7 @@ where
             let mut next_temp = temp * self.cooling; // geometric base
             if ar < self.ar_target_low {
                 next_temp = (temp * 1.05).max(next_temp);
-            } // heat a little if frozen
+            } // heat a bit if frozen
             if ar > self.ar_target_high {
                 next_temp *= self.cooling;
             } // cool extra if too random
@@ -602,6 +598,8 @@ where
         let _ = context.shared_incumbent().try_update(&best, model);
     }
 }
+
+/* ----------------------------- preset ----------------------------- */
 
 pub fn sa_strategy<T, R>(model: &SolverModel<T>) -> SimulatedAnnealingStrategy<T, R>
 where
@@ -626,7 +624,7 @@ where
         .with_refetch_after_stale(60)
         .with_reheat_factor(0.85)
         .with_kick_ops_after_refetch(18)
-        // ---- energy/bandit/targets ----
+        // ---- energy/targets (bandit knobs are no-ops now) ----
         .with_big_m_for_energy(900_000_000)
         .with_op_ema_alpha(0.30)
         .with_op_min_weight(0.12)
@@ -668,5 +666,13 @@ where
         ))
         .with_local_op(Box::new(
             CrossExchangeBestAcrossBerths::new(32..=96).with_neighbors(neighbors_any.clone()),
+        ))
+        .with_local_op(Box::new(
+            CascadeRelocateK::new(3..=5, 6..=10, 10..=20)
+                .with_neighbors(neighbors_any.clone())
+                .with_insert_policy(CascadeInsertPolicy::Rcl {
+                    alpha_range: 1.4..=2.0,
+                })
+                .allow_step_worsening(30),
         ))
 }

@@ -276,6 +276,18 @@ where
     _phantom: PhantomData<(T, C, R, F)>,
 }
 
+impl<T, C, R, F> Default for OperatorPool<T, C, R, F>
+where
+    T: Copy + Ord,
+    C: CostEvaluator<T>,
+    R: Rng,
+    F: FamilyApi<T, C, R>,
+ {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T, C, R, F> OperatorPool<T, C, R, F>
 where
     T: Copy + Ord,

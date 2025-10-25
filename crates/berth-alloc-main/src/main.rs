@@ -21,8 +21,6 @@
 
 use berth_alloc_model::prelude::{Problem, SolutionView};
 use berth_alloc_model::problem::loader::ProblemLoader;
-use berth_alloc_solver::engine::gls;
-use berth_alloc_solver::engine::ils::IteratedLocalSearchStrategy;
 use berth_alloc_solver::engine::solver_engine::SolverEngineBuilder;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -101,7 +99,7 @@ fn main() {
 
     let mut results: Vec<RunRecord> = Vec::new();
 
-    for (iter, (problem, file)) in instances().take(1).enumerate() {
+    for (iter, (problem, file)) in instances().enumerate().skip(1).take(1) {
         let iteration = iter + 1;
 
         tracing::info!(
@@ -117,7 +115,7 @@ fn main() {
 
         let mut solver = SolverEngineBuilder::<i64>::default()
             .with_time_limit(std::time::Duration::from_secs(200))
-            .with_worker_count(3)
+            .with_worker_count(6)
             .build();
         let outcome = solver.solve(&problem);
 

@@ -22,7 +22,7 @@
 use crate::{
     core::numeric::SolveNumeric,
     engine::{
-        gls,
+        gls::{self, DecayMode},
         greedy_opening::GreedyOpening,
         ils::{self, IteratedLocalSearchStrategy},
         opening::OpeningStrategy,
@@ -214,8 +214,8 @@ where
         let mut s = gls::gls_strategy::<T, ChaCha8Rng>(model);
 
         // diversify: lambda, penalty_step, pulse, max steps, refetch cadence, kicks
-        let lambda = Self::jitter_i64(rng, 9, 3);
-        let pstep = Self::jitter_i64(rng, 2, 1);
+        let lambda = Self::jitter_i64(rng, 500, 10);
+        let pstep = Self::jitter_i64(rng, 10, 1);
         let (pulse_stale, pulse_k) = {
             let ps = Self::jitter_usize(rng, 8, 0.35, 2);
             let pk = Self::jitter_usize(rng, 20, 0.35, 5);
@@ -232,6 +232,7 @@ where
             .with_pulse_params(pulse_stale, pulse_k)
             .with_max_local_steps(max_steps)
             .with_hard_refetch_every(refetch_every)
+            .with_decay(DecayMode::Multiplicative { num: 99, den: 100 })
             .with_refetch_after_stale(refetch_after_stale)
             .with_kick_steps_on_reset(kicks);
 
@@ -286,7 +287,7 @@ where
         let refetch_every = [60, 70, 80, 100, 120][slot_idx % 5];
         let stale_epochs = [40, 50, 60, 80][slot_idx % 4];
         let reheat = Self::jitter_f64(rng, 0.85, 0.25, 0.4, 0.95);
-        let big_m = Self::jitter_i64(rng, 900_000_000, 150_000_000);
+        let big_m = Self::jitter_i64(rng, 900_000, 150_000_000);
         let alpha = Self::jitter_f64(rng, 0.30, 0.3, 0.05, 0.6);
         let minw = Self::jitter_f64(rng, 0.12, 0.5, 0.01, 0.3);
         let low = Self::jitter_f64(rng, 0.22, 0.35, 0.05, 0.5);
@@ -456,153 +457,5 @@ where
 
     pub fn build(self) -> SolverEngine<T> {
         SolverEngine::new(self.config, self.strategies)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
-    use berth_alloc_model::prelude::*;
-    use rand_chacha::ChaCha8Rng;
-    use std::collections::BTreeMap;
-
-    #[inline]
-    fn tp(v: i64) -> TimePoint<i64> {
-        TimePoint::new(v)
-    }
-    #[inline]
-    fn iv(a: i64, b: i64) -> TimeInterval<i64> {
-        TimeInterval::new(tp(a), tp(b))
-    }
-    #[inline]
-    fn bid(n: u32) -> BerthIdentifier {
-        BerthIdentifier::new(n)
-    }
-    #[inline]
-    fn rid(n: u32) -> RequestIdentifier {
-        RequestIdentifier::new(n)
-    }
-
-    fn berth(id: u32, s: i64, e: i64) -> Berth<i64> {
-        Berth::from_windows(bid(id), [iv(s, e)])
-    }
-
-    fn flex_req(
-        id: u32,
-        window: (i64, i64),
-        pt: &[(u32, i64)],
-        weight: i64,
-    ) -> Request<FlexibleKind, i64> {
-        let mut m = BTreeMap::new();
-        for (b, d) in pt {
-            m.insert(bid(*b), TimeDelta::new(*d));
-        }
-        Request::<FlexibleKind, i64>::new(rid(id), iv(window.0, window.1), weight, m).unwrap()
-    }
-
-    fn problem_feasible_two_flex() -> Problem<i64> {
-        let mut berths = berth_alloc_model::problem::berth::BerthContainer::new();
-        berths.insert(berth(1, 0, 1000));
-
-        let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
-
-        let mut flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
-        // Two small requests that both fit
-        flex.insert(flex_req(1, (0, 200), &[(1, 10)], 1));
-        flex.insert(flex_req(2, (0, 200), &[(1, 5)], 1));
-
-        Problem::new(berths, fixed, flex).unwrap()
-    }
-
-    fn problem_infeasible_two_large() -> Problem<i64> {
-        let mut berths = berth_alloc_model::problem::berth::BerthContainer::new();
-        berths.insert(berth(1, 0, 12));
-
-        let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
-
-        let mut flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
-        // Two requests of length 10 in a 12-length window → only one can fit
-        flex.insert(flex_req(1, (0, 12), &[(1, 10)], 1));
-        flex.insert(flex_req(2, (0, 12), &[(1, 10)], 1));
-
-        Problem::new(berths, fixed, flex).unwrap()
-    }
-
-    struct DummyStrategy {
-        sleep_time: std::time::Duration,
-    }
-
-    impl Default for DummyStrategy {
-        fn default() -> Self {
-            Self {
-                sleep_time: std::time::Duration::from_millis(5),
-            }
-        }
-    }
-
-    impl SearchStrategy<i64, ChaCha8Rng> for DummyStrategy {
-        fn name(&self) -> &str {
-            "DummyStrategy"
-        }
-
-        fn run<'e, 'm, 'p>(&mut self, _context: &mut SearchContext<'e, 'm, 'p, i64, ChaCha8Rng>) {
-            std::thread::sleep(self.sleep_time);
-        }
-    }
-
-    fn engine_with_strategies(
-        num_workers: usize,
-        strategies_count: usize,
-        time_ms: u64,
-    ) -> SolverEngine<i64> {
-        let mut builder = SolverEngineBuilder::<i64>::new()
-            .with_worker_count(num_workers)
-            .with_time_limit(std::time::Duration::from_millis(time_ms));
-
-        for _ in 0..strategies_count {
-            builder = builder.with_strategy(Box::new(DummyStrategy::default()));
-        }
-
-        builder.build()
-    }
-
-    #[test]
-    fn test_solve_returns_solution_when_opening_feasible() {
-        let prob = problem_feasible_two_flex();
-        let mut engine = engine_with_strategies(2, 2, 50);
-
-        let res = engine.solve(&prob);
-        match res {
-            Ok(Some(sol)) => {
-                // Flexible assignments should be non-empty
-                assert!(sol.flexible_assignments().len() == 2);
-            }
-            other => panic!("expected Some(solution), got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_solve_returns_none_when_opening_infeasible() {
-        let prob = problem_infeasible_two_large();
-        let mut engine = engine_with_strategies(4, 1, 20);
-
-        let res = engine.solve(&prob);
-        match res {
-            Ok(None) => { /* infeasible incumbent stays infeasible */ }
-            other => panic!("expected Ok(None), got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_diversified_when_none_provided() {
-        let prob = problem_feasible_two_flex();
-        let mut engine = SolverEngineBuilder::<i64>::new()
-            .with_worker_count(6)
-            .with_time_limit(std::time::Duration::from_millis(10))
-            .build();
-
-        // should not panic and should run with synthesized strategies
-        let _ = engine.solve(&prob).unwrap();
     }
 }

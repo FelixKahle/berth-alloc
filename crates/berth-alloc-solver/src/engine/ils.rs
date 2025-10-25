@@ -19,7 +19,6 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use rand::seq::SliceRandom;
 use std::{ops::RangeInclusive, sync::atomic::Ordering as AtomicOrdering};
 
 use crate::{
@@ -27,10 +26,10 @@ use crate::{
     engine::{
         acceptor::{Acceptor, LexStrictAcceptor, RepairAcceptor},
         neighbors,
+        operators::{DestroyPool, LocalPool, RepairPool, SoftmaxSelector},
         search::{SearchContext, SearchStrategy},
         strategy_support::{
-            ApplyOnceByIndex, MedianHistoryEpsilon, StaleTracker, deterministic_kick,
-            materially_better, patience_from_exploration_budget,
+            MedianHistoryEpsilon, StaleTracker, materially_better, patience_from_exploration_budget,
         },
     },
     model::solver_model::SolverModel,
@@ -41,12 +40,13 @@ use crate::{
                 RandomKRatioDestroy, ShawRelatedDestroy, TimeClusterDestroy, WorstCostDestroy,
             },
             local::{
-                CrossExchangeAcrossBerths, HillClimbRelocateBest, OrOptBlockRelocate,
-                RelocateSingleBest, ShiftEarlierOnSameBerth, SwapPairSameBerth,
+                CascadeInsertPolicy, CascadeRelocateK, CrossExchangeAcrossBerths,
+                HillClimbRelocateBest, OrOptBlockRelocate, RelocateSingleBest,
+                ShiftEarlierOnSameBerth, SwapPairSameBerth,
             },
             repair::{GreedyInsertion, KRegretInsertion},
         },
-        planner::{CostEvaluator, DefaultCostEvaluator, PlanningContext},
+        planner::{CostEvaluator, DefaultCostEvaluator, PlanningContext}, // <-- bring trait in
     },
     state::{
         decisionvar::DecisionVar,
@@ -56,27 +56,28 @@ use crate::{
 };
 
 /// Optional periodic refetch policy. Even when `Always`, we still refetch
-/// **only when stale** (see `run`); this enum only controls the “periodic due” gate.
+/// **only when stale**; this only controls the periodic cadence gate.
 #[derive(Clone, Copy)]
 pub enum HardRefetchMode {
     IfBetter,
     Always,
 }
 
-/// Standard ILS with:
-/// - Local improvement (A)
-/// - Ruin (B), Repair (C)
-/// - ε-guarded refetch of incumbent when stale (optional periodic cadence)
-/// - Deterministic kick after refetch to avoid resynchronization
+/// ILS with operator pools:
+/// - Local improvement (A) via LocalPool
+/// - Destroy (B) via DestroyPool
+/// - Repair (C) via RepairPool
+/// - ε-guarded refetch of incumbent when stale, optional periodic cadence
+/// - K-step kick after refetch using the local pool
 pub struct IteratedLocalSearchStrategy<T, R>
 where
     T: SolveNumeric,
     R: rand::Rng,
 {
-    // Operators
-    destroy_ops: Vec<Box<dyn DestroyOperator<T, DefaultCostEvaluator, R>>>,
-    repair_ops: Vec<Box<dyn RepairOperator<T, DefaultCostEvaluator, R>>>,
-    local_ops: Vec<Box<dyn LocalMoveOperator<T, DefaultCostEvaluator, R>>>,
+    // Pools (bandit softmax selector + EWMA scoring)
+    local_pool: LocalPool<T, DefaultCostEvaluator, R>,
+    destroy_pool: DestroyPool<T, DefaultCostEvaluator, R>,
+    repair_pool: RepairPool<T, DefaultCostEvaluator, R>,
 
     // Acceptors
     local_acceptor: LexStrictAcceptor, // Phase A
@@ -88,13 +89,13 @@ where
 
     // Local acceptance tweaks
     allow_sideways_in_local: bool, // accept equal fitness
-    accept_worsening_local_with_prob: Option<f64>, // (unused in standard ILS; keep for completeness)
+    accept_worsening_local_with_prob: Option<f64>, // optional simulated “shake”
 
     // Ruin-and-repair caps per round
     max_destroy_attempts_per_round: Option<usize>,
     max_repair_attempts_per_round: Option<usize>,
 
-    // Shuffle policy: reshuffle local op order each inner step (or only once per round)
+    // Legacy knob (kept for API compatibility; pool handles selection anyway)
     shuffle_local_each_step: bool,
 
     // Staleness patience override for refetch (if None, derived from exploration budget)
@@ -104,9 +105,11 @@ where
     hard_refetch_every: usize,          // 0 => disabled
     hard_refetch_mode: HardRefetchMode, // IfBetter / Always
 
-    // Post-refetch deterministic kick: apply first k local ops once
+    // Post-refetch kick: apply K local pool proposals once
     kick_ops_after_refetch: usize, // 0 => no kick
 }
+
+/* ----------------------------- public API ----------------------------- */
 
 impl<T, R> Default for IteratedLocalSearchStrategy<T, R>
 where
@@ -124,10 +127,16 @@ where
     R: rand::Rng,
 {
     pub fn new() -> Self {
+        // softmax selector defaults — feel free to tune from call-site
+        let selector = SoftmaxSelector::default()
+            .with_base_temp(1.0)
+            .with_min_p(1e-6)
+            .with_power(1.0);
+
         Self {
-            destroy_ops: Vec::new(),
-            repair_ops: Vec::new(),
-            local_ops: Vec::new(),
+            local_pool: LocalPool::new().with_selector(selector.clone()),
+            destroy_pool: DestroyPool::new().with_selector(selector.clone()),
+            repair_pool: RepairPool::new().with_selector(selector),
             local_acceptor: LexStrictAcceptor,
             repair_acceptor: RepairAcceptor,
             max_local_steps: 64,
@@ -136,7 +145,7 @@ where
             accept_worsening_local_with_prob: None,
             max_destroy_attempts_per_round: None,
             max_repair_attempts_per_round: None,
-            shuffle_local_each_step: true,
+            shuffle_local_each_step: true, // kept for API stability
             stale_min_rounds_override: None,
             hard_refetch_every: 0,
             hard_refetch_mode: HardRefetchMode::IfBetter,
@@ -144,28 +153,31 @@ where
         }
     }
 
-    // --------------------- Builder / Tuners ---------------------
+    // -------- operator registration --------
+
     pub fn with_destroy_op(
         mut self,
         op: Box<dyn DestroyOperator<T, DefaultCostEvaluator, R>>,
     ) -> Self {
-        self.destroy_ops.push(op);
+        self.destroy_pool.push(op);
         self
     }
     pub fn with_repair_op(
         mut self,
         op: Box<dyn RepairOperator<T, DefaultCostEvaluator, R>>,
     ) -> Self {
-        self.repair_ops.push(op);
+        self.repair_pool.push(op);
         self
     }
     pub fn with_local_op(
         mut self,
         op: Box<dyn LocalMoveOperator<T, DefaultCostEvaluator, R>>,
     ) -> Self {
-        self.local_ops.push(op);
+        self.local_pool.push(op);
         self
     }
+
+    // -------- knobs --------
 
     pub fn with_max_local_steps(mut self, steps: usize) -> Self {
         self.max_local_steps = steps.max(1);
@@ -200,8 +212,6 @@ where
         self
     }
 
-    /// Provide an explicit staleness threshold (rounds) before refetch is considered.
-    /// If not set, patience is derived from exploration budget.
     pub fn with_refetch_after_stale(mut self, rounds: usize) -> Self {
         self.stale_min_rounds_override = Some(rounds.max(1));
         self
@@ -219,94 +229,193 @@ where
         self.kick_ops_after_refetch = k;
         self
     }
+}
 
-    // --------------------- Internal helpers ---------------------
+/* ----------------------------- small helpers (testable) ----------------------------- */
 
-    #[inline]
-    fn periodic_refetch_due(&self, outer_rounds: usize) -> bool {
-        self.hard_refetch_every > 0
-            && outer_rounds > 0
-            && outer_rounds.is_multiple_of(self.hard_refetch_every)
+#[inline]
+fn periodic_refetch_due(period: usize, outer_rounds: usize) -> bool {
+    period > 0 && outer_rounds > 0 && outer_rounds.is_multiple_of(period)
+}
+
+/// Build a new DV vector “last patch wins” and set `plan.delta_cost`
+/// using *base* evaluator fitness before/after (keeps `SolverState` consistent).
+fn set_plan_delta_via_eval<'m, T: SolveNumeric>(
+    model: &SolverModel<'m, T>,
+    eval: &DefaultCostEvaluator,
+    current_vars: &[DecisionVar<T>],
+    plan: &mut crate::state::plan::Plan<'m, T>,
+) {
+    let mut new_vars = current_vars.to_vec();
+    for p in &plan.decision_var_patches {
+        let i = p.index.get();
+        if i < new_vars.len() {
+            new_vars[i] = p.patch;
+        }
     }
 
-    /// Compute plan.delta_cost via full fitness evals (`CostEvaluator::eval_fitness`).
-    /// Keeps correctness without re-implementing base-delta logic.
-    fn set_plan_delta_via_eval<'m>(
-        &self,
-        model: &SolverModel<'m, T>,
-        eval: &DefaultCostEvaluator,
-        current_vars: &[DecisionVar<T>],
-        plan: &mut crate::state::plan::Plan<'m, T>,
-    ) {
-        // Build new DV vector with “last patch wins”.
-        let mut new_vars = current_vars.to_vec();
-        for p in &plan.decision_var_patches {
-            let i = p.index.get();
-            if i < new_vars.len() {
-                new_vars[i] = p.patch;
-            }
+    let old_fit: Fitness = eval.eval_fitness(model, current_vars);
+    let new_fit: Fitness = eval.eval_fitness(model, &new_vars);
+
+    plan.delta_cost = new_fit.cost.saturating_sub(old_fit.cost);
+}
+
+/// Sample the step budget for this round.
+#[inline]
+fn steps_budget(
+    range: &Option<RangeInclusive<usize>>,
+    def_max: usize,
+    rng: &mut impl rand::Rng,
+) -> usize {
+    if let Some(r) = range {
+        let lo = *r.start();
+        let hi = *r.end();
+        if lo == hi {
+            lo
+        } else {
+            rng.random_range(lo..=hi)
         }
-
-        let old_fit: Fitness = eval.eval_fitness(model, current_vars);
-        let new_fit: Fitness = eval.eval_fitness(model, &new_vars);
-
-        plan.delta_cost = new_fit.cost.saturating_sub(old_fit.cost);
+    } else {
+        def_max
     }
 }
 
-/// Adapter to run a deterministic “kick” by applying the first k local ops once.
-struct KickAdapter<'a, 'm, 'p, Tnum, Rng>
+/// One local attempt via pool; returns (accepted?, strict_improvement_delta).
+#[allow(clippy::too_many_arguments)]
+fn try_one_local_step<'p, T, R>(
+    local_pool: &mut LocalPool<T, DefaultCostEvaluator, R>,
+    local_acceptor: &LexStrictAcceptor,
+    allow_sideways_in_local: bool,
+    accept_worsening_local_with_prob: Option<f64>,
+    model: &SolverModel<'p, T>,
+    eval: &DefaultCostEvaluator,
+    dv_buf: &mut [DecisionVar<T>],
+    current: &mut SolverState<'p, T>,
+    rng: &mut R,
+) -> (bool, i64)
 where
-    Tnum: SolveNumeric,
-    Rng: rand::Rng,
+    T: SolveNumeric,
+    R: rand::Rng,
 {
-    model: &'m SolverModel<'p, Tnum>,
-    eval: &'a DefaultCostEvaluator,
-    locals: &'a [Box<dyn LocalMoveOperator<Tnum, DefaultCostEvaluator, Rng>>],
-    state: &'a mut SolverState<'p, Tnum>,
-    dv_buf: &'a mut [DecisionVar<Tnum>],
-    rng: &'a mut Rng,
-}
+    let mut pc = PlanningContext::new(model, &*current, eval, dv_buf);
+    let mut prop = local_pool.apply(&mut pc, rng, None);
 
-impl<'a, 'm, 'p, Tnum, Rng> ApplyOnceByIndex for KickAdapter<'a, 'm, 'p, Tnum, Rng>
-where
-    Tnum: SolveNumeric,
-    Rng: rand::Rng,
-{
-    fn apply_once(&mut self, index: usize) -> bool {
-        if index >= self.locals.len() {
-            return false;
+    let Some(mut plan) = prop.take_plan() else {
+        prop.reject();
+        return (false, 0);
+    };
+
+    set_plan_delta_via_eval(model, eval, current.decision_variables(), &mut plan);
+
+    let mut cand = current.clone();
+    cand.apply_plan(plan);
+
+    let cur_fit = current.fitness();
+    let new_fit = cand.fitness();
+
+    let better = local_acceptor.accept(cur_fit, new_fit);
+    let sideways = allow_sideways_in_local && (new_fit == cur_fit);
+    let worse_random = if !better && !sideways {
+        if let Some(p) = accept_worsening_local_with_prob {
+            rng.random::<f64>() < p
+        } else {
+            false
         }
-        let op = &self.locals[index];
-
-        let mut pc = PlanningContext::new(self.model, &*self.state, self.eval, self.dv_buf);
-
-        if let Some(mut plan) = op.propose(&mut pc, self.rng) {
-            // Compute delta using evaluator-based fitness before/after for correctness.
-            let cur_vars = self.state.decision_variables();
-            let mut new_vars = cur_vars.to_vec();
-            for p in &plan.decision_var_patches {
-                let i = p.index.get();
-                if i < new_vars.len() {
-                    new_vars[i] = p.patch;
-                }
-            }
-            let old_fit = self.eval.eval_fitness(self.model, cur_vars);
-            let new_fit = self.eval.eval_fitness(self.model, &new_vars);
-            plan.delta_cost = new_fit.cost.saturating_sub(old_fit.cost);
-
-            let prev = *self.state.fitness();
-            self.state.apply_plan(plan);
-            return *self.state.fitness() != prev;
-        }
+    } else {
         false
+    };
+
+    if better || sideways || worse_random {
+        let strict_drop = cur_fit.cost.saturating_sub(new_fit.cost).max(0);
+        *current = cand;
+        // reward pool by strict improvement only; sideways/worse treated as neutral
+        prop.accept(strict_drop);
+        (true, strict_drop)
+    } else {
+        prop.reject();
+        (false, 0)
     }
 }
+
+/// Try several destroy attempts; returns true if a plan was applied.
+fn run_destroy_phase<'p, T, R>(
+    pool: &mut DestroyPool<T, DefaultCostEvaluator, R>,
+    attempts: usize,
+    model: &SolverModel<'p, T>,
+    eval: &DefaultCostEvaluator,
+    dv_buf: &mut [DecisionVar<T>],
+    current: &mut SolverState<'p, T>,
+    rng: &mut R,
+) -> bool
+where
+    T: SolveNumeric,
+    R: rand::Rng,
+{
+    for _ in 0..attempts {
+        let mut pc = PlanningContext::new(model, &*current, eval, dv_buf);
+        let mut prop = pool.apply(&mut pc, rng, None);
+        if let Some(mut plan) = prop.take_plan() {
+            set_plan_delta_via_eval(model, eval, current.decision_variables(), &mut plan);
+            current.apply_plan(plan);
+            // destroy usually worsens; neutral reward
+            prop.accept(0);
+            return true;
+        } else {
+            prop.reject();
+        }
+    }
+    false
+}
+
+/// Try several repair attempts; returns (accepted?, improvement_vs_baseline).
+#[allow(clippy::too_many_arguments)]
+fn run_repair_phase<'p, T, R>(
+    pool: &mut RepairPool<T, DefaultCostEvaluator, R>,
+    acceptor: &RepairAcceptor,
+    attempts: usize,
+    model: &SolverModel<'p, T>,
+    eval: &DefaultCostEvaluator,
+    dv_buf: &mut [DecisionVar<T>],
+    baseline: &SolverState<'p, T>,
+    rng: &mut R,
+) -> (bool, SolverState<'p, T>, i64)
+where
+    T: SolveNumeric,
+    R: rand::Rng,
+{
+    for _ in 0..attempts {
+        let mut tmp = baseline.clone();
+        let mut pc = PlanningContext::new(model, &tmp, eval, dv_buf);
+        let mut prop = pool.apply(&mut pc, rng, None);
+
+        if let Some(mut plan) = prop.take_plan() {
+            set_plan_delta_via_eval(model, eval, tmp.decision_variables(), &mut plan);
+            tmp.apply_plan(plan);
+
+            if acceptor.accept(baseline.fitness(), tmp.fitness()) {
+                let drop = baseline
+                    .fitness()
+                    .cost
+                    .saturating_sub(tmp.fitness().cost)
+                    .max(0);
+                prop.accept(drop);
+                return (true, tmp, drop);
+            } else {
+                prop.reject();
+            }
+        } else {
+            prop.reject();
+        }
+    }
+    (false, baseline.clone(), 0)
+}
+
+/* ----------------------------- main strategy impl ----------------------------- */
 
 impl<T, R> SearchStrategy<T, R> for IteratedLocalSearchStrategy<T, R>
 where
     T: SolveNumeric,
-    R: rand::Rng,
+    R: rand::Rng + Send + Sync,
 {
     fn name(&self) -> &str {
         "Iterated Local Search"
@@ -317,18 +426,19 @@ where
         let model = context.model();
         let stop = context.stop();
 
-        if self.local_ops.is_empty() && (self.destroy_ops.is_empty() || self.repair_ops.is_empty())
+        if self.local_pool.is_empty()
+            && (self.destroy_pool.is_empty() || self.repair_pool.is_empty())
         {
             tracing::warn!(
-                "ILS: no operators configured (local={}, destroy={}, repair={})",
-                self.local_ops.len(),
-                self.destroy_ops.len(),
-                self.repair_ops.len()
+                "ILS: no operators configured (local_pool={}, destroy_pool={}, repair_pool={})",
+                self.local_pool.len(),
+                self.destroy_pool.len(),
+                self.repair_pool.len()
             );
             return;
         }
 
-        // Seed working state from the global incumbent once at start.
+        // Working state starts from incumbent
         let mut current: SolverState<'p, T> = context.shared_incumbent().snapshot();
 
         debug_assert_eq!(
@@ -337,27 +447,28 @@ where
             "incumbent DV vector length must match model"
         );
 
-        // Scratch buffer for PlanningContext.
+        // Scratch buffer
         let mut dv_buf: Vec<DecisionVar<T>> =
             vec![DecisionVar::unassigned(); model.flexible_requests_len()];
 
-        // Stale tracking & epsilon (data-driven).
+        // Data-driven stale/epsilon trackers
         let mut stale = StaleTracker::new(*current.fitness(), /*history_cap*/ 32);
         let mut eps_src = MedianHistoryEpsilon::new(/*history_cap*/ 32, /*min_eps*/ 1);
 
-        // Derive default patience from exploration budget (neutral); allow external override.
+        // Exploration budget → patience
         let destroy_cap = self
             .max_destroy_attempts_per_round
-            .unwrap_or_else(|| self.destroy_ops.len().max(1));
+            .unwrap_or_else(|| self.destroy_pool.len().max(1));
         let repair_cap = self
             .max_repair_attempts_per_round
-            .unwrap_or_else(|| self.repair_ops.len().max(1));
-        let batches_per_round = 1 + destroy_cap + repair_cap;
+            .unwrap_or_else(|| self.repair_pool.len().max(1));
 
-        let inner_steps_mean = match &self.local_steps_range {
-            Some(r) => ((*r.start() + *r.end()) / 2).max(1),
-            None => self.max_local_steps.max(1),
-        };
+        let batches_per_round = 1 + destroy_cap + repair_cap;
+        let inner_steps_mean = self
+            .local_steps_range
+            .as_ref()
+            .map(|r| ((*r.start() + *r.end()) / 2).max(1))
+            .unwrap_or(self.max_local_steps.max(1));
 
         let derived_patience = patience_from_exploration_budget(
             batches_per_round,
@@ -367,7 +478,6 @@ where
         let patience_s = self.stale_min_rounds_override.unwrap_or(derived_patience);
 
         let eval = DefaultCostEvaluator;
-
         let mut outer_rounds = 0usize;
 
         'outer: loop {
@@ -376,255 +486,196 @@ where
             }
             outer_rounds = outer_rounds.saturating_add(1);
 
-            // --------------- Phase A: Local improvement ---------------
+            // -------- Phase A: Local improvement (via pool) --------
+            let budget = steps_budget(&self.local_steps_range, self.max_local_steps, context.rng());
             let mut improved_in_round = false;
-            let steps_budget = {
-                match &self.local_steps_range {
-                    Some(r) => {
-                        let lo = *r.start();
-                        let hi = *r.end();
-                        if lo == hi {
-                            lo
-                        } else {
-                            context.rng().random_range(lo..=hi)
-                        }
-                    }
-                    None => self.max_local_steps,
-                }
-            };
 
-            // Persistent per-round order (if not reshuffling each step).
-            let mut round_order: Vec<usize> = (0..self.local_ops.len()).collect();
-            if !self.shuffle_local_each_step {
-                round_order.shuffle(context.rng());
-            }
-
-            for _ in 0..steps_budget {
+            for _ in 0..budget {
                 if stop.load(AtomicOrdering::Relaxed) {
                     break 'outer;
                 }
-
-                let mut accepted_this_step = false;
-
-                // Decide operator visiting order for this step
-                let order: Vec<usize> = if self.shuffle_local_each_step {
-                    let mut v = (0..self.local_ops.len()).collect::<Vec<_>>();
-                    v.shuffle(context.rng());
-                    v
-                } else {
-                    round_order.clone()
-                };
-
-                for &i in &order {
-                    let op = &self.local_ops[i];
-
-                    let mut pc =
-                        PlanningContext::new(model, &current, &eval, dv_buf.as_mut_slice());
-
-                    if let Some(mut plan) = op.propose(&mut pc, context.rng()) {
-                        // Compute delta via evaluator-based full fitness (correctness-first).
-                        self.set_plan_delta_via_eval(
-                            model,
-                            &eval,
-                            current.decision_variables(),
-                            &mut plan,
-                        );
-
-                        let mut tmp = current.clone();
-                        tmp.apply_plan(plan);
-
-                        let cur_fit = current.fitness();
-                        let tmp_fit = tmp.fitness();
-
-                        let better = self.local_acceptor.accept(cur_fit, tmp_fit);
-                        let sideways = self.allow_sideways_in_local && (tmp_fit == cur_fit);
-                        let worse_random = if !better && !sideways {
-                            if let Some(p) = self.accept_worsening_local_with_prob {
-                                context.rng().random::<f64>() < p
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-
-                        if better || sideways || worse_random {
-                            if better {
-                                // Feed strict-improvement size into epsilon history.
-                                let drop = cur_fit.cost.saturating_sub(tmp_fit.cost).max(0);
-                                eps_src.record(drop);
-                                improved_in_round = true;
-                            }
-                            current = tmp;
-                            accepted_this_step = true;
-
-                            // Publish if we beat the shared incumbent (no-op otherwise).
-                            let _ = context.shared_incumbent().try_update(&current, model);
-
-                            tracing::trace!(
-                                "ILS: accepted local op {} (better={}, sideways={}, worse_rand={})",
-                                op.name(),
-                                better,
-                                sideways,
-                                worse_random
-                            );
-                            break; // restart local climb from updated state
-                        }
+                // NOTE: pass the exact fields we need to avoid &self + &mut self.local_pool aliasing
+                let (accepted, strict_drop) = try_one_local_step(
+                    &mut self.local_pool,
+                    &self.local_acceptor,
+                    self.allow_sideways_in_local,
+                    self.accept_worsening_local_with_prob,
+                    model,
+                    &eval,
+                    dv_buf.as_mut_slice(),
+                    &mut current,
+                    context.rng(),
+                );
+                if accepted {
+                    if strict_drop > 0 {
+                        eps_src.record(strict_drop);
+                        improved_in_round = true;
                     }
-                }
-
-                if !accepted_this_step {
-                    break; // no acceptable local move found right now
+                    // publish opportunistically
+                    let _ = context.shared_incumbent().try_update(&current, model);
+                } else {
+                    // local couldn’t produce an acceptable plan now; go to perturbation
+                    break;
                 }
             }
 
             if !improved_in_round {
-                // ---------------------- Phase B: Destroy + Phase C: Repair ----------------------
-                if self.destroy_ops.is_empty() || self.repair_ops.is_empty() {
+                // -------- Phase B: Destroy --------
+                if self.destroy_pool.is_empty() || self.repair_pool.is_empty() {
                     tracing::debug!("ILS: no perturbation operators configured; stopping.");
                     break 'outer;
                 }
 
                 let baseline = current.clone();
-
-                // Destroy attempts
-                let destroy_attempts = destroy_cap;
-                let mut destroyed = false;
-                for _ in 0..destroy_attempts {
-                    if stop.load(AtomicOrdering::Relaxed) {
-                        break 'outer;
-                    }
-                    let idx = if self.destroy_ops.len() == 1 {
-                        0
-                    } else {
-                        context.rng().random_range(0..self.destroy_ops.len())
-                    };
-                    let d = &self.destroy_ops[idx];
-
-                    let mut pc =
-                        PlanningContext::new(model, &current, &eval, dv_buf.as_mut_slice());
-                    if let Some(mut plan) = d.propose(&mut pc, context.rng()) {
-                        self.set_plan_delta_via_eval(
-                            model,
-                            &eval,
-                            current.decision_variables(),
-                            &mut plan,
-                        );
-                        current.apply_plan(plan);
-                        destroyed = true;
-                        tracing::trace!("ILS: applied destroy op {}", d.name());
-                        break;
-                    }
-                }
+                let destroyed = run_destroy_phase(
+                    &mut self.destroy_pool,
+                    destroy_cap,
+                    model,
+                    &eval,
+                    dv_buf.as_mut_slice(),
+                    &mut current,
+                    context.rng(),
+                );
 
                 if !destroyed {
                     tracing::debug!("ILS: no destroy operator produced a plan; stopping.");
                     break 'outer;
                 }
 
-                // Repair attempts
-                let repair_attempts = repair_cap;
-                let mut repaired_and_accepted = false;
+                // -------- Phase C: Repair --------
+                let (repaired, repaired_state, drop_vs_base) = run_repair_phase(
+                    &mut self.repair_pool,
+                    &self.repair_acceptor,
+                    repair_cap,
+                    model,
+                    &eval,
+                    dv_buf.as_mut_slice(),
+                    &current,
+                    context.rng(),
+                );
 
-                let mut repair_indices: Vec<usize> = (0..self.repair_ops.len()).collect();
-                repair_indices.shuffle(context.rng());
-
-                for &ri in repair_indices.iter().take(repair_attempts) {
-                    if stop.load(AtomicOrdering::Relaxed) {
-                        break 'outer;
+                if repaired {
+                    current = repaired_state;
+                    let _ = context.shared_incumbent().try_update(&current, model);
+                    if drop_vs_base > 0 {
+                        eps_src.record(drop_vs_base);
                     }
-
-                    let r = &self.repair_ops[ri];
-                    let mut temp = current.clone();
-
-                    let mut pc = PlanningContext::new(model, &temp, &eval, dv_buf.as_mut_slice());
-
-                    if let Some(mut plan) = r.repair(&mut pc, context.rng()) {
-                        self.set_plan_delta_via_eval(
-                            model,
-                            &eval,
-                            temp.decision_variables(),
-                            &mut plan,
-                        );
-                        temp.apply_plan(plan);
-
-                        if self
-                            .repair_acceptor
-                            .accept(baseline.fitness(), temp.fitness())
-                        {
-                            current = temp;
-                            repaired_and_accepted = true;
-
-                            let _ = context.shared_incumbent().try_update(&current, model);
-                            tracing::trace!("ILS: accepted repair op {}", r.name());
-                            break;
-                        }
-                    }
-                }
-
-                if !repaired_and_accepted {
-                    // Revert to baseline if repair couldn't beat it.
-                    current = baseline;
+                } else {
+                    current = baseline; // revert
                     tracing::debug!("ILS: repair failed to beat baseline.");
                 }
             }
 
-            // --- End of outer round: update stale tracking and ε history on strict improvement ---
+            // ------ Round end: stale & epsilon ------
             if let Some(delta) = stale.on_round_end(*current.fitness()) {
                 eps_src.record(delta);
             }
 
-            // --- Refetch: ONLY when stale, and incumbent is materially better (ε-guarded). ---
+            // ------ Refetch (stale + material) + optional periodic cadence ------
             if stale.is_stale(patience_s) {
-                let inc_fit = context.shared_incumbent().peek();
-                let materially = materially_better(current.fitness(), &inc_fit, eps_src.epsilon());
+                let inc = context.shared_incumbent().peek();
+                let mat = materially_better(current.fitness(), &inc, eps_src.epsilon());
 
-                // Even with periodic cadence configured, we *still* require staleness + materiality.
-                let periodic_due = self.periodic_refetch_due(outer_rounds);
+                let periodic_ok = periodic_refetch_due(self.hard_refetch_every, outer_rounds);
                 let allowed_by_mode = match self.hard_refetch_mode {
                     HardRefetchMode::Always => true,
                     HardRefetchMode::IfBetter => true, // materiality already checked
                 };
 
-                if materially && allowed_by_mode && (periodic_due || self.hard_refetch_every == 0) {
+                if mat && allowed_by_mode && (periodic_ok || self.hard_refetch_every == 0) {
                     tracing::debug!(
                         "ILS: stale refetch (round={}, patience={}, eps={}) current={} incumbent={}",
                         outer_rounds,
                         patience_s,
                         eps_src.epsilon(),
                         current.fitness(),
-                        inc_fit
+                        inc
                     );
 
-                    // Refetch to incumbent snapshot
+                    // Refetch snapshot
                     let mut snap = context.shared_incumbent().snapshot();
 
-                    // Deterministic kick to avoid herd/sync lock-in (apply first K local ops once).
-                    if self.kick_ops_after_refetch > 0 && !self.local_ops.is_empty() {
-                        let k = self.kick_ops_after_refetch.min(self.local_ops.len());
-                        let mut adapter = KickAdapter {
+                    // Deterministic kick using local pool
+                    if self.kick_ops_after_refetch > 0 && !self.local_pool.is_empty() {
+                        let k = self.kick_ops_after_refetch.min(self.local_pool.len());
+                        kick_with_local_pool_internal(
+                            self,
+                            k,
                             model,
-                            eval: &eval,
-                            locals: &self.local_ops,
-                            state: &mut snap,
-                            dv_buf: dv_buf.as_mut_slice(),
-                            rng: context.rng(),
-                        };
-                        let _changed = deterministic_kick(&mut adapter, k);
+                            &eval,
+                            dv_buf.as_mut_slice(),
+                            &mut snap,
+                            context.rng(),
+                        );
                     }
 
                     current = snap;
-
-                    // Cooldown until the next strict improvement to avoid immediate refetch loops.
                     stale.arm_cooldown_until_next_improvement();
                 }
             }
         }
 
-        // Final publish (no-op if we didn't beat the incumbent).
+        // Final publish (no-op if not better)
         let _ = context.shared_incumbent().try_update(&current, model);
     }
 }
+
+/* ----------------------------- internal: refetch kick ----------------------------- */
+
+fn kick_with_local_pool_internal<'p, T, R>(
+    strat: &mut IteratedLocalSearchStrategy<T, R>,
+    k: usize,
+    model: &SolverModel<'p, T>,
+    eval: &DefaultCostEvaluator,
+    dv_buf: &mut [DecisionVar<T>],
+    state: &mut SolverState<'p, T>,
+    rng: &mut R,
+) where
+    T: SolveNumeric,
+    R: rand::Rng,
+{
+    if k == 0 || strat.local_pool.is_empty() {
+        return;
+    }
+    for _ in 0..k {
+        let mut pc = PlanningContext::new(model, &*state, eval, dv_buf);
+        let mut prop = strat.local_pool.apply(&mut pc, rng, None);
+        let Some(mut plan) = prop.take_plan() else {
+            prop.reject();
+            continue;
+        };
+
+        set_plan_delta_via_eval(model, eval, state.decision_variables(), &mut plan);
+
+        let mut tmp = state.clone();
+        tmp.apply_plan(plan);
+
+        let cur_fit = state.fitness();
+        let new_fit = tmp.fitness();
+
+        let better = strat.local_acceptor.accept(cur_fit, new_fit);
+        let sideways = strat.allow_sideways_in_local && (new_fit == cur_fit);
+        let worse_random = if !better && !sideways {
+            if let Some(p) = strat.accept_worsening_local_with_prob {
+                rng.random::<f64>() < p
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if better || sideways || worse_random {
+            let drop = cur_fit.cost.saturating_sub(new_fit.cost).max(0);
+            *state = tmp;
+            prop.accept(drop);
+        } else {
+            prop.reject();
+        }
+    }
+}
+
+/* ----------------------------- factory preset ----------------------------- */
 
 pub fn ils_strategy<T, R>(model: &SolverModel<T>) -> IteratedLocalSearchStrategy<T, R>
 where
@@ -636,12 +687,11 @@ where
     let neighbors_direct_competitors = neighbors::direct_competitors(proximity_map);
     let neighbors_same_berth = neighbors::same_berth(proximity_map);
 
-    // ILS — “standard but bolder” (no worsening in local; bigger ruins; stronger repair).
     IteratedLocalSearchStrategy::new()
         // -------- Local budget & acceptance --------
         .with_local_steps_range(1200..=2200)
         .with_local_sideways(true)
-        .with_local_worsening_prob(0.0) // standard ILS: no worsening in local phase
+        .with_local_worsening_prob(0.0)
         // -------- Ruin/Repair attempts per outer round --------
         .with_destroy_attempts(12)
         .with_repair_attempts(28)
@@ -651,7 +701,7 @@ where
         .with_hard_refetch_every(14)
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
         .with_kick_ops_after_refetch(8)
-        // ------------------------- Local improvement (compact core) -------------------------
+        // ------------------------- Local improvement -------------------------
         .with_local_op(Box::new(
             RelocateSingleBest::new(24..=64).with_neighbors(neighbors_direct_competitors.clone()),
         ))
@@ -673,7 +723,12 @@ where
         .with_local_op(Box::new(
             ShiftEarlierOnSameBerth::new(16..=48).with_neighbors(neighbors_same_berth.clone()),
         ))
-        // ---------------------- Destroy (moderate → bold) ----------------------
+        .with_local_op(Box::new(
+            CascadeRelocateK::new(3..=4, 8..=12, 12..=24)
+                .with_neighbors(neighbors_direct_competitors.clone())
+                .with_insert_policy(CascadeInsertPolicy::BestEarliest),
+        ))
+        // ---------------------- Destroy ----------------------
         .with_destroy_op(Box::new(
             RandomKRatioDestroy::new(0.32..=0.58).with_neighbors(neighbors_any.clone()),
         ))
@@ -681,14 +736,8 @@ where
             WorstCostDestroy::new(0.30..=0.48).with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_destroy_op(Box::new(
-            ShawRelatedDestroy::new(
-                0.28..=0.40,
-                1.6..=2.2,
-                1.into(), // weight_abs_start_gap
-                1.into(), // weight_abs_end_gap
-                5.into(), // penalty_berth_mismatch
-            )
-            .with_neighbors(neighbors_direct_competitors.clone()),
+            ShawRelatedDestroy::new(0.28..=0.40, 1.6..=2.2, 1.into(), 1.into(), 5.into())
+                .with_neighbors(neighbors_direct_competitors.clone()),
         ))
         .with_destroy_op(Box::new(
             TimeClusterDestroy::<T>::new(
@@ -698,7 +747,7 @@ where
             .with_alpha(1.55..=1.90)
             .with_neighbors(neighbors_any.clone()),
         ))
-        // ---------------------- Repair (slightly stronger K) ----------------------
+        // ---------------------- Repair ----------------------
         .with_repair_op(Box::new(KRegretInsertion::new(8..=11)))
         .with_repair_op(Box::new(GreedyInsertion))
 }

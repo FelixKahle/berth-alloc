@@ -265,7 +265,7 @@ where
         label: &str,
     ) {
         tabu_until.clear();
-        *last_best_current = current.fitness().clone();
+        *last_best_current = *current.fitness();
         *stale_rounds = 0;
 
         if self.kick_steps_on_reset > 0 {
@@ -366,7 +366,7 @@ where
         // Loop counters and staleness
         let mut round: usize = 0;
         let mut stale_rounds: usize = 0;
-        let mut last_best_current = current.fitness().clone();
+        let mut last_best_current = *current.fitness();
 
         'outer: loop {
             if stop.load(AtomicOrdering::Relaxed) {
@@ -400,7 +400,7 @@ where
                     {
                         best_true = snap;
                     }
-                    last_best_current = current.fitness().clone();
+                    last_best_current = *current.fitness();
 
                     if self.reset_on_refetch {
                         self.reset_state(
@@ -514,7 +514,7 @@ where
                         let aug_unassigned = cand.fitness().unassigned_requests;
 
                         // True fitness (for aspiration and publishing)
-                        let true_fit = cand.fitness().clone();
+                        let true_fit = *cand.fitness();
 
                         let is_tabu = moved
                             .iter()
@@ -551,7 +551,7 @@ where
                                 moved: cand_rec.moved.clone(),
                                 aug_unassigned: cand_rec.aug_unassigned,
                                 aug_cost: cand_rec.aug_cost,
-                                true_fit: cand_rec.true_fit.clone(),
+                                true_fit: cand_rec.true_fit,
                             });
                         }
 
@@ -620,7 +620,7 @@ where
                     .true_acceptor
                     .accept(&last_best_current, current.fitness())
                 {
-                    last_best_current = current.fitness().clone();
+                    last_best_current = *current.fitness();
                     improved_this_round = true;
                     stale_rounds = 0;
                 }
@@ -696,7 +696,7 @@ where
                         {
                             best_true = snap;
                         }
-                        last_best_current = current.fitness().clone();
+                        last_best_current = *current.fitness();
 
                         if self.reset_on_refetch {
                             self.reset_state(
