@@ -5,7 +5,8 @@
 // "Software"), to deal in the Software without restriction, including
 // without limitation the rights to use, copy, modify, merge, publish,
 // distribute, sublicense, and/or sell copies of the Software, and to
-// permit persons to do so, subject to the following conditions:
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
 //
 // The above copyright notice and this permission notice shall be
 // included in all copies or substantial portions of the Software.
@@ -20,31 +21,39 @@
 
 #![allow(clippy::needless_return)]
 
+use std::sync::atomic::Ordering as AtomicOrdering;
+
+use berth_alloc_core::prelude::Cost;
+
 use crate::{
     core::numeric::SolveNumeric,
     engine::{
         acceptor::{Acceptor, LexStrictAcceptor},
         neighbors,
+        operators::{LocalPool, SoftmaxSelector},
         search::{SearchContext, SearchStrategy},
+        strategy_support::{
+            MedianHistoryEpsilon, StaleTracker, materially_better, patience_from_cooling_halving,
+        },
     },
     model::solver_model::SolverModel,
     search::{
         operator::LocalMoveOperator,
         operator_library::local::{
-            CrossExchangeAcrossBerths, CrossExchangeBestAcrossBerths, HillClimbBestSwapSameBerth,
-            HillClimbRelocateBest, OrOptBlockRelocate, RandomRelocateAnywhere,
-            RandomizedGreedyRelocateRcl, RelocateSingleBest, RelocateSingleBestAllowWorsening,
-            ShiftEarlierOnSameBerth, SwapPairSameBerth,
+            CascadeInsertPolicy, CascadeRelocateK, CrossExchangeAcrossBerths,
+            CrossExchangeBestAcrossBerths, HillClimbBestSwapSameBerth, HillClimbRelocateBest,
+            OrOptBlockRelocate, RandomRelocateAnywhere, RandomizedGreedyRelocateRcl,
+            RelocateSingleBest, RelocateSingleBestAllowWorsening, ShiftEarlierOnSameBerth,
+            SwapPairSameBerth,
         },
-        planner::{DefaultCostEvaluator, PlanningContext},
+        planner::{CostEvaluator, DefaultCostEvaluator, PlanningContext},
     },
     state::{
+        decisionvar::DecisionVar,
         fitness::Fitness,
         solver_state::{SolverState, SolverStateView},
     },
 };
-use berth_alloc_core::prelude::Cost;
-use std::sync::atomic::Ordering as AtomicOrdering;
 
 #[derive(Clone, Copy)]
 pub enum HardRefetchMode {
@@ -52,9 +61,8 @@ pub enum HardRefetchMode {
     Always,
 }
 
-/// Energy-ordered acceptor used by SA for *deterministic* improvements.
-/// Uses a BIG-M scalarization to strongly prioritize fewer unassigned requests.
-/// Assumes Cost = i64.
+/// Energy-ordered acceptor (deterministic compare) used for SA "energy".
+/// Energy = BIG_M * unassigned + cost (i64), so lex-like prioritization.
 #[derive(Debug, Clone)]
 pub struct EnergyAcceptor {
     big_m: i64,
@@ -63,7 +71,7 @@ impl Default for EnergyAcceptor {
     fn default() -> Self {
         Self {
             big_m: 1_000_000_000,
-        } // strong priority on unassigned
+        }
     }
 }
 impl EnergyAcceptor {
@@ -73,9 +81,9 @@ impl EnergyAcceptor {
     }
     #[inline]
     pub fn energy(&self, f: &Fitness) -> i64 {
-        let ua = f.unassigned_requests as i64;
-        let c = f.cost;
-        ua.saturating_mul(self.big_m).saturating_add(c)
+        (f.unassigned_requests as i64)
+            .saturating_mul(self.big_m)
+            .saturating_add(f.cost)
     }
 }
 impl Acceptor for EnergyAcceptor {
@@ -83,55 +91,52 @@ impl Acceptor for EnergyAcceptor {
         "EnergyAcceptor"
     }
     #[inline]
-    fn accept(&self, current: &Fitness, new: &Fitness) -> bool {
-        self.energy(new) < self.energy(current)
+    fn accept(&self, cur: &Fitness, new: &Fitness) -> bool {
+        self.energy(new) < self.energy(cur)
     }
 }
 
-/// Simulated Annealing with:
-/// - bandit-style adaptive operator selection (EMA-weighted roulette)
-/// - acceptance-ratio guided temperature adaptation
-/// - lex-true upgrades for publishing/shared-incumbent
+/// Simulated Annealing with operator pool:
+/// - Proposals from LocalPool (softmax on EMA score; temp wired to pool for exploration)
+/// - Standard Metropolis acceptance on an “energy” (BIG-M + cost)
+/// - Geometric cooling + acceptance-ratio nudges
+/// - ε-guarded refetch of incumbent + reheat + small kick via pool
 pub struct SimulatedAnnealingStrategy<T, R>
 where
     T: SolveNumeric,
     R: rand::Rng,
 {
-    // Local search operators (true objective via DefaultCostEvaluator).
-    local_ops: Vec<Box<dyn LocalMoveOperator<T, DefaultCostEvaluator, R>>>,
+    // Pool of local operators (evaluated on TRUE/Base objective)
+    local_pool: LocalPool<T, DefaultCostEvaluator, R>,
 
-    // Temperature schedule
+    // Temperature schedule (geometric cooling)
     temperature: f64,
-    init_temperature: f64, // remember initial temp for reheating
+    init_temperature: f64,
     cooling: f64,
     min_temperature: f64,
-    steps_per_temp: usize,
+    steps_per_epoch: usize,
 
     // Acceptors
     true_acceptor: LexStrictAcceptor,
-    sa_acceptor: EnergyAcceptor,
+    energy_acceptor: EnergyAcceptor,
 
-    // ILS-like sync/refetch knobs
-    refetch_after_stale: usize, // epochs without global improvement before refetch; 0 => off
-    hard_refetch_every: usize,  // every N epochs; 0 => off
+    // Refetch policy
+    refetch_after_stale_override: Option<usize>, // epochs; if None, derived from cooling
+    hard_refetch_every: usize,
     hard_refetch_mode: HardRefetchMode,
+    reheat_factor: f64, // 0..1; fraction of init T to reheat to on refetch
+    kick_ops_after_refetch: usize, // kick count via pool after refetch
 
-    // Reheat control: 0.0 => disabled; 1.0 => reset to initial temperature on refetch; (0,1) => partial
-    reheat_factor: f64,
+    // Acceptance ratio guidance (nudges, not replacement of geometric cooling)
+    ar_target_low: f64,
+    ar_target_high: f64,
 
-    // ---- Adaptive operator scheduling (bandit-style) ----
-    // Per-operator positive weights used in weighted roulette selection.
-    op_weights: Vec<f64>,
-    // EMA step for weight updates (0,1]; higher -> faster adaptation.
-    op_ema_alpha: f64,
-    // Keep all operators selectable.
-    op_min_weight: f64,
-
-    // ---- Adaptive acceptance targeting ----
-    ar_target_low: f64,  // if acceptance ratio < low -> heat up a bit
-    ar_target_high: f64, // if acceptance ratio > high -> cool extra
+    // Kept for API compatibility (no longer used with pool-based selection)
+    _op_ema_alpha: f64,
+    _op_min_weight: f64,
 }
 
+// -------------- Builder --------------
 impl<T, R> Default for SimulatedAnnealingStrategy<T, R>
 where
     T: SolveNumeric,
@@ -141,33 +146,40 @@ where
         Self::new()
     }
 }
-
 impl<T, R> SimulatedAnnealingStrategy<T, R>
 where
     T: SolveNumeric,
     R: rand::Rng,
 {
     pub fn new() -> Self {
+        let selector = SoftmaxSelector::default()
+            .with_base_temp(1.0)
+            .with_min_p(1e-6)
+            .with_power(1.0);
+
         Self {
-            local_ops: Vec::new(),
-            temperature: 1.0,
-            init_temperature: 1.0,
-            cooling: 0.995,
+            local_pool: LocalPool::new().with_selector(selector),
+            // schedule
+            temperature: 1.6,
+            init_temperature: 1.6,
+            cooling: 0.9993,
             min_temperature: 1e-4,
-            steps_per_temp: 256,
+            steps_per_epoch: 600,
+            // acceptors
             true_acceptor: LexStrictAcceptor,
-            sa_acceptor: EnergyAcceptor::default(),
-            refetch_after_stale: 0,
-            hard_refetch_every: 0,
+            energy_acceptor: EnergyAcceptor::default(),
+            // refetch
+            refetch_after_stale_override: None,
+            hard_refetch_every: 24,
             hard_refetch_mode: HardRefetchMode::IfBetter,
-            reheat_factor: 1.0, // default: full reheat on refetch
-            // bandit defaults
-            op_weights: Vec::new(),
-            op_ema_alpha: 0.15,
-            op_min_weight: 0.05,
-            // acceptance ratio guidance
+            reheat_factor: 0.6,
+            kick_ops_after_refetch: 8,
+            // AR targets
             ar_target_low: 0.10,
-            ar_target_high: 0.45,
+            ar_target_high: 0.50,
+            // legacy (unused, kept for builder compatibility)
+            _op_ema_alpha: 0.25,
+            _op_min_weight: 0.05,
         }
     }
 
@@ -175,77 +187,80 @@ where
         mut self,
         op: Box<dyn LocalMoveOperator<T, DefaultCostEvaluator, R>>,
     ) -> Self {
-        self.local_ops.push(op);
+        self.local_pool.push(op);
         self
     }
 
     pub fn with_init_temp(mut self, t0: f64) -> Self {
-        let t = t0.max(1e-9);
+        let t = t0.max(1e-8);
         self.temperature = t;
         self.init_temperature = t;
         self
     }
-
     pub fn with_cooling(mut self, factor: f64) -> Self {
-        self.cooling = factor;
+        self.cooling = factor.clamp(0.9, 0.99999);
         self
     }
-
-    pub fn with_steps_per_temp(mut self, k: usize) -> Self {
-        self.steps_per_temp = k.max(1);
+    pub fn with_min_temp(mut self, tmin: f64) -> Self {
+        self.min_temperature = tmin.max(1e-9);
         self
     }
-
+    pub fn with_steps_per_epoch(mut self, k: usize) -> Self {
+        self.steps_per_epoch = k.max(1);
+        self
+    }
     pub fn with_refetch_after_stale(mut self, epochs: usize) -> Self {
-        self.refetch_after_stale = epochs;
+        self.refetch_after_stale_override = Some(epochs.max(1));
         self
     }
-
     pub fn with_hard_refetch_every(mut self, epochs: usize) -> Self {
         self.hard_refetch_every = epochs;
         self
     }
-
     pub fn with_hard_refetch_mode(mut self, mode: HardRefetchMode) -> Self {
         self.hard_refetch_mode = mode;
         self
     }
-
-    pub fn with_big_m_for_energy(mut self, big_m: i64) -> Self {
-        self.sa_acceptor = self.sa_acceptor.clone().with_big_m(big_m);
-        self
-    }
-
-    /// 0.0 => no reheat; 1.0 => reset to initial temperature on refetch; (0,1) => partial reheat.
     pub fn with_reheat_factor(mut self, f: f64) -> Self {
         self.reheat_factor = f.clamp(0.0, 1.0);
         self
     }
-
-    // (Optional) public tuners for bandit and acceptance targets:
+    pub fn with_kick_ops_after_refetch(mut self, k: usize) -> Self {
+        self.kick_ops_after_refetch = k;
+        self
+    }
+    pub fn with_big_m_for_energy(mut self, big_m: i64) -> Self {
+        self.energy_acceptor = self.energy_acceptor.clone().with_big_m(big_m);
+        self
+    }
+    // Legacy no-ops kept for config compatibility (bandit now handled by pool)
     pub fn with_op_ema_alpha(mut self, a: f64) -> Self {
-        self.op_ema_alpha = a.clamp(0.01, 0.9);
+        self._op_ema_alpha = a;
         self
     }
     pub fn with_op_min_weight(mut self, w: f64) -> Self {
-        self.op_min_weight = w.clamp(0.0, 1.0);
+        self._op_min_weight = w;
         self
     }
+
     pub fn with_acceptance_targets(mut self, low: f64, high: f64) -> Self {
         self.ar_target_low = low.clamp(0.0, 1.0);
         self.ar_target_high = high.clamp(self.ar_target_low, 1.0);
         self
     }
 
-    /// Accept a worse move with probability exp(-Δ/T), where Δ is the SA energy increase.
+    // --------- internals ---------
     #[inline]
-    fn accept_worse<RNG: rand::Rng>(&self, rng: &mut RNG, delta_energy: f64, temp: f64) -> bool {
-        let p = (-delta_energy / temp).exp();
+    fn metropolis<RNG: rand::Rng>(rng: &mut RNG, delta_energy: i64, temp: f64) -> bool {
+        if delta_energy <= 0 {
+            return true;
+        }
+        let p = (-(delta_energy as f64) / temp).exp();
         rng.random::<f64>() < p
     }
 
     #[inline]
-    fn should_hard_refetch(&self, epoch: usize) -> bool {
+    fn epoch_due(&self, epoch: usize) -> bool {
         self.hard_refetch_every > 0 && epoch > 0 && epoch.is_multiple_of(self.hard_refetch_every)
     }
 
@@ -253,51 +268,91 @@ where
     fn reheat(&self, temp: &mut f64) {
         if self.reheat_factor > 0.0 {
             let target = (self.init_temperature * self.reheat_factor).max(self.min_temperature);
-            // raise to at least target, but do not reduce temperature if already higher
             *temp = temp.max(target);
         }
     }
 
     #[inline]
-    fn pick_operator_index(&self, rng: &mut R, weights: &[f64]) -> usize {
-        debug_assert!(!weights.is_empty());
-        let sum: f64 = weights.iter().copied().sum();
-        // fall back to uniform if degenerate
-        if !sum.is_finite() || sum <= 0.0 {
-            return rng.random_range(0..weights.len());
-        }
-        let mut r = rng.random::<f64>() * sum;
-        for (i, w) in weights.iter().enumerate() {
-            r -= *w;
-            if r <= 0.0 {
-                return i;
-            }
-        }
-        weights.len() - 1
-    }
-
-    #[inline]
-    fn update_weight(w: &mut f64, alpha: f64, reward: f64, min_w: f64) {
-        // Reward in [0,1]; EMA update then clamp to [min_w, +inf).
-        let base = if w.is_finite() && *w > 0.0 { *w } else { 1.0 };
-        let new_w = (1.0 - alpha) * base + alpha * (reward.max(0.0));
-        *w = new_w.max(min_w);
-    }
-
-    #[inline]
-    fn acceptance_ratio(accepted: usize, tried: usize) -> f64 {
+    fn acceptance_ratio(acc: usize, tried: usize) -> f64 {
         if tried == 0 {
             0.0
         } else {
-            (accepted as f64) / (tried as f64)
+            (acc as f64) / (tried as f64)
+        }
+    }
+
+    /// Small helper: try K local proposals via the pool and take any improving/sideways moves.
+    fn kick_with_local_pool<'p>(
+        &mut self,
+        k: usize,
+        model: &SolverModel<'p, T>,
+        eval: &DefaultCostEvaluator,
+        dv_buf: &mut [DecisionVar<T>],
+        state: &mut SolverState<'p, T>,
+        rng: &mut R,
+    ) {
+        if k == 0 || self.local_pool.is_empty() {
+            return;
+        }
+        for _ in 0..k {
+            let mut pc = PlanningContext::new(model, &*state, eval, dv_buf);
+            // pick a bit hotter to desync from incumbent
+            let mut prop = self.local_pool.apply(&mut pc, rng, Some(1.0));
+            let Some(mut plan) = prop.take_plan() else {
+                prop.reject();
+                continue;
+            };
+
+            set_plan_delta_via_eval(model, eval, state.decision_variables(), &mut plan);
+
+            let mut tmp = state.clone();
+            tmp.apply_plan(plan);
+
+            let cur_fit = state.fitness();
+            let tmp_fit = tmp.fitness();
+
+            let better = self.true_acceptor.accept(cur_fit, tmp_fit);
+            let sideways = tmp_fit == cur_fit;
+
+            if better || sideways {
+                let drop = cur_fit.cost.saturating_sub(tmp_fit.cost).max(0);
+                *state = tmp;
+                prop.accept(drop);
+            } else {
+                prop.reject();
+            }
         }
     }
 }
 
+/* ----------------------------- small free helpers ----------------------------- */
+
+/// Build a new DV vector with “last patch wins”, compute base fitness delta by full evals,
+/// and write it into `plan.delta_cost`. Free function to avoid any `&self` borrow tangles.
+fn set_plan_delta_via_eval<'m, T: SolveNumeric>(
+    model: &SolverModel<'m, T>,
+    eval: &DefaultCostEvaluator,
+    current_vars: &[DecisionVar<T>],
+    plan: &mut crate::state::plan::Plan<'m, T>,
+) {
+    let mut new_vars = current_vars.to_vec();
+    for p in &plan.decision_var_patches {
+        let i = p.index.get();
+        if i < new_vars.len() {
+            new_vars[i] = p.patch;
+        }
+    }
+    let old_fit: Fitness = eval.eval_fitness(model, current_vars);
+    let new_fit: Fitness = eval.eval_fitness(model, &new_vars);
+    plan.delta_cost = new_fit.cost.saturating_sub(old_fit.cost);
+}
+
+/* ----------------------------- strategy impl ----------------------------- */
+
 impl<T, R> SearchStrategy<T, R> for SimulatedAnnealingStrategy<T, R>
 where
     T: SolveNumeric,
-    R: rand::Rng,
+    R: rand::Rng + Send + Sync,
 {
     fn name(&self) -> &str {
         "Simulated Annealing"
@@ -307,31 +362,31 @@ where
     fn run<'e, 'm, 'p>(&mut self, context: &mut SearchContext<'e, 'm, 'p, T, R>) {
         let stop = context.stop();
         let model = context.model();
-        if self.local_ops.is_empty() {
+        if self.local_pool.is_empty() {
             tracing::warn!("SA: no local operators configured");
             return;
         }
 
-        // Two states: `current` (walker) and `best` (true objective).
+        // Working states
         let mut current: SolverState<'p, T> = context.shared_incumbent().snapshot();
         let mut best: SolverState<'p, T> = current.clone();
 
-        // local scratch buffer
-        let mut dv_buf: Vec<crate::state::decisionvar::DecisionVar<T>> = vec![
-                crate::state::decisionvar::DecisionVar::unassigned();
-                model.flexible_requests_len()
-            ];
+        // Scratch buffer for PlanningContext
+        let mut dv_buf: Vec<DecisionVar<T>> =
+            vec![DecisionVar::unassigned(); model.flexible_requests_len()];
 
+        // Data-driven epsilon & stale tracking via helpers
+        let mut eps_src = MedianHistoryEpsilon::new(/*history_cap*/ 32, /*min_eps*/ 1);
+        let mut stale = StaleTracker::new(*current.fitness(), /*history_cap*/ 32);
+
+        // Derive patience if not overridden: epochs to halve temperature
+        let patience_epochs = self
+            .refetch_after_stale_override
+            .unwrap_or_else(|| patience_from_cooling_halving(self.cooling));
+
+        let eval = DefaultCostEvaluator;
         let mut temp = self.temperature;
-        let mut epoch: usize = 0;
-        let mut stale_epochs_without_global_improve: usize = 0;
-
-        // Lazily initialize operator weights (all ones).
-        if self.op_weights.len() != self.local_ops.len() {
-            // NOTE: we do not mutate &self here; it is &mut self already inside run()
-            self.op_weights.clear();
-            self.op_weights.resize(self.local_ops.len(), 1.0);
-        }
+        let mut epoch = 0usize;
 
         'outer: loop {
             if stop.load(AtomicOrdering::Relaxed) {
@@ -339,15 +394,8 @@ where
             }
             epoch = epoch.saturating_add(1);
 
-            // Effective temperature: once below floor, behave like hill-climbing unless reheated.
-            let t_eff = if temp < self.min_temperature {
-                self.min_temperature
-            } else {
-                temp
-            };
-
-            // Periodic hard refetch (sync threads). Optionally reheat on refetch.
-            if self.should_hard_refetch(epoch) {
+            // -------- Periodic refetch (sync) gate; optional reheat --------
+            if self.hard_refetch_every > 0 && self.epoch_due(epoch) {
                 let inc = context.shared_incumbent().peek();
                 let do_fetch = match self.hard_refetch_mode {
                     HardRefetchMode::IfBetter => self.true_acceptor.accept(current.fitness(), &inc),
@@ -355,202 +403,203 @@ where
                 };
                 if do_fetch {
                     tracing::debug!(
-                        "SA: periodic refetch at epoch {} (curr {}, inc {})",
+                        "SA: periodic refetch @epoch {} (curr {}, inc {})",
                         epoch,
                         current.fitness(),
                         inc
                     );
-                    let snap = context.shared_incumbent().snapshot();
-                    current = snap.clone();
-                    if self.true_acceptor.accept(best.fitness(), snap.fitness()) {
-                        best = snap;
+                    let mut snap = context.shared_incumbent().snapshot();
+
+                    // Kick a few times via pool to avoid synchronization lock
+                    if self.kick_ops_after_refetch > 0 && !self.local_pool.is_empty() {
+                        self.kick_with_local_pool(
+                            self.kick_ops_after_refetch.min(self.local_pool.len()),
+                            model,
+                            &eval,
+                            dv_buf.as_mut_slice(),
+                            &mut snap,
+                            context.rng(),
+                        );
                     }
-                    // Reheat and clear staleness, since we jumped basins.
+
+                    if self.true_acceptor.accept(best.fitness(), snap.fitness()) {
+                        best = snap.clone();
+                    }
+                    current = snap;
+
+                    // Reheat and cooldown for staleness
                     self.reheat(&mut temp);
-                    stale_epochs_without_global_improve = 0;
-                    tracing::debug!("SA: refetch → reheat to T={}", temp);
+                    stale.arm_cooldown_until_next_improvement();
+                    tracing::debug!("SA: periodic refetch → reheat to T={}", temp);
                 }
             }
 
-            let mut improved_global_in_epoch = false;
+            // -------- One SA epoch: Metropolis steps on TRUE objective --------
+            let mut accepted = 0usize;
+            let mut tried = 0usize;
 
-            // Acceptance accounting for adaptive temperature
-            let mut accepted_this_epoch: usize = 0;
-            let mut tried_this_epoch: usize = 0;
-
-            for _ in 0..self.steps_per_temp {
+            for _ in 0..self.steps_per_epoch {
                 if stop.load(AtomicOrdering::Relaxed) {
                     break 'outer;
                 }
 
-                // Pick a single operator by weighted roulette.
-                let oi = self.pick_operator_index(context.rng(), &self.op_weights);
-                let op = &self.local_ops[oi];
-
-                let mut pc = PlanningContext::new(
-                    model,
-                    &current,
-                    &DefaultCostEvaluator,
-                    dv_buf.as_mut_slice(),
+                let mut pc = PlanningContext::new(model, &current, &eval, dv_buf.as_mut_slice());
+                // Wire temp into pool to control exploration among operators
+                let mut prop = self.local_pool.apply(
+                    &mut pc,
+                    context.rng(),
+                    Some(temp.max(self.min_temperature)),
                 );
-                tried_this_epoch = tried_this_epoch.saturating_add(1);
 
-                if let Some(mut plan) = op.propose(&mut pc, context.rng()) {
-                    // Recompute base delta for the plan before applying to keep Fitness true/base.
+                tried = tried.saturating_add(1);
+
+                if let Some(mut plan) = prop.take_plan() {
+                    // Compute TRUE/base delta quickly with "last patch wins"
                     use crate::model::index::RequestIndex;
                     use crate::state::decisionvar::DecisionVar;
                     use std::collections::HashMap;
 
-                    let mut base_delta: Cost = Cost::from(0);
-
-                    // Keep last patch per request if multiple appear
+                    let mut base_delta: Cost = 0.into();
                     let mut last: HashMap<usize, DecisionVar<T>> = HashMap::new();
                     for p in &plan.decision_var_patches {
                         last.insert(p.index.get(), p.patch);
                     }
-
                     for (ri_u, patch) in last {
                         let ri = RequestIndex::new(ri_u);
                         let old_dv = current.decision_variables()[ri.get()];
-
-                        // subtract old base cost
                         if let DecisionVar::Assigned(old) = old_dv
                             && let Some(c) =
                                 model.cost_of_assignment(ri, old.berth_index, old.start_time)
-                            {
-                                base_delta = base_delta.saturating_sub(c);
-                            }
-                        // add new base cost
+                        {
+                            base_delta = base_delta.saturating_sub(c);
+                        }
                         if let DecisionVar::Assigned(new_dec) = patch
                             && let Some(c) = model.cost_of_assignment(
                                 ri,
                                 new_dec.berth_index,
                                 new_dec.start_time,
-                            ) {
-                                base_delta = base_delta.saturating_add(c);
-                            }
+                            )
+                        {
+                            base_delta = base_delta.saturating_add(c);
+                        }
                     }
-
                     plan.delta_cost = base_delta;
 
-                    let mut tmp = current.clone();
-                    tmp.apply_plan(plan);
+                    // Candidate
+                    let mut next = current.clone();
+                    next.apply_plan(plan);
 
-                    // Deterministic improvement under SA energy? Accept.
-                    if self.sa_acceptor.accept(current.fitness(), tmp.fitness()) {
-                        current = tmp.clone();
-                        accepted_this_epoch = accepted_this_epoch.saturating_add(1);
+                    // Metropolis on ENERGY
+                    let e0 = self.energy_acceptor.energy(current.fitness());
+                    let e1 = self.energy_acceptor.energy(next.fitness());
+                    let delta_e = e1 - e0;
 
-                        // Bandit reward: strong credit for true improvement; moderate otherwise.
-                        let mut reward = 0.6;
+                    // Temperature floor behavior: still allow exp(-Δ/Tmin)
+                    let t_eff = temp.max(self.min_temperature);
+                    let accept = Self::metropolis(context.rng(), delta_e, t_eff);
+
+                    if accept {
+                        current = next;
+                        accepted = accepted.saturating_add(1);
+
+                        // Reward pool by TRUE improvement only (nonnegative)
+                        let drop = best
+                            .fitness()
+                            .cost
+                            .saturating_sub(current.fitness().cost)
+                            .max(0);
+                        prop.accept(drop);
+
+                        // If TRUE/base objective improved best → publish & record epsilon-stat
                         if self.true_acceptor.accept(best.fitness(), current.fitness()) {
+                            let drop_best = best
+                                .fitness()
+                                .cost
+                                .saturating_sub(current.fitness().cost)
+                                .max(0);
+                            eps_src.record(drop_best);
+
                             best = current.clone();
                             let _ = context.shared_incumbent().try_update(&best, model);
-                            improved_global_in_epoch = true;
-                            reward = 1.0;
                         }
-                        Self::update_weight(
-                            &mut self.op_weights[oi],
-                            self.op_ema_alpha,
-                            reward,
-                            self.op_min_weight,
-                        );
                     } else {
-                        // Maybe accept worse probabilistically using SA energy.
-                        let e0 = self.sa_acceptor.energy(current.fitness());
-                        let e1 = self.sa_acceptor.energy(tmp.fitness());
-                        let delta = (e1 - e0) as f64;
-                        if delta <= 0.0 || self.accept_worse(context.rng(), delta, t_eff) {
-                            current = tmp;
-                            accepted_this_epoch = accepted_this_epoch.saturating_add(1);
-
-                            // Small credit for accepted-worse (diversification).
-                            Self::update_weight(
-                                &mut self.op_weights[oi],
-                                self.op_ema_alpha,
-                                0.25,
-                                self.op_min_weight,
-                            );
-
-                            // Upgrade `best` only if true objective improves.
-                            if self.true_acceptor.accept(best.fitness(), current.fitness()) {
-                                best = current.clone();
-                                let _ = context.shared_incumbent().try_update(&best, model);
-                                improved_global_in_epoch = true;
-
-                                // Bonus: a bit more credit if a worse-by-energy
-                                // move still improved the true objective.
-                                Self::update_weight(
-                                    &mut self.op_weights[oi],
-                                    self.op_ema_alpha,
-                                    0.5,
-                                    self.op_min_weight,
-                                );
-                            }
-                        } else {
-                            // Tiny penalty (do not drive to zero).
-                            Self::update_weight(
-                                &mut self.op_weights[oi],
-                                self.op_ema_alpha,
-                                0.0,
-                                self.op_min_weight,
-                            );
-                        }
+                        prop.reject();
                     }
+                } else {
+                    // pool had no plan; count as tried but not accepted
+                    prop.reject();
                 }
             }
 
-            if improved_global_in_epoch {
-                stale_epochs_without_global_improve = 0;
-            } else {
-                stale_epochs_without_global_improve =
-                    stale_epochs_without_global_improve.saturating_add(1);
+            // ----- Staleness bookkeeping (per-epoch, on TRUE fitness) -----
+            if let Some(delta) = stale.on_round_end(*best.fitness()) {
+                eps_src.record(delta);
+            }
 
-                // Staleness refetch (only if incumbent strictly better than our current).
-                if self.refetch_after_stale > 0
-                    && stale_epochs_without_global_improve >= self.refetch_after_stale
-                {
-                    let inc = context.shared_incumbent().peek();
-                    if self.true_acceptor.accept(current.fitness(), &inc) {
-                        tracing::debug!(
-                            "SA: staleness refetch at epoch {} ({} -> {})",
-                            epoch,
-                            current.fitness(),
-                            inc
+            // ----- Refetch when STALE & incumbent materially better (ε-guarded) -----
+            if stale.is_stale(patience_epochs) {
+                let inc = context.shared_incumbent().peek();
+                let eps = eps_src.epsilon();
+                let material = materially_better(current.fitness(), &inc, eps);
+
+                let allowed = match self.hard_refetch_mode {
+                    HardRefetchMode::Always => true,
+                    HardRefetchMode::IfBetter => material,
+                };
+
+                if allowed && material {
+                    tracing::debug!(
+                        "SA: stale refetch @epoch {} (pat={}, eps={}) current={} incumbent={}",
+                        epoch,
+                        patience_epochs,
+                        eps,
+                        current.fitness(),
+                        inc
+                    );
+                    let mut snap = context.shared_incumbent().snapshot();
+
+                    // Kick via pool
+                    if self.kick_ops_after_refetch > 0 && !self.local_pool.is_empty() {
+                        self.kick_with_local_pool(
+                            self.kick_ops_after_refetch.min(self.local_pool.len()),
+                            model,
+                            &eval,
+                            dv_buf.as_mut_slice(),
+                            &mut snap,
+                            context.rng(),
                         );
-                        let snap = context.shared_incumbent().snapshot();
-                        current = snap.clone();
-                        if self.true_acceptor.accept(best.fitness(), snap.fitness()) {
-                            best = snap;
-                        }
-                        // Reheat and clear staleness when refetching to a better basin.
-                        self.reheat(&mut temp);
-                        tracing::debug!("SA: stale-refetch → reheat to T={}", temp);
                     }
-                    // Reset either way to avoid immediate refetch loop.
-                    stale_epochs_without_global_improve = 0;
+
+                    if self.true_acceptor.accept(best.fitness(), snap.fitness()) {
+                        best = snap.clone();
+                    }
+                    current = snap;
+
+                    // Reheat and cool-down staleness until next strict improvement
+                    self.reheat(&mut temp);
+                    stale.arm_cooldown_until_next_improvement();
+                    tracing::debug!("SA: stale refetch → reheat to T={}", temp);
                 }
             }
 
-            // ---- Adaptive temperature update by acceptance ratio ----
-            let ar = Self::acceptance_ratio(accepted_this_epoch, tried_this_epoch);
-            // Base cooling
-            let mut next_temp = temp * self.cooling;
-            // Heat up slightly if we're “frozen”
+            // ----- Temperature update (geometric + AR nudges) -----
+            let ar = Self::acceptance_ratio(accepted, tried);
+            let mut next_temp = temp * self.cooling; // geometric base
             if ar < self.ar_target_low {
-                next_temp = (temp * 1.06).max(next_temp);
-            }
-            // Cool extra if we accept too much (too random)
+                next_temp = (temp * 1.05).max(next_temp);
+            } // heat a bit if frozen
             if ar > self.ar_target_high {
                 next_temp *= self.cooling;
-            }
+            } // cool extra if too random
             temp = next_temp.max(self.min_temperature);
         }
 
-        // Final publish (no-op if `best` doesn't beat the shared incumbent).
+        // Final publish (no-op if not better than incumbent).
         let _ = context.shared_incumbent().try_update(&best, model);
     }
 }
+
+/* ----------------------------- preset ----------------------------- */
 
 pub fn sa_strategy<T, R>(model: &SolverModel<T>) -> SimulatedAnnealingStrategy<T, R>
 where
@@ -562,19 +611,24 @@ where
     let neighbors_direct_competitors = neighbors::direct_competitors(proximity_map);
     let neighbors_same_berth = neighbors::same_berth(proximity_map);
 
-    // SA with tighter acceptance and partial reheat for steady progress
+    // SA — “hotter & longer” preset for deeper exploration.
     SimulatedAnnealingStrategy::new()
-        .with_init_temp(1.7)
-        .with_cooling(0.99925)
-        .with_steps_per_temp(600)
-        .with_refetch_after_stale(60)
-        .with_hard_refetch_every(24)
+        // ---- schedule ----
+        .with_init_temp(35.0)
+        .with_cooling(0.9997)
+        .with_min_temp(1e-4)
+        .with_steps_per_epoch(1200)
+        // ---- refetch (ε-guarded in run) ----
+        .with_hard_refetch_every(80)
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
-        .with_reheat_factor(0.6)
+        .with_refetch_after_stale(60)
+        .with_reheat_factor(0.85)
+        .with_kick_ops_after_refetch(18)
+        // ---- energy/targets (bandit knobs are no-ops now) ----
+        .with_big_m_for_energy(900_000_000)
         .with_op_ema_alpha(0.30)
-        .with_op_min_weight(0.10)
-        .with_acceptance_targets(0.10, 0.52)
-        .with_big_m_for_energy(1_250_000_000)
+        .with_op_min_weight(0.12)
+        .with_acceptance_targets(0.22, 0.70)
         // ------------------------- Local operators -------------------------
         .with_local_op(Box::new(
             ShiftEarlierOnSameBerth::new(18..=52).with_neighbors(neighbors_same_berth.clone()),
@@ -612,5 +666,13 @@ where
         ))
         .with_local_op(Box::new(
             CrossExchangeBestAcrossBerths::new(32..=96).with_neighbors(neighbors_any.clone()),
+        ))
+        .with_local_op(Box::new(
+            CascadeRelocateK::new(3..=5, 6..=10, 10..=20)
+                .with_neighbors(neighbors_any.clone())
+                .with_insert_policy(CascadeInsertPolicy::Rcl {
+                    alpha_range: 1.4..=2.0,
+                })
+                .allow_step_worsening(30),
         ))
 }
