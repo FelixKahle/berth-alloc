@@ -24,12 +24,11 @@ use crate::{
     engine::{
         gls,
         greedy_opening::GreedyOpening,
-        ils,
+        ils::{self, IteratedLocalSearchStrategy},
         opening::OpeningStrategy,
         sa,
         search::{SearchContext, SearchStrategy},
         shared_incumbent::SharedIncumbent,
-        tabu,
     },
     model::{err::SolverModelBuildError, solver_model::SolverModel},
     state::solver_state::SolverStateView,
@@ -38,7 +37,7 @@ use berth_alloc_model::{
     prelude::{Problem, SolutionRef},
     solution::SolutionError,
 };
-use rand::seq::{IndexedRandom, SliceRandom};
+use num_traits::ToPrimitive;
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::{
@@ -146,11 +145,203 @@ where
         }
     }
 
+    // ---- helpers: tiny jitter utilities around strong defaults ----
+
+    #[inline]
+    fn jitter_i64<R: Rng>(rng: &mut R, base: i64, spread: i64) -> i64 {
+        if spread <= 0 {
+            base
+        } else {
+            let off = rng.random_range(-spread..=spread);
+            (base + off).max(1)
+        }
+    }
+
+    #[inline]
+    fn jitter_usize<R: rand::Rng>(rng: &mut R, base: usize, pct: f64, min: usize) -> usize {
+        let pct = pct.clamp(0.0, 1.0);
+        let span_f = (base as f64) * pct;
+        let span_i64 = span_f.round() as i64;
+
+        // If span is zero, nothing to jitter—still respect the floor.
+        if span_i64 <= 0 {
+            return base.max(min);
+        }
+
+        // Use i64 for the range since isize doesn't implement SampleUniform on all targets.
+        let off: i64 = rng.random_range(-span_i64..=span_i64);
+        let jittered = if off >= 0 {
+            base.saturating_add(off as usize)
+        } else {
+            base.saturating_sub((-off) as usize)
+        };
+
+        jittered.max(min)
+    }
+
+    #[inline]
+    fn jitter_f64<R: Rng>(rng: &mut R, base: f64, pct: f64, floor: f64, ceil: f64) -> f64 {
+        let pct = pct.clamp(0.0, 1.0);
+        let span = base.abs() * pct;
+        let off = rng.random_range(-1_000_000i64..=1_000_000i64) as f64 / 1_000_000.0;
+        (base + off * span).clamp(floor, ceil)
+    }
+
+    #[inline]
+    fn jitter_pair_usize<R: Rng>(
+        rng: &mut R,
+        lo: usize,
+        hi: usize,
+        pct: f64,
+        minw: usize,
+    ) -> (usize, usize) {
+        let nlo = Self::jitter_usize(rng, lo, pct, 1);
+        let nhi = Self::jitter_usize(rng, hi, pct, nlo + minw);
+        (nlo, nhi.max(nlo + minw))
+    }
+
+    // ---- per-family samplers (wrap the good factories and nudge params) ----
+
+    fn sample_gls<'p, R>(
+        model: &SolverModel<'p, T>,
+        rng: &mut R,
+        slot_idx: usize,
+    ) -> Box<dyn SearchStrategy<T, ChaCha8Rng>>
+    where
+        T: SolveNumeric + ToPrimitive + Copy + From<i32>,
+        R: rand::Rng,
+    {
+        let mut s = gls::gls_strategy::<T, ChaCha8Rng>(model);
+
+        // diversify: lambda, penalty_step, pulse, max steps, refetch cadence, kicks
+        let lambda = Self::jitter_i64(rng, 9, 3);
+        let pstep = Self::jitter_i64(rng, 2, 1);
+        let (pulse_stale, pulse_k) = {
+            let ps = Self::jitter_usize(rng, 8, 0.35, 2);
+            let pk = Self::jitter_usize(rng, 20, 0.35, 5);
+            (ps, pk)
+        };
+        let max_steps = Self::jitter_usize(rng, 2100, 0.25, 600);
+        let refetch_every = [0, 16, 20, 24, 28, 32][slot_idx % 6];
+        let refetch_after_stale = [0, 40, 60][slot_idx % 3];
+        let kicks = Self::jitter_usize(rng, 6, 0.5, 2);
+
+        s = s
+            .with_lambda(lambda)
+            .with_penalty_step(pstep)
+            .with_pulse_params(pulse_stale, pulse_k)
+            .with_max_local_steps(max_steps)
+            .with_hard_refetch_every(refetch_every)
+            .with_refetch_after_stale(refetch_after_stale)
+            .with_kick_steps_on_reset(kicks);
+
+        Box::new(s)
+    }
+
+    fn sample_ils<'p, R>(
+        model: &SolverModel<'p, T>,
+        rng: &mut R,
+        slot_idx: usize,
+    ) -> Box<dyn SearchStrategy<T, ChaCha8Rng>>
+    where
+        T: SolveNumeric + From<i32>,
+        R: Rng,
+    {
+        let mut s: IteratedLocalSearchStrategy<T, ChaCha8Rng> = ils::ils_strategy(model);
+
+        // diversify around your “standard but bolder” preset
+        let (lo, hi) = Self::jitter_pair_usize(rng, 1200, 2200, 0.25, 100);
+        let destroy_attempts = Self::jitter_usize(rng, 12, 0.34, 3);
+        let repair_attempts = Self::jitter_usize(rng, 28, 0.34, 6);
+        let refetch_after_stale = [32, 40, 48, 56][slot_idx % 4];
+        let refetch_every = [10, 12, 14, 16][slot_idx % 4];
+        let kicks = Self::jitter_usize(rng, 8, 0.5, 2);
+
+        s = s
+            .with_local_steps_range(lo..=hi)
+            .with_destroy_attempts(destroy_attempts)
+            .with_repair_attempts(repair_attempts)
+            .with_refetch_after_stale(refetch_after_stale)
+            .with_hard_refetch_every(refetch_every)
+            .with_kick_ops_after_refetch(kicks);
+
+        Box::new(s)
+    }
+
+    fn sample_sa<'p, R>(
+        model: &SolverModel<'p, T>,
+        rng: &mut R,
+        slot_idx: usize,
+    ) -> Box<dyn SearchStrategy<T, ChaCha8Rng>>
+    where
+        T: SolveNumeric + From<i32>,
+        R: rand::Rng,
+    {
+        let mut s = sa::sa_strategy::<T, ChaCha8Rng>(model);
+
+        // diversify schedule + bandit + refetch cadence
+        let t0 = Self::jitter_f64(rng, 35.0, 0.35, 3.0, 80.0);
+        let cool = Self::jitter_f64(rng, 0.9997, 0.0006, 0.9985, 0.99995);
+        let steps = Self::jitter_usize(rng, 1200, 0.35, 300);
+        let refetch_every = [60, 70, 80, 100, 120][slot_idx % 5];
+        let stale_epochs = [40, 50, 60, 80][slot_idx % 4];
+        let reheat = Self::jitter_f64(rng, 0.85, 0.25, 0.4, 0.95);
+        let big_m = Self::jitter_i64(rng, 900_000_000, 150_000_000);
+        let alpha = Self::jitter_f64(rng, 0.30, 0.3, 0.05, 0.6);
+        let minw = Self::jitter_f64(rng, 0.12, 0.5, 0.01, 0.3);
+        let low = Self::jitter_f64(rng, 0.22, 0.35, 0.05, 0.5);
+        let high = (low + 0.25).clamp(0.2, 0.85);
+        let kicks = Self::jitter_usize(rng, 18, 0.5, 4);
+
+        s = s
+            .with_init_temp(t0)
+            .with_cooling(cool)
+            .with_steps_per_epoch(steps)
+            .with_hard_refetch_every(refetch_every)
+            .with_refetch_after_stale(stale_epochs)
+            .with_reheat_factor(reheat)
+            .with_big_m_for_energy(big_m)
+            .with_op_ema_alpha(alpha)
+            .with_op_min_weight(minw)
+            .with_acceptance_targets(low, high)
+            .with_kick_ops_after_refetch(kicks);
+
+        Box::new(s)
+    }
+
+    fn diversified_strategies<'p>(
+        model: &SolverModel<'p, T>,
+        n: usize,
+        seeder: &mut impl RngCore,
+    ) -> Vec<Box<dyn SearchStrategy<T, ChaCha8Rng>>>
+    where
+        T: SolveNumeric + From<i32> + ToPrimitive + Copy,
+    {
+        let n = n.max(1);
+        let mut out: Vec<Box<dyn SearchStrategy<T, ChaCha8Rng>>> = Vec::with_capacity(n);
+
+        // one RNG per sampler for stability
+        for i in 0..n {
+            let mut rng = ChaCha8Rng::seed_from_u64(seeder.next_u64());
+            // round-robin families, skew a bit towards exploration on later threads
+            match i % 3 {
+                0 => out.push(Self::sample_gls(model, &mut rng, i)),
+                1 => out.push(Self::sample_ils(model, &mut rng, i)),
+                _ => out.push(Self::sample_sa(model, &mut rng, i)),
+            }
+        }
+        out
+    }
+
     #[tracing::instrument(level = "info", skip(self, problem))]
     pub fn solve<'p>(
         &mut self,
         problem: &'p Problem<T>,
-    ) -> Result<Option<SolutionRef<'p, T>>, EngineError<T, GreedyOpening<T>>> {
+    ) -> Result<Option<SolutionRef<'p, T>>, EngineError<T, GreedyOpening<T>>>
+    where
+        // needed for the GLS factory and our diversification
+        T: SolveNumeric + From<i32> + ToPrimitive + Copy,
+    {
         let model: SolverModel<'p, T> = SolverModel::from_problem(problem)?;
 
         // Opening on the main thread
@@ -160,226 +351,19 @@ where
             .map_err(EngineError::OpeningFailed)?;
         let shared_incumbent = SharedIncumbent::new(initial_state);
 
-        // --- Diversified, randomized strategy portfolio (types + settings) ---
-        if self.strategies.is_empty() {
-            let n = self.config.num_workers.max(1);
-
-            #[derive(Clone, Copy, Debug)]
-            enum Kind {
-                Ils,
-                Tabu,
-                Sa,
-                Gls,
-            }
-
-            fn make_one_variant<Tnum>(
-                k: Kind,
-                model: &SolverModel<Tnum>,
-                rng: &mut ChaCha8Rng,
-            ) -> Box<dyn SearchStrategy<Tnum, ChaCha8Rng>>
-            where
-                Tnum: SolveNumeric + From<i32>,
-            {
-                match k {
-                    Kind::Ils => {
-                        let mut s = ils::ils_strategy::<Tnum, ChaCha8Rng>(model);
-
-                        // Heavier local budget; sample per-run for variability
-                        if rng.random_bool(0.5) {
-                            s = s.with_max_local_steps(rng.random_range(1400..=2200));
-                        } else {
-                            let lo = rng.random_range(800..=1400);
-                            let hi = rng.random_range((lo + 200)..=(lo + 900));
-                            s = s.with_local_steps_range(lo..=hi);
-                        }
-
-                        // Allow plateaus and controlled worsening
-                        s = s.with_local_sideways(rng.random_bool(0.7));
-                        if rng.random_bool(0.75) {
-                            s = s.with_local_worsening_prob(rng.random_range(0.08..=0.15));
-                        }
-
-                        // More perturbation attempts per round
-                        s = s.with_shuffle_local_each_step(true);
-                        if rng.random_bool(0.75) {
-                            s = s.with_destroy_attempts(rng.random_range(18..=42));
-                        }
-                        if rng.random_bool(0.75) {
-                            s = s.with_repair_attempts(rng.random_range(18..=42));
-                        }
-
-                        // Refetch policy: prefer earlier stale-refetch; periodic refetch less often
-                        if rng.random_bool(0.70) {
-                            s = s.with_refetch_after_stale(rng.random_range(60..=140));
-                        }
-                        if rng.random_bool(0.35) {
-                            s = s.with_hard_refetch_every(rng.random_range(16..=40));
-                        }
-
-                        Box::new(s)
-                    }
-
-                    Kind::Tabu => {
-                        // Longer tabu tenure and more sampling
-                        let lo = rng.random_range(36..=56);
-                        let hi = rng.random_range((lo + 2)..=96);
-                        let steps = rng.random_range(1400..=2200);
-                        let samples = rng.random_range(128..=192);
-                        let restart_on_publish = rng.random_bool(0.85);
-                        let reset_on_refetch = rng.random_bool(0.95);
-                        let kick = rng.random_range(6..=10);
-
-                        // Penalty pulses earlier and broader
-                        let pulse_top_k = rng.random_range(16..=28);
-                        let stagnation = rng.random_range(6..=12);
-
-                        let mut s = tabu::tabu_strategy::<Tnum, ChaCha8Rng>(model)
-                            .with_tabu_tenure(lo..=hi)
-                            .with_max_local_steps(steps)
-                            .with_samples_per_step(samples)
-                            .with_pulse_params(stagnation, pulse_top_k)
-                            .with_restart_on_publish(restart_on_publish)
-                            .with_reset_on_refetch(reset_on_refetch)
-                            .with_kick_steps_on_reset(kick);
-
-                        // Refetch policy: rely more on stale-refetch; occasional periodic refetch
-                        if rng.random_bool(0.30) {
-                            s = s.with_hard_refetch_every(rng.random_range(18..=40));
-                        }
-                        if rng.random_bool(0.70) {
-                            s = s.with_refetch_after_stale(rng.random_range(60..=140));
-                        }
-
-                        Box::new(s)
-                    }
-
-                    Kind::Sa => {
-                        // Hotter start, slower cooling, longer epochs
-                        let init_t = rng.random_range(1.6_f64..=2.4);
-                        let cooling = rng.random_range(0.9990_f64..=0.9997);
-                        let steps = rng.random_range(450..=700);
-
-                        // Acceptance targeting widened for sustained exploration
-                        let low = rng.random_range(0.08_f64..=0.15);
-                        let high = rng.random_range(0.60_f64..=0.70).max(low + 0.06);
-
-                        // Faster EMA for bandit and full/none reheat
-                        let ema = rng.random_range(0.25_f64..=0.40);
-                        let reheat = if rng.random_bool(0.5) { 1.0 } else { 0.0 };
-                        let big_m = [1_000_000_000_i64, 1_250_000_000, 1_500_000_000]
-                            .choose(rng)
-                            .copied()
-                            .unwrap_or(1_250_000_000);
-
-                        let mut s = sa::sa_strategy::<Tnum, ChaCha8Rng>(model)
-                            .with_init_temp(init_t)
-                            .with_cooling(cooling)
-                            .with_steps_per_temp(steps)
-                            .with_acceptance_targets(low, high)
-                            .with_op_ema_alpha(ema)
-                            .with_reheat_factor(reheat) // 0.0 or 1.0
-                            .with_big_m_for_energy(big_m);
-
-                        // Mostly rely on stale-refetch + reheat
-                        if rng.random_bool(0.25) {
-                            s = s.with_hard_refetch_every(rng.random_range(14..=36));
-                        }
-                        if rng.random_bool(0.75) {
-                            s = s.with_refetch_after_stale(rng.random_range(48..=120));
-                        }
-
-                        Box::new(s)
-                    }
-
-                    Kind::Gls => {
-                        // Stronger penalty guidance with earlier pulses
-                        let lambda = [7_i64, 8, 9, 10].choose(rng).copied().unwrap_or(8);
-                        let step = [2_i64, 3].choose(rng).copied().unwrap_or(2);
-                        let max_steps = rng.random_range(1600..=2400);
-                        let top_k = rng.random_range(18..=28);
-                        let stagnation = rng.random_range(6..=12);
-                        let decay = gls::DecayMode::Multiplicative {
-                            num: rng.random_range(90u32..=95),
-                            den: 100,
-                        };
-                        let restart_on_publish = rng.random_bool(0.9);
-                        let reset_on_refetch = rng.random_bool(0.95);
-                        let kick = rng.random_range(5..=9);
-
-                        let mut s = gls::gls_strategy::<Tnum, ChaCha8Rng>(model)
-                            .with_lambda(lambda)
-                            .with_penalty_step(step)
-                            .with_max_local_steps(max_steps)
-                            .with_decay(decay)
-                            .with_restart_on_publish(restart_on_publish)
-                            .with_reset_on_refetch(reset_on_refetch)
-                            .with_kick_steps_on_reset(kick)
-                            .with_max_penalty(1_000_000_000)
-                            .with_pulse_params(stagnation, top_k);
-
-                        // Let it wander; periodic refetch occasionally
-                        if rng.random_bool(0.30) {
-                            s = s.with_hard_refetch_every(rng.random_range(12..=36));
-                        }
-                        if rng.random_bool(0.75) {
-                            s = s.with_refetch_after_stale(rng.random_range(60..=140));
-                        }
-
-                        Box::new(s)
-                    }
-                }
-            }
-
-            // Start with guaranteed coverage (one of each, up to n).
-            let mut kinds: Vec<Kind> = Vec::with_capacity(n);
-            let all = [Kind::Ils, Kind::Tabu, Kind::Sa, Kind::Gls];
-            for k in all.into_iter().take(n) {
-                kinds.push(k);
-            }
-
-            // Fill remaining slots from a weighted bag, then shuffle.
-            let weights = &[
-                (Kind::Ils, 2usize),
-                (Kind::Tabu, 1usize),
-                (Kind::Sa, 4usize),
-                (Kind::Gls, 2usize),
-            ];
-            let mut bag: Vec<Kind> = Vec::new();
-            for (k, w) in weights {
-                for _ in 0..*w {
-                    bag.push(*k);
-                }
-            }
-
-            // Use a deterministic per-run RNG for portfolio construction
-            let mut pf_rng = rand::rng();
-            while kinds.len() < n {
-                if let Some(&k) = bag.choose(&mut pf_rng) {
-                    kinds.push(k);
-                } else {
-                    kinds.push(Kind::Ils);
-                }
-            }
-            kinds.shuffle(&mut pf_rng);
-
-            // Materialize diversified strategies with randomized settings.
-            // Each worker gets its own seed; we derive a sub-seed for the “variant maker”
-            // so that creation-time randomization is also independent per worker.
-            let mut variant_seed_rng = rand::rng();
-            for _ in 0..kinds.len() {
-                // Derive a seed to randomize the strategy's internal knobs
-                let seed = variant_seed_rng.next_u64();
-                let mut knob_rng = ChaCha8Rng::seed_from_u64(seed);
-                let k = kinds[self.strategies.len()];
-                self.strategies
-                    .push(make_one_variant(k, &model, &mut knob_rng));
-            }
-        }
-
         let deadline = Instant::now() + self.config.time_limit;
         let stop = AtomicBool::new(false);
 
+        // If the caller didn't provide strategies, synthesize a diversified portfolio sized to workers.
         let mut strategies = std::mem::take(&mut self.strategies);
+        if strategies.is_empty() {
+            let mut seed_picker = rand::rng();
+            strategies = Self::diversified_strategies(
+                &model,
+                self.config.num_workers.max(1),
+                &mut seed_picker,
+            );
+        }
 
         let inc_ref = &shared_incumbent;
         let stop_ref = &stop;
@@ -608,5 +592,17 @@ mod tests {
             Ok(None) => { /* infeasible incumbent stays infeasible */ }
             other => panic!("expected Ok(None), got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_diversified_when_none_provided() {
+        let prob = problem_feasible_two_flex();
+        let mut engine = SolverEngineBuilder::<i64>::new()
+            .with_worker_count(6)
+            .with_time_limit(std::time::Duration::from_millis(10))
+            .build();
+
+        // should not panic and should run with synthesized strategies
+        let _ = engine.solve(&prob).unwrap();
     }
 }

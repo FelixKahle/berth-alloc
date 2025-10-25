@@ -19,6 +19,7 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+use crate::state::fitness::Fitness;
 use crate::state::solver_state::SolverStateView;
 use crate::state::terminal::terminalocc::TerminalWrite;
 use crate::{
@@ -153,7 +154,7 @@ impl<'pb, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>>
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
         self.cost_evaluator
-            .eval(self.model(), request, start_time, berth_index)
+            .eval_request(self.model(), request, start_time, berth_index)
     }
 }
 
@@ -234,7 +235,7 @@ impl<'b, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> PlanBuilder<'b, 'c,
 
             let old_cost = self
                 .cost_evaluator
-                .eval(self.solver_model, request, old.start_time, old.berth_index)
+                .eval_request(self.solver_model, request, old.start_time, old.berth_index)
                 .ok_or_else(|| {
                     ProposeAssignmentError::NotAllowedOnBerth(NotAllowedOnBerthError::new(
                         request,
@@ -251,7 +252,7 @@ impl<'b, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> PlanBuilder<'b, 'c,
 
         let cost = self
             .cost_evaluator
-            .eval(
+            .eval_request(
                 self.solver_model,
                 request,
                 start_time,
@@ -335,7 +336,7 @@ impl<'b, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> PlanBuilder<'b, 'c,
 
         let cost = self
             .cost_evaluator
-            .eval(self.solver_model, request, dv.start_time, dv.berth_index)
+            .eval_request(self.solver_model, request, dv.start_time, dv.berth_index)
             .ok_or_else(|| {
                 ProposeUnassignmentError::NotAllowedOnBerth(NotAllowedOnBerthError::new(
                     request,
@@ -388,7 +389,7 @@ impl<'b, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> PlanBuilder<'b, 'c,
     where
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
-        self.cost_evaluator.eval(
+        self.cost_evaluator.eval_request(
             self.solver_model,
             request,
             start_time,
@@ -413,7 +414,7 @@ impl<'b, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> PlanBuilder<'b, 'c,
                     berth_index,
                     start_time,
                 }) => {
-                    let c = self.cost_evaluator.eval(
+                    let c = self.cost_evaluator.eval_request(
                         self.solver_model,
                         RequestIndex::new(i),
                         start_time,
@@ -444,13 +445,37 @@ impl<'b, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> PlanBuilder<'b, 'c,
 }
 
 pub trait CostEvaluator<T: Copy + Ord> {
-    fn eval<'m>(
+    fn eval_request<'m>(
         &self,
         model: &SolverModel<'m, T>,
         request: RequestIndex,
         start_time: TimePoint<T>,
         berth_index: BerthIndex,
     ) -> Option<Cost>;
+
+    fn eval_decision<'m>(
+        &self,
+        model: &SolverModel<'m, T>,
+        request: RequestIndex,
+        decision: &Decision<T>,
+    ) -> Option<Cost> {
+        self.eval_request(model, request, decision.start_time, decision.berth_index)
+    }
+
+    #[inline]
+    fn eval_fitness<'m>(&self, model: &SolverModel<'m, T>, vars: &[DecisionVar<T>]) -> Fitness {
+        vars.iter()
+            .enumerate()
+            .fold(Fitness::new(Cost::zero(), 0), |mut fitness, (i, d)| {
+                match d {
+                    DecisionVar::Unassigned => fitness.unassigned_requests += 1,
+                    DecisionVar::Assigned(v) => {
+                        fitness.cost += self.eval_decision(model, RequestIndex::new(i), v).unwrap()
+                    }
+                }
+                fitness
+            })
+    }
 }
 
 pub struct DefaultCostEvaluator;
@@ -459,7 +484,7 @@ where
     T: Copy + Ord + CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
 {
     #[inline]
-    fn eval<'m>(
+    fn eval_request<'m>(
         &self,
         model: &SolverModel<'m, T>,
         request: RequestIndex,
@@ -826,5 +851,62 @@ mod tests {
 
         assert_eq!(pb.delta_unassigned(), 0);
         assert_eq!(pb.delta_cost(), 0);
+    }
+
+    #[test]
+    fn test_eval_fitness_all_unassigned() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+
+        let vars = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let fit = DefaultCostEvaluator.eval_fitness(&model, &vars);
+
+        assert_eq!(fit.unassigned_requests, model.flexible_requests_len());
+        assert_eq!(fit.cost, 0);
+    }
+
+    #[test]
+    fn test_eval_fitness_one_assigned_one_unassigned() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+
+        let r1 = model.index_manager().request_index(rid(1)).unwrap();
+        let b1 = model.index_manager().berth_index(bid(1)).unwrap();
+
+        let mut vars = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        // Valid assignment: start at arrival time 0 on the only allowed berth
+        vars[r1.get()] = DecisionVar::assigned(b1, tp(0));
+
+        let expected_cost = model
+            .cost_of_assignment(r1, b1, tp(0))
+            .expect("valid assignment must have a cost");
+
+        let fit = DefaultCostEvaluator.eval_fitness(&model, &vars);
+
+        assert_eq!(fit.unassigned_requests, model.flexible_requests_len() - 1);
+        assert_eq!(fit.cost, expected_cost);
+    }
+
+    #[test]
+    fn test_eval_fitness_all_assigned_sums_costs() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+
+        let r1 = model.index_manager().request_index(rid(1)).unwrap();
+        let r2 = model.index_manager().request_index(rid(2)).unwrap();
+        let b1 = model.index_manager().berth_index(bid(1)).unwrap();
+
+        // Both requests are feasible on berth 1 starting at time 0 in this problem setup
+        let mut vars = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        vars[r1.get()] = DecisionVar::assigned(b1, tp(0));
+        vars[r2.get()] = DecisionVar::assigned(b1, tp(0));
+
+        let expected_cost = model.cost_of_assignment(r1, b1, tp(0)).unwrap()
+            + model.cost_of_assignment(r2, b1, tp(0)).unwrap();
+
+        let fit = DefaultCostEvaluator.eval_fitness(&model, &vars);
+
+        assert_eq!(fit.unassigned_requests, 0);
+        assert_eq!(fit.cost, expected_cost);
     }
 }

@@ -19,11 +19,4 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod math;
-pub mod primitives;
-pub mod utils;
-
-pub mod prelude {
-    pub use crate::primitives::*;
-    pub use crate::utils::*;
-}
+pub mod emwa;

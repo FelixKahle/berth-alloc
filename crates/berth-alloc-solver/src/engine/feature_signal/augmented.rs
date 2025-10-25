@@ -70,14 +70,16 @@ where
     B: CostEvaluator<Tnum>,
     FX: FeatureExtractor<Tnum>,
 {
-    fn eval<'m>(
+    fn eval_request<'m>(
         &self,
         model: &SolverModel<'m, Tnum>,
         request: RequestIndex,
         start_time: TimePoint<Tnum>,
         berth_index: BerthIndex,
     ) -> Option<Cost> {
-        let base = self.base.eval(model, request, start_time, berth_index)?;
+        let base = self
+            .base
+            .eval_request(model, request, start_time, berth_index)?;
         let mut buf: SmallVec<[super::features::Feature; 6]> = SmallVec::new();
         self.feats
             .features_for(request, berth_index, start_time, &mut buf);
@@ -286,7 +288,7 @@ mod tests {
         assert_eq!(base, 5, "sanity: base cost");
 
         let aug = eval
-            .eval(&model, r_ix, t0, b_ix)
+            .eval_request(&model, r_ix, t0, b_ix)
             .expect("augmented eval must be Some");
         // base(5) + lambda(10) * sum(5) = 55
         assert_eq!(aug, 55);
@@ -358,7 +360,7 @@ mod tests {
         assert_eq!(base, 10, "sanity: base cost");
 
         let aug = eval
-            .eval(&model, r_ix, t0, b_ix)
+            .eval_request(&model, r_ix, t0, b_ix)
             .expect("augmented eval must be Some");
         // base(10) + lambda(3)*penalty(5) = 25
         assert_eq!(aug, 25);

@@ -671,10 +671,18 @@ where
             let iv_b_to_a = TimeInterval::new(sa, sa + ptb);
 
             // quick sanity: both targets allowed per evaluator
-            if context.cost_evaluator().eval(model, ra, sb, bi_b).is_none() {
+            if context
+                .cost_evaluator()
+                .eval_request(model, ra, sb, bi_b)
+                .is_none()
+            {
                 continue;
             }
-            if context.cost_evaluator().eval(model, rb, sa, bi_a).is_none() {
+            if context
+                .cost_evaluator()
+                .eval_request(model, rb, sa, bi_a)
+                .is_none()
+            {
                 continue;
             }
 
@@ -1553,13 +1561,14 @@ where
                         let iv = free.interval();
                         let s = iv.start();
                         if s + pt <= iv.end()
-                            && let Some(c) = ex.peek_cost(ra, s, bi_b) {
-                                match best {
-                                    None => best = Some((free, s, c)),
-                                    Some((_, _, bc)) if c < bc => best = Some((free, s, c)),
-                                    _ => {}
-                                }
+                            && let Some(c) = ex.peek_cost(ra, s, bi_b)
+                        {
+                            match best {
+                                None => best = Some((free, s, c)),
+                                Some((_, _, bc)) if c < bc => best = Some((free, s, c)),
+                                _ => {}
                             }
+                        }
                     }
                 }
                 best
@@ -1584,13 +1593,14 @@ where
                         let iv = free.interval();
                         let s = iv.start();
                         if s + pt <= iv.end()
-                            && let Some(c) = ex.peek_cost(rb, s, bi_a) {
-                                match best {
-                                    None => best = Some((free, s, c)),
-                                    Some((_, _, bc)) if c < bc => best = Some((free, s, c)),
-                                    _ => {}
-                                }
+                            && let Some(c) = ex.peek_cost(rb, s, bi_a)
+                        {
+                            match best {
+                                None => best = Some((free, s, c)),
+                                Some((_, _, bc)) if c < bc => best = Some((free, s, c)),
+                                _ => {}
                             }
+                        }
                     }
                 }
                 best
@@ -1715,9 +1725,10 @@ where
                         let iv = free.interval();
                         let s = iv.start();
                         if s + pt <= iv.end()
-                            && let Some(c) = ex.peek_cost(ri, s, b) {
-                                v.push((free, s, c));
-                            }
+                            && let Some(c) = ex.peek_cost(ri, s, b)
+                        {
+                            v.push((free, s, c));
+                        }
                     }
                 }
                 v
@@ -1739,6 +1750,370 @@ where
                 continue;
             }
             return Some(bld.finalize());
+        }
+
+        None
+    }
+}
+
+#[derive(Clone)]
+pub enum CascadeInsertPolicy {
+    /// Always pick the best earliest-feasible placement by base cost.
+    BestEarliest,
+    /// Randomized candidate via RCL over earliest-feasible placements.
+    Rcl {
+        alpha_range: std::ops::RangeInclusive<f64>,
+    },
+}
+
+#[derive(Clone)]
+pub struct CascadeRelocateK {
+    /// Chain length K to try per proposal (sampled per call).
+    pub chain_len_range: std::ops::RangeInclusive<usize>,
+    /// How many seeds to consider per call (upper bound).
+    pub seeds_to_try_range: std::ops::RangeInclusive<usize>,
+    /// Max candidates to consider per step (neighbors of last moved ⇒ fallback full).
+    pub candidates_per_step_range: std::ops::RangeInclusive<usize>,
+    /// Locality restriction.
+    pub neighbor_callback: Option<std::sync::Arc<crate::search::operator::NeighborFn>>,
+    /// How to choose the target placement of each moved request.
+    pub insert_policy: CascadeInsertPolicy,
+    /// Per-step acceptance: require non-worsening at every step?
+    pub monotone_steps: bool,
+    /// If monotone=false, still forbid *huge* step regressions (ε guard).
+    pub max_single_step_worsening: berth_alloc_core::prelude::Cost,
+}
+
+impl CascadeRelocateK {
+    pub fn new(
+        chain_len_range: std::ops::RangeInclusive<usize>,
+        seeds_to_try_range: std::ops::RangeInclusive<usize>,
+        candidates_per_step_range: std::ops::RangeInclusive<usize>,
+    ) -> Self {
+        assert!(!chain_len_range.is_empty());
+        assert!(!seeds_to_try_range.is_empty());
+        assert!(!candidates_per_step_range.is_empty());
+        Self {
+            chain_len_range,
+            seeds_to_try_range,
+            candidates_per_step_range,
+            neighbor_callback: None,
+            insert_policy: CascadeInsertPolicy::BestEarliest,
+            monotone_steps: true,
+            max_single_step_worsening: 0, // ignored if monotone=true
+        }
+    }
+    pub fn with_neighbors(
+        mut self,
+        cb: std::sync::Arc<crate::search::operator::NeighborFn>,
+    ) -> Self {
+        self.neighbor_callback = Some(cb);
+        self
+    }
+    pub fn with_insert_policy(mut self, p: CascadeInsertPolicy) -> Self {
+        self.insert_policy = p;
+        self
+    }
+    pub fn allow_step_worsening(mut self, epsilon_cost: berth_alloc_core::prelude::Cost) -> Self {
+        self.monotone_steps = false;
+        self.max_single_step_worsening = epsilon_cost.max(0);
+        self
+    }
+}
+
+impl<T, C, R> crate::search::operator::LocalMoveOperator<T, C, R> for CascadeRelocateK
+where
+    T: Copy
+        + Ord
+        + num_traits::CheckedAdd
+        + num_traits::CheckedSub
+        + Into<berth_alloc_core::prelude::Cost>
+        + std::ops::Mul<Output = berth_alloc_core::prelude::Cost>,
+    C: crate::search::planner::CostEvaluator<T>,
+    R: rand::Rng,
+{
+    fn name(&self) -> &str {
+        "CascadeRelocateK"
+    }
+
+    fn propose<'b, 'c, 's, 'm, 'p>(
+        &self,
+        context: &mut crate::search::planner::PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
+        rng: &mut R,
+    ) -> Option<crate::state::plan::Plan<'p, T>> {
+        let model = context.model();
+        let seed_builder = context.builder();
+
+        // -------------- collect assigned requests --------------
+        let assigned: Vec<(RequestIndex, ())> = seed_builder.with_explorer(|ex| {
+            ex.decision_vars()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, dv)| {
+                    if let DecisionVar::Assigned(Decision { .. }) = *dv {
+                        Some((RequestIndex::new(i), ()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        });
+        if assigned.is_empty() {
+            return None;
+        }
+
+        // -------------- seeds to try this call --------------
+        let seeds_to_try = {
+            let lo = *self.seeds_to_try_range.start();
+            let hi = *self.seeds_to_try_range.end();
+            if lo == hi {
+                lo
+            } else {
+                rng.random_range(lo..=hi)
+            }
+        }
+        .min(assigned.len())
+        .max(1);
+
+        // helper: enumerate earliest-feasible placements for a req
+        let enumerate_options =
+            |bld: &mut crate::search::planner::PlanBuilder<'_, 'c, 's, 'm, 'p, T, C>,
+             ri: RequestIndex|
+             -> Vec<(FreeBerth<T>, TimePoint<T>, Cost)> {
+                bld.with_explorer(|ex| {
+                    let mut v: Vec<(FreeBerth<T>, TimePoint<T>, Cost)> = Vec::new();
+                    for free in ex.iter_free_for(ri) {
+                        let b = free.berth_index();
+                        if let Some(pt) = model.processing_time(ri, b) {
+                            let iv = free.interval();
+                            let s = iv.start();
+                            if s + pt <= iv.end() {
+                                if let Some(c) = ex.peek_cost(ri, s, b) {
+                                    v.push((free, s, c));
+                                }
+                            }
+                        }
+                    }
+                    v
+                })
+            };
+
+        // -------------- try up to N seeds --------------
+        let mut seeds_pool = assigned.clone();
+        seeds_pool.shuffle(rng);
+        seeds_pool.truncate(seeds_to_try);
+
+        for (seed_ri, _) in seeds_pool {
+            // fresh builder per seed
+            let mut bld = context.builder();
+            if bld.peek_fitness().is_none() {
+                continue;
+            }
+
+            // draw K for this attempt
+            let k = {
+                let lo = *self.chain_len_range.start();
+                let hi = *self.chain_len_range.end();
+                if lo == hi {
+                    lo
+                } else {
+                    rng.random_range(lo..=hi)
+                }
+            }
+            .max(2);
+
+            // we’ll build a small candidate frontier: start with the seed
+            let mut frontier: Vec<RequestIndex> = vec![seed_ri];
+            let mut moved: Vec<RequestIndex> = Vec::with_capacity(k);
+
+            // chain the relocations
+            for _ in 0..k {
+                // pick a source to move: prefer last moved’s neighbors else fallback to all assigned
+                let source_pool: Vec<RequestIndex> = {
+                    let seed_list: Vec<(RequestIndex, ())> = bld.with_explorer(|ex| {
+                        ex.decision_vars()
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, dv)| {
+                                if let DecisionVar::Assigned(Decision { .. }) = *dv {
+                                    Some((RequestIndex::new(i), ()))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    });
+                    let mut pool: Vec<(RequestIndex, ())> = seed_list.clone();
+                    if let Some(cb) = &self.neighbor_callback {
+                        if let Some(&anchor) = frontier.last() {
+                            let mut set = std::collections::HashSet::new();
+                            set.insert(anchor.get());
+                            for n in cb(anchor) {
+                                set.insert(n.get());
+                            }
+                            let filtered: Vec<_> = seed_list
+                                .into_iter()
+                                .filter(|(ri, _)| set.contains(&ri.get()))
+                                .collect();
+                            if !filtered.is_empty() {
+                                pool = filtered;
+                            }
+                        }
+                    }
+                    // cap candidates per step
+                    let max_c = {
+                        let lo = *self.candidates_per_step_range.start();
+                        let hi = *self.candidates_per_step_range.end();
+                        if lo == hi {
+                            lo
+                        } else {
+                            rng.random_range(lo..=hi)
+                        }
+                    }
+                    .max(1);
+                    let mut v: Vec<RequestIndex> = pool.into_iter().map(|(ri, _)| ri).collect();
+                    v.shuffle(rng);
+                    v.truncate(max_c.min(v.len()));
+                    v
+                };
+
+                // choose the first source that can be feasibly reinserted
+                let mut did_step = false;
+                for src in source_pool {
+                    // Don’t move same request twice in one chain (cheap guard)
+                    if moved.contains(&src) {
+                        continue;
+                    }
+
+                    // enumerate options on the *current* builder
+                    let mut opts = enumerate_options(&mut bld, src);
+                    if opts.is_empty() {
+                        continue;
+                    }
+
+                    // choose insertion
+                    let (fb, s, _cand_cost) = match self.insert_policy {
+                        CascadeInsertPolicy::BestEarliest => {
+                            opts.sort_by_key(|(_, _, c)| *c);
+                            opts[0].clone()
+                        }
+                        CascadeInsertPolicy::Rcl { ref alpha_range } => {
+                            opts.sort_by_key(|(_, _, c)| *c);
+                            let a_lo = *alpha_range.start();
+                            let a_hi = *alpha_range.end();
+                            let alpha = if (a_lo - a_hi).abs() < f64::EPSILON {
+                                a_lo
+                            } else {
+                                rng.random_range(a_lo..=a_hi)
+                            };
+                            let idx = rcl_index(opts.len(), alpha, rng);
+                            opts[idx].clone()
+                        }
+                    };
+
+                    // compute step delta (peek fitness before/after)
+                    let before = match bld.peek_fitness() {
+                        Some(f) => f,
+                        None => break,
+                    };
+                    let _ = bld.propose_unassignment(src).ok()?;
+                    if bld.propose_assignment(src, s, &fb).is_err() {
+                        // Revert to the path state by rebuilding and replaying the moved chain.
+                        bld = context.builder();
+                        for &ri_m in &moved {
+                            let mut rep_opts = enumerate_options(&mut bld, ri_m);
+                            if rep_opts.is_empty() {
+                                break;
+                            }
+                            rep_opts.sort_by_key(|(_, _, c)| *c);
+                            let (rfb, rs, _) = rep_opts[0].clone();
+                            let _ = bld.propose_unassignment(ri_m);
+                            let _ = bld.propose_assignment(ri_m, rs, &rfb);
+                        }
+                        continue;
+                    }
+                    // step guard
+                    if self.monotone_steps {
+                        if let Some(after) = bld.peek_fitness() {
+                            if after >= before {
+                                // undo by discarding this attempt path: rebuild small builder
+                                bld = context.builder();
+                                // reapply already moved requests deterministically (best earliest again)
+                                for &ri_m in &moved {
+                                    let mut rep_opts = enumerate_options(&mut bld, ri_m);
+                                    if rep_opts.is_empty() {
+                                        break;
+                                    }
+                                    rep_opts.sort_by_key(|(_, _, c)| *c);
+                                    let (rfb, rs, _) = rep_opts[0].clone();
+                                    let _ = bld.propose_unassignment(ri_m);
+                                    let _ = bld.propose_assignment(ri_m, rs, &rfb);
+                                }
+                                continue;
+                            }
+                        } else {
+                            // cannot evaluate → abandon this src
+                            bld = context.builder();
+                            for &ri_m in &moved {
+                                let mut rep_opts = enumerate_options(&mut bld, ri_m);
+                                if rep_opts.is_empty() {
+                                    break;
+                                }
+                                rep_opts.sort_by_key(|(_, _, c)| *c);
+                                let (rfb, rs, _) = rep_opts[0].clone();
+                                let _ = bld.propose_unassignment(ri_m);
+                                let _ = bld.propose_assignment(ri_m, rs, &rfb);
+                            }
+                            continue;
+                        }
+                    } else {
+                        // allow small worsening per step
+                        if let (Some(after), Some(before)) = (bld.peek_fitness(), Some(before)) {
+                            if after.cost > before.cost + self.max_single_step_worsening {
+                                // revert path like above
+                                bld = context.builder();
+                                for &ri_m in &moved {
+                                    let mut rep_opts = enumerate_options(&mut bld, ri_m);
+                                    if rep_opts.is_empty() {
+                                        break;
+                                    }
+                                    rep_opts.sort_by_key(|(_, _, c)| *c);
+                                    let (rfb, rs, _) = rep_opts[0].clone();
+                                    let _ = bld.propose_unassignment(ri_m);
+                                    let _ = bld.propose_assignment(ri_m, rs, &rfb);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
+                    // commit this step
+                    moved.push(src);
+                    frontier.push(src);
+                    did_step = true;
+                    break;
+                }
+
+                if !did_step {
+                    break; // chain stuck; stop early
+                }
+            }
+
+            // finalize only if we actually changed at least 2 requests (≥4 patches)
+            if !bld.has_changes() {
+                continue;
+            }
+            if moved.len() < 2 {
+                continue;
+            }
+            if bld.peek_fitness().is_none() {
+                continue;
+            }
+
+            let plan = bld.finalize();
+            if plan.decision_var_patches.len() >= 2 * moved.len() {
+                return Some(plan);
+            }
         }
 
         None
@@ -2105,6 +2480,59 @@ mod tests {
         };
 
         if let Some(plan) = op.propose(&mut ctx, &mut rand::rngs::StdRng::seed_from_u64(9)) {
+            state.apply_plan(plan);
+            assert!(
+                state
+                    .decision_variables()
+                    .iter()
+                    .filter(|dv| dv.is_assigned())
+                    .count()
+                    > 0
+            );
+        }
+    }
+
+    #[test]
+    fn test_cascade_relocate_k_bestearliest_executes_with_neighbors() {
+        let prob = make_problem();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        // Two requests, both on single berth
+        let mut state = make_state_with_assignments(&model, &[(1, 10), (2, 20)]);
+        let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut ctx = make_ctx(&model, &state, &mut buffer);
+
+        let op = CascadeRelocateK::new(2..=2, 2..=2, 2..=2).with_neighbors(Arc::new(neighbor_pm1));
+
+        if let Some(plan) = op.propose(&mut ctx, &mut rand::rngs::StdRng::seed_from_u64(10)) {
+            state.apply_plan(plan);
+            // remain with assigned jobs and a feasible state
+            assert!(
+                state
+                    .decision_variables()
+                    .iter()
+                    .filter(|dv| dv.is_assigned())
+                    .count()
+                    > 0
+            );
+        }
+    }
+
+    #[test]
+    fn test_cascade_relocate_k_rcl_allow_worsening_executes() {
+        let prob = make_problem();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let mut state = make_state_with_assignments(&model, &[(1, 10), (2, 20)]);
+        let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut ctx = make_ctx(&model, &state, &mut buffer);
+
+        let op = CascadeRelocateK::new(2..=2, 2..=2, 2..=2)
+            .with_neighbors(Arc::new(neighbor_pm1))
+            .with_insert_policy(CascadeInsertPolicy::Rcl {
+                alpha_range: 1.3..=1.3,
+            })
+            .allow_step_worsening(1000);
+
+        if let Some(plan) = op.propose(&mut ctx, &mut rand::rngs::StdRng::seed_from_u64(11)) {
             state.apply_plan(plan);
             assert!(
                 state

@@ -21,7 +21,7 @@
 
 use berth_alloc_core::prelude::Cost;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Fitness {
     pub cost: Cost,
     pub unassigned_requests: usize,
