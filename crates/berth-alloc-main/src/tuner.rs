@@ -222,13 +222,13 @@ impl<P: Clone + Serialize> Archive<P> {
         (new_best, improved_top)
     }
     fn good_pool(&self) -> &[Scored<P>] {
-        if self.top.is_empty() {
-            return &self.top;
+        let len = self.top.len();
+        if len == 0 {
+            return &self.top; // coerces to &[Scored<P>]
         }
-        let q = ((self.top.len() as f64) * 0.2).ceil() as usize;
-        let k = self.top.len().max(4);
-        let upto = q.max(4).min(k);
-        &self.top[0..upto]
+        let q = ((len as f64) * 0.2).ceil() as usize; // top 20%
+        let upto = std::cmp::min(len, std::cmp::max(4, q)); // never exceed len
+        &self.top[..upto]
     }
     fn exploit_weighted_pick<'a>(&'a self, rng: &mut ChaCha8Rng) -> Option<&'a Scored<P>> {
         let pool = self.good_pool();
@@ -662,7 +662,7 @@ fn worker_loop<P, Bldr>(
     let tid: u64 = rand::random::<u64>();
     let mut rng = ChaCha8Rng::seed_from_u64(tid ^ 0xBADC0FFE_u64);
     loop {
-        let params = {
+        let (params, used_mode) = {
             let arc = shared.archive.lock();
             let mode = arc.choose_mode(&mut rng);
             let candidate = match mode {
@@ -675,8 +675,7 @@ fn worker_loop<P, Bldr>(
                     }
                 }
             };
-            drop(arc);
-            candidate
+            (candidate, mode)
         };
 
         let model = match SolverModel::from_problem(&problem) {
@@ -731,9 +730,7 @@ fn worker_loop<P, Bldr>(
             let (is_best, _improved_top) = {
                 let mut arc = shared.archive.lock();
                 let (b, t) = arc.register(scored.clone());
-                // reward by new global best (simple streaming signal)
-                let mode_now = arc.choose_mode(&mut rng);
-                arc.reward(mode_now, b);
+                arc.reward(used_mode, b); // reward the actual mode used
                 (b, t)
             };
             new_best = is_best;
@@ -763,9 +760,8 @@ fn worker_loop<P, Bldr>(
     }
 }
 
-// ---------- main ----------
-fn main() -> AppResult<()> {
-    // tracing
+#[allow(dead_code)]
+fn setup_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -774,7 +770,12 @@ fn main() -> AppResult<()> {
         .with_target(false)
         .compact()
         .init();
+}
 
+// ---------- main ----------
+fn main() -> AppResult<()> {
+    // tracing
+    //setup_tracing();
     ensure_dir(Path::new("tuning"))?;
 
     // load one instance (as requested)
