@@ -1,23 +1,32 @@
+// Copyright (c) 2025 Felix Kahle.
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+//
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 //! Tuner: saturates CPU with many parallel tuners (one engine per thread, one strategy per engine).
 //! - 20s time limit per trial, runs forever until you Ctrl-C.
 //! - Wide param spaces for GLS / ILS / SA.
 //! - Online archive per strategy: TPE-like exploit (mutate good configs) vs. explore (new samples),
 //!   with Thompson sampling to choose mode.
 //! - Writes JSONL trial logs + rolling best.json per strategy.
-//!
-//! Add to Cargo.toml if missing:
-//! [dependencies]
-//! rand = "0.8"
-//! rand_chacha = "0.3"
-//! rand_distr = "0.4"
-//! serde = { version = "1", features = ["derive"] }
-//! serde_json = "1"
-//! chrono = { version = "0.4", features = ["serde"] }
-//! parking_lot = "0.12"
-//! once_cell = "1"
-//! ctrlc = "3"
-//! tracing = "0.1"
-//! tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+//! - No refetch tuning (single-worker focus). GLS still uses restart-on-publish so
+//!   we can apply kicks on reset.
 
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
@@ -305,7 +314,7 @@ fn pick_f64(rng: &mut ChaCha8Rng, lo: f64, hi: f64) -> f64 {
     rng.random_range(lo..=hi)
 }
 
-// ---- GLS params ----
+// ---- GLS params (no refetch knobs; kicks sampled) ----
 #[derive(Clone, Serialize, Deserialize)]
 struct GlsParams {
     lambda: i64,
@@ -315,12 +324,11 @@ struct GlsParams {
     stagn_pulse: usize,
     pulse_top_k: usize,
     max_local_steps: usize,
-    refetch_after_stale: usize,
-    hard_refetch_every: usize,
-    kicks_on_reset: usize,
     tgt_pen_low: f64,
     tgt_pen_high: f64,
     lambda_step_frac: f64,
+    // kicks applied on reset (we trigger resets via restart-on-publish)
+    kicks_on_reset: usize,
 }
 impl ParamSpace for GlsParams {
     fn sample_new(rng: &mut ChaCha8Rng) -> Self {
@@ -342,12 +350,10 @@ impl ParamSpace for GlsParams {
             stagn_pulse: pick_usize(rng, 4, 24),
             pulse_top_k: pick_usize(rng, 8, 64),
             max_local_steps: pick_usize(rng, 800, 4000),
-            refetch_after_stale: pick_usize(rng, 0, 80),
-            hard_refetch_every: pick_usize(rng, 8, 64),
-            kicks_on_reset: pick_usize(rng, 0, 24),
             tgt_pen_low: low,
             tgt_pen_high: high,
             lambda_step_frac: pick_f64(rng, 0.02, 0.15),
+            kicks_on_reset: pick_usize(rng, 0, 24),
         }
     }
     fn mutate(&self, rng: &mut ChaCha8Rng) -> Self {
@@ -359,13 +365,11 @@ impl ParamSpace for GlsParams {
         p.stagn_pulse = jitter_usize(rng, p.stagn_pulse, 0.50, 3, 64);
         p.pulse_top_k = jitter_usize(rng, p.pulse_top_k, 0.40, 6, 96);
         p.max_local_steps = jitter_usize(rng, p.max_local_steps, 0.40, 400, 6000);
-        p.refetch_after_stale = jitter_usize(rng, p.refetch_after_stale, 0.60, 0, 120);
-        p.hard_refetch_every = jitter_usize(rng, p.hard_refetch_every, 0.60, 4, 120);
-        p.kicks_on_reset = jitter_usize(rng, p.kicks_on_reset, 0.60, 0, 32);
         p.tgt_pen_low = jitter_f64(rng, p.tgt_pen_low, 0.40, 0.0, 0.9);
         p.tgt_pen_high = (jitter_f64(rng, p.tgt_pen_high, 0.40, 0.0, 0.98))
             .max((p.tgt_pen_low + 0.02).min(0.98));
         p.lambda_step_frac = jitter_f64(rng, p.lambda_step_frac, 0.40, 0.01, 0.25);
+        p.kicks_on_reset = jitter_usize(rng, p.kicks_on_reset, 0.60, 0, 32);
         p
     }
 }
@@ -383,11 +387,8 @@ fn build_gls<'p>(
         })
         .with_pulse_params(params.stagn_pulse, params.pulse_top_k)
         .with_max_local_steps(params.max_local_steps)
-        .with_refetch_after_stale(params.refetch_after_stale)
-        .with_hard_refetch_every(params.hard_refetch_every)
-        .with_hard_refetch_mode(gls::HardRefetchMode::IfBetter)
+        // enable resets without refetch so kicks can apply
         .with_restart_on_publish(true)
-        .with_reset_on_refetch(true)
         .with_kick_steps_on_reset(params.kicks_on_reset)
         .with_adaptive_lambda(true)
         .with_target_penalty_share(params.tgt_pen_low, params.tgt_pen_high)
@@ -396,7 +397,7 @@ fn build_gls<'p>(
     Box::new(s)
 }
 
-// ---- ILS params ----
+// ---- ILS params (no refetch knobs; no kicks unless you add a non-refetch hook) ----
 #[derive(Clone, Serialize, Deserialize)]
 struct IlsParams {
     local_lo: usize,
@@ -405,9 +406,6 @@ struct IlsParams {
     worsen_prob: f64,
     destroy_attempts: usize,
     repair_attempts: usize,
-    refetch_after_stale: usize,
-    hard_refetch_every: usize,
-    kicks_after_refetch: usize,
     ewma_beta: f64,
     sr_low: f64,
     sr_high: f64,
@@ -428,9 +426,6 @@ impl ParamSpace for IlsParams {
             worsen_prob: pick_f64(rng, 0.0, 0.05),
             destroy_attempts: pick_usize(rng, 6, 24),
             repair_attempts: pick_usize(rng, 12, 48),
-            refetch_after_stale: pick_usize(rng, 24, 80),
-            hard_refetch_every: pick_usize(rng, 8, 40),
-            kicks_after_refetch: pick_usize(rng, 2, 16),
             ewma_beta: pick_f64(rng, 0.20, 0.60),
             sr_low,
             sr_high,
@@ -443,27 +438,20 @@ impl ParamSpace for IlsParams {
         let mut p = self.clone();
         p.local_lo = jitter_usize(rng, p.local_lo, 0.40, 200, 4000);
         p.local_hi = jitter_usize(rng, p.local_hi, 0.40, p.local_lo + 50, 5000);
-        p.sideways = if rng.random_bool(0.15) {
-            !p.sideways
-        } else {
-            p.sideways
-        };
+        if rng.random_bool(0.15) {
+            p.sideways = !p.sideways;
+        }
         p.worsen_prob = jitter_f64(rng, p.worsen_prob, 0.8, 0.0, 0.15);
         p.destroy_attempts = jitter_usize(rng, p.destroy_attempts, 0.40, 3, 64);
         p.repair_attempts = jitter_usize(rng, p.repair_attempts, 0.40, 6, 80);
-        p.refetch_after_stale = jitter_usize(rng, p.refetch_after_stale, 0.40, 8, 120);
-        p.hard_refetch_every = jitter_usize(rng, p.hard_refetch_every, 0.60, 0, 64);
-        p.kicks_after_refetch = jitter_usize(rng, p.kicks_after_refetch, 0.60, 0, 24);
         p.ewma_beta = jitter_f64(rng, p.ewma_beta, 0.40, 0.05, 0.95);
         p.sr_low = jitter_f64(rng, p.sr_low, 0.40, 0.0, 0.9);
         p.sr_high = (jitter_f64(rng, p.sr_high, 0.40, 0.0, 0.98)).max((p.sr_low + 0.05).min(0.98));
         p.upd_period = jitter_usize(rng, p.upd_period, 0.60, 1, 12);
         p.step_max = jitter_usize(rng, p.step_max, 0.60, 1, 6);
-        p.bias_explore = if rng.random_bool(0.10) {
-            !p.bias_explore
-        } else {
-            p.bias_explore
-        };
+        if rng.random_bool(0.10) {
+            p.bias_explore = !p.bias_explore;
+        }
         p
     }
 }
@@ -479,10 +467,7 @@ fn build_ils<'p>(
         .with_destroy_attempts(params.destroy_attempts)
         .with_repair_attempts(params.repair_attempts)
         .with_shuffle_local_each_step(true)
-        .with_refetch_after_stale(params.refetch_after_stale)
-        .with_hard_refetch_every(params.hard_refetch_every)
-        .with_hard_refetch_mode(ils::HardRefetchMode::IfBetter)
-        .with_kick_ops_after_refetch(params.kicks_after_refetch)
+        // no refetch hooks in single-worker run
         .with_online_perturbation(true)
         .with_destroy_cap_bounds(4, 48)
         .with_repair_cap_bounds(8, 64)
@@ -494,16 +479,13 @@ fn build_ils<'p>(
     Box::new(s)
 }
 
-// ---- SA params ----
+// ---- SA params (no refetch hooks; reheat is internal to SA) ----
 #[derive(Clone, Serialize, Deserialize)]
 struct SaParams {
     t0: f64,
     cooling: f64,
     steps_per_epoch: usize,
-    refetch_every: usize,
-    stale_epochs: usize,
     reheat: f64,
-    kicks: usize,
     low: f64,
     high: f64,
     nudge_up: f64,
@@ -522,10 +504,7 @@ impl ParamSpace for SaParams {
             t0: pick_f64(rng, 12.0, 90.0),
             cooling: pick_f64(rng, 0.9982, 0.99995),
             steps_per_epoch: pick_usize(rng, 600, 2000),
-            refetch_every: pick_usize(rng, 60, 200),
-            stale_epochs: pick_usize(rng, 30, 100),
             reheat: pick_f64(rng, 0.6, 0.95),
-            kicks: pick_usize(rng, 4, 32),
             low,
             high,
             nudge_up: pick_f64(rng, 1.02, 1.12),
@@ -540,10 +519,7 @@ impl ParamSpace for SaParams {
         p.t0 = jitter_f64(rng, p.t0, 0.40, 6.0, 120.0);
         p.cooling = jitter_f64(rng, p.cooling, 0.0006, 0.9975, 0.99999);
         p.steps_per_epoch = jitter_usize(rng, p.steps_per_epoch, 0.40, 300, 3000);
-        p.refetch_every = jitter_usize(rng, p.refetch_every, 0.40, 40, 300);
-        p.stale_epochs = jitter_usize(rng, p.stale_epochs, 0.40, 20, 160);
         p.reheat = jitter_f64(rng, p.reheat, 0.20, 0.5, 0.99);
-        p.kicks = jitter_usize(rng, p.kicks, 0.40, 0, 48);
         p.low = jitter_f64(rng, p.low, 0.40, 0.05, 0.5);
         p.high = jitter_f64(rng, p.high, 0.40, p.low + 0.1, 0.95);
         p.nudge_up = jitter_f64(rng, p.nudge_up, 0.20, 1.01, 1.20);
@@ -565,11 +541,8 @@ fn build_sa<'p>(
         .with_cooling(params.cooling)
         .with_min_temp(1e-4)
         .with_steps_per_epoch(params.steps_per_epoch)
-        .with_hard_refetch_every(params.refetch_every)
-        .with_hard_refetch_mode(sa::HardRefetchMode::IfBetter)
-        .with_refetch_after_stale(params.stale_epochs)
+        // no refetch/kicks in single-worker runs
         .with_reheat_factor(params.reheat)
-        .with_kick_ops_after_refetch(params.kicks)
         .with_big_m_for_energy(900_000_000)
         .with_acceptance_targets(params.low, params.high)
         .with_ar_nudge_up(params.nudge_up)
@@ -774,7 +747,6 @@ fn setup_tracing() {
 
 // ---------- main ----------
 fn main() -> AppResult<()> {
-    // tracing
     //setup_tracing();
     ensure_dir(Path::new("tuning"))?;
 
