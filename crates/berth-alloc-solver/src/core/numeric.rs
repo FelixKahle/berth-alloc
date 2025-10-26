@@ -23,6 +23,8 @@ use berth_alloc_core::prelude::Cost;
 use num_traits::{CheckedAdd, CheckedDiv, CheckedSub, FromPrimitive, ToPrimitive, Zero};
 use std::ops::Mul;
 
+// Yes i know this is ugly but this will save us time in the long run
+
 pub trait SolveNumeric:
     Copy
     + Ord

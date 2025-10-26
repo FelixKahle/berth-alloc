@@ -1,92 +1,64 @@
-// Copyright (c) 2025 Felix Kahle.
-// MIT License
-
-//! Random-search parameter tuner for ILS / SA / GLS.
+//! Tuner: saturates CPU with many parallel tuners (one engine per thread, one strategy per engine).
+//! - 20s time limit per trial, runs forever until you Ctrl-C.
+//! - Wide param spaces for GLS / ILS / SA.
+//! - Online archive per strategy: TPE-like exploit (mutate good configs) vs. explore (new samples),
+//!   with Thompson sampling to choose mode.
+//! - Writes JSONL trial logs + rolling best.json per strategy.
 //!
-//! - Only the *first* instance under `instances/` is used.
-//! - One engine per trial, one worker per engine, exactly one strategy.
-//! - ILS/SA/GLS each run on their own thread group (coordinator + workers).
-//! - Each solve has ~80s time limit (override with env TUNER_SOLVE_SECS).
-//! - Control parallelism with env TUNER_THREADS_PER_STRATEGY (default 3).
-//! - Control run length with env TUNER_TRIALS_PER_WORKER (default 100000).
-//! - Every trial is appended to JSONL per strategy.
-//! - A live summary (best/leaderboard aggregates) is continuously updated.
+//! Add to Cargo.toml if missing:
+//! [dependencies]
+//! rand = "0.8"
+//! rand_chacha = "0.3"
+//! rand_distr = "0.4"
+//! serde = { version = "1", features = ["derive"] }
+//! serde_json = "1"
+//! chrono = { version = "0.4", features = ["serde"] }
+//! parking_lot = "0.12"
+//! once_cell = "1"
+//! ctrlc = "3"
+//! tracing = "0.1"
+//! tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
-#![allow(clippy::too_many_arguments)]
-#![allow(clippy::needless_return)]
-
-use berth_alloc_model::prelude::Problem;
-use berth_alloc_model::problem::loader::ProblemLoader;
-use berth_alloc_model::solution::SolutionView;
-use berth_alloc_solver::{
-    core::numeric::SolveNumeric,
-    engine::{
-        search::SearchStrategy,
-        solver_engine::{SolverEngine, SolverEngineBuilder},
-    },
-    model::solver_model::SolverModel,
-};
 use chrono::{DateTime, Utc};
-use rand::SeedableRng;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use rand_distr::{Beta, Distribution, Normal};
 use serde::{Deserialize, Serialize};
 use std::{
-    env,
-    ffi::OsStr,
+    cmp::Ordering,
+    error::Error,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
-use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
+use tracing::{info, warn};
 
-/* ------------------------- configuration ------------------------- */
+// ----- your solver crates -----
+use berth_alloc_model::prelude::{Problem, SolutionView};
+use berth_alloc_model::problem::loader::ProblemLoader;
+use berth_alloc_solver::engine::solver_engine::{SolverEngineBuilder, SolverEngineConfig};
+use berth_alloc_solver::engine::{gls, ils, sa};
+use berth_alloc_solver::model::solver_model::SolverModel;
 
-fn cfg_usize(env_key: &str, default: usize) -> usize {
-    env::var(env_key)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(default)
-}
-fn cfg_u64(env_key: &str, default: u64) -> u64 {
-    env::var(env_key)
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(default)
-}
-fn cfg_secs(env_key: &str, default: u64) -> u64 {
-    env::var(env_key)
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(default)
+// ---------- simple app result ----------
+type AppError = Box<dyn Error + Send + Sync + 'static>;
+type AppResult<T> = Result<T, AppError>;
+
+// ---------- filesystem helpers ----------
+fn ensure_dir(p: &Path) -> AppResult<()> {
+    if !p.exists() {
+        fs::create_dir_all(p)?;
+    }
+    Ok(())
 }
 
-fn solve_time_limit() -> Duration {
-    Duration::from_secs(cfg_secs("TUNER_SOLVE_SECS", 80))
-}
-fn threads_per_strategy() -> usize {
-    cfg_usize("TUNER_THREADS_PER_STRATEGY", 3)
-}
-fn trials_per_worker() -> usize {
-    cfg_usize("TUNER_TRIALS_PER_WORKER", 100_000)
-}
-
-/* ------------------------- logging ------------------------- */
-
-fn enable_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_span_events(FmtSpan::CLOSE)
-        .try_init();
-}
-
-/* ------------------------- instance loading ------------------------- */
-
+// ---------- instance loader (first instance in ./instances) ----------
 fn find_instances_dir() -> Option<PathBuf> {
-    // Start from this crate and walk up to find `instances/`
     let mut cur: Option<&Path> = Some(Path::new(env!("CARGO_MANIFEST_DIR")));
     while let Some(p) = cur {
         let cand = p.join("instances");
@@ -98,615 +70,784 @@ fn find_instances_dir() -> Option<PathBuf> {
     None
 }
 
-fn load_first_instance() -> (Problem<i64>, String) {
-    let inst_dir = find_instances_dir()
-        .expect("Could not find an `instances/` directory in any ancestor of CARGO_MANIFEST_DIR");
-
-    let mut files: Vec<PathBuf> = fs::read_dir(&inst_dir)
-        .expect("read_dir(instances) failed")
+fn load_first_instance() -> AppResult<(Problem<i64>, String)> {
+    let inst_dir =
+        find_instances_dir().ok_or_else(|| "Could not find instances/ directory".to_string())?;
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&inst_dir)?
         .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+                && e.path().extension().map(|x| x == "txt").unwrap_or(false)
+        })
         .map(|e| e.path())
-        .filter(|p| p.extension() == Some(OsStr::new("txt")))
         .collect();
-
     files.sort();
 
-    let first = files
+    let f = files
         .into_iter()
         .next()
-        .expect("instances/ has no *.txt instance files");
-
+        .ok_or_else(|| format!("No .txt instance files in {}", inst_dir.display()))?;
     let loader = ProblemLoader::default();
-    let problem = loader
-        .from_path(&first)
-        .unwrap_or_else(|e| panic!("Failed to load {:?}: {}", first, e));
-    let name = first
+    let problem = loader.from_path(&f)?;
+    let name = f
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("unknown.txt")
-        .to_string();
-
-    (problem, name)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| f.to_string_lossy().into_owned());
+    Ok((problem, name))
 }
 
-/* ------------------------- strategy kinds ------------------------- */
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum StrategyKind {
+// ---------- per-strategy files + locks ----------
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum StratKind {
+    Gls,
     Ils,
     Sa,
-    Gls,
 }
-
-impl StrategyKind {
-    fn jsonl_basename(self) -> &'static str {
+impl StratKind {
+    fn as_str(&self) -> &'static str {
         match self {
-            StrategyKind::Ils => "ils.jsonl",
-            StrategyKind::Sa => "sa.jsonl",
-            StrategyKind::Gls => "gls.jsonl",
-        }
-    }
-    fn summary_basename(self) -> &'static str {
-        match self {
-            StrategyKind::Ils => "ils_summary.json",
-            StrategyKind::Sa => "sa_summary.json",
-            StrategyKind::Gls => "gls_summary.json",
+            StratKind::Gls => "gls",
+            StratKind::Ils => "ils",
+            StratKind::Sa => "sa",
         }
     }
 }
 
-/* ------------------------- params ------------------------- */
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct IlsParams {
-    local_lo: usize,
-    local_hi: usize,
-    allow_sideways: bool,
-    destroy_attempts: usize,
-    repair_attempts: usize,
-    refetch_after_stale: usize,
-    hard_refetch_every: usize,
-    kick_after_refetch: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SaParams {
-    init_temp: f64,
-    cooling: f64,
-    min_temp: f64,
-    steps_per_epoch: usize,
-    refetch_after_stale: usize,
-    hard_refetch_every: usize,
-    reheat_factor: f64,
-    kick_after_refetch: usize,
-    big_m: i64,
-    ar_low: f64,
-    ar_high: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct GlsParams {
-    lambda: i64,
-    penalty_step: i64,
-    max_local_steps: usize,
-    stagnation_before_pulse: usize,
-    pulse_top_k: usize,
-    hard_refetch_every: usize,
-    kick_steps_on_reset: usize,
-}
-
-/* ------------------------- random samplers ------------------------- */
-
-fn sample_ils_params<R: rand::Rng>(rng: &mut R) -> IlsParams {
-    IlsParams {
-        local_lo: rng.random_range(900..=1500),
-        local_hi: rng.random_range(1600..=2600),
-        allow_sideways: rng.random::<bool>(),
-        destroy_attempts: rng.random_range(8..=18),
-        repair_attempts: rng.random_range(18..=36),
-        refetch_after_stale: rng.random_range(24..=80),
-        hard_refetch_every: rng.random_range(8..=32),
-        kick_after_refetch: rng.random_range(4..=16),
-    }
-}
-
-fn sample_sa_params<R: rand::Rng>(rng: &mut R) -> SaParams {
-    SaParams {
-        init_temp: rng.random_range(10.0..=60.0),
-        cooling: rng.random_range(0.9992..=0.99985),
-        min_temp: 1e-4,
-        steps_per_epoch: rng.random_range(800..=1800),
-        refetch_after_stale: rng.random_range(30..=100),
-        hard_refetch_every: rng.random_range(50..=120),
-        reheat_factor: rng.random_range(0.5..=0.9),
-        kick_after_refetch: rng.random_range(6..=22),
-        big_m: rng.random_range(600_000_000i64..=1_200_000_000i64),
-        ar_low: rng.random_range(0.10..=0.30),
-        ar_high: rng.random_range(0.55..=0.80),
-    }
-}
-
-fn sample_gls_params<R: rand::Rng>(rng: &mut R) -> GlsParams {
-    GlsParams {
-        lambda: rng.random_range(5..=16),
-        penalty_step: rng.random_range(1..=4),
-        max_local_steps: rng.random_range(800..=2400),
-        stagnation_before_pulse: rng.random_range(6..=18),
-        pulse_top_k: rng.random_range(12..=28),
-        hard_refetch_every: rng.random_range(10..=36),
-        kick_steps_on_reset: rng.random_range(3..=12),
-    }
-}
-
-/* ------------------------- result records ------------------------- */
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TrialResult {
-    strategy: StrategyKind,
-    params: serde_json::Value,
+#[derive(Serialize, Deserialize, Clone)]
+struct TrialRecord<P: Serialize + Clone> {
+    strategy: String,
+    params: P,
     seed: u64,
-    filename: String,
     start_ts: DateTime<Utc>,
     end_ts: DateTime<Utc>,
     runtime_ms: u128,
     cost: Option<i64>,
 }
 
-/* ------------------------- IO helpers ------------------------- */
-
-const OUT_DIR: &str = "tuning_results";
-
-fn ensure_out_dir() {
-    let _ = fs::create_dir_all(OUT_DIR);
+#[derive(Serialize, Deserialize, Clone)]
+struct BestSnapshot<P: Serialize + Clone> {
+    strategy: String,
+    params: P,
+    seed: u64,
+    cost: i64,
+    runtime_ms: u128,
+    filename: String,
+    at: DateTime<Utc>,
 }
 
-fn jsonl_path(kind: StrategyKind) -> PathBuf {
-    PathBuf::from(OUT_DIR).join(kind.jsonl_basename())
+struct IoPaths {
+    dir: PathBuf,
+    trials_jsonl: PathBuf,
+    best_json: PathBuf,
+    top_json: PathBuf,
+}
+fn io_paths(kind: StratKind) -> IoPaths {
+    let dir = PathBuf::from("tuning").join(kind.as_str());
+    let trials_jsonl = dir.join(format!("tuning_{}_trials.jsonl", kind.as_str()));
+    let best_json = dir.join(format!("tuning_{}_best.json", kind.as_str()));
+    let top_json = dir.join(format!("tuning_{}_top.json", kind.as_str()));
+    IoPaths {
+        dir,
+        trials_jsonl,
+        best_json,
+        top_json,
+    }
 }
 
-fn summary_path(kind: StrategyKind) -> PathBuf {
-    PathBuf::from(OUT_DIR).join(kind.summary_basename())
+static GLS_IO_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static ILS_IO_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static SA_IO_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+// ---------- archives (TPE-ish good pool + mutation) ----------
+#[derive(Clone, Serialize, Deserialize)]
+struct Scored<P> {
+    params: P,
+    seed: u64,
+    cost: i64,
+    runtime_ms: u128,
+}
+impl<P> PartialEq for Scored<P> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cost == other.cost
+    }
+}
+impl<P> Eq for Scored<P> {}
+impl<P> PartialOrd for Scored<P> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<P> Ord for Scored<P> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.cost.cmp(&other.cost).reverse()
+    }
 }
 
-fn append_jsonl(kind: StrategyKind, res: &TrialResult) {
-    ensure_out_dir();
-    let line = serde_json::to_string(res).expect("serialize TrialResult");
-    let path = jsonl_path(kind);
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .unwrap_or_else(|e| panic!("open {} failed: {}", path.display(), e));
-    let _ = writeln!(f, "{}", line);
+#[derive(Clone)]
+struct Archive<P: Clone + Serialize> {
+    best: Option<Scored<P>>,
+    top: Vec<Scored<P>>,
+    top_cap: usize,
+    explore_beta: (f64, f64), // alpha, beta
+    exploit_beta: (f64, f64),
+}
+impl<P: Clone + Serialize> Archive<P> {
+    fn new(cap: usize) -> Self {
+        Self {
+            best: None,
+            top: Vec::new(),
+            top_cap: cap.max(8),
+            explore_beta: (1.0, 1.0),
+            exploit_beta: (1.0, 1.0),
+        }
+    }
+    fn register(&mut self, scored: Scored<P>) -> (bool, bool) {
+        let mut new_best = false;
+        if let Some(b) = &self.best {
+            if scored.cost < b.cost {
+                self.best = Some(scored.clone());
+                new_best = true;
+            }
+        } else {
+            self.best = Some(scored.clone());
+            new_best = true;
+        }
+        self.top.push(scored);
+        self.top.sort_by_key(|s| s.cost);
+        if self.top.len() > self.top_cap {
+            self.top.truncate(self.top_cap);
+        }
+        let improved_top = new_best || self.top.len() < self.top_cap;
+        (new_best, improved_top)
+    }
+    fn good_pool(&self) -> &[Scored<P>] {
+        if self.top.is_empty() {
+            return &self.top;
+        }
+        let q = ((self.top.len() as f64) * 0.2).ceil() as usize;
+        let k = self.top.len().max(4);
+        let upto = q.max(4).min(k);
+        &self.top[0..upto]
+    }
+    fn exploit_weighted_pick<'a>(&'a self, rng: &mut ChaCha8Rng) -> Option<&'a Scored<P>> {
+        let pool = self.good_pool();
+        if pool.is_empty() {
+            return None;
+        }
+        let mut total = 0.0;
+        let weights: Vec<f64> = pool
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let w = 1.0 / ((i + 1) as f64);
+                total += w;
+                w
+            })
+            .collect();
+        let mut r = rng.random::<f64>() * total;
+        for (i, w) in weights.iter().enumerate() {
+            if r < *w {
+                return pool.get(i);
+            }
+            r -= *w;
+        }
+        pool.last()
+    }
+    fn choose_mode(&self, rng: &mut ChaCha8Rng) -> Mode {
+        let (a_e, b_e) = self.explore_beta;
+        let (a_x, b_x) = self.exploit_beta;
+        let be = Beta::new(a_e.max(1e-6), b_e.max(1e-6)).unwrap();
+        let bx = Beta::new(a_x.max(1e-6), b_x.max(1e-6)).unwrap();
+        if bx.sample(rng) >= be.sample(rng) {
+            Mode::Exploit
+        } else {
+            Mode::Explore
+        }
+    }
+    fn reward(&mut self, mode: Mode, success: bool) {
+        let ab = match mode {
+            Mode::Explore => &mut self.explore_beta,
+            Mode::Exploit => &mut self.exploit_beta,
+        };
+        if success {
+            ab.0 += 1.0;
+        } else {
+            ab.1 += 1.0;
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum Mode {
+    Explore,
+    Exploit,
 }
 
-/* ------------------------- strategy builders (boxed with ChaCha8Rng) ------------------------- */
-
-fn ils_strategy_with_params<T>(
-    model: &SolverModel<T>,
-    p: &IlsParams,
-) -> Box<dyn SearchStrategy<T, ChaCha8Rng>>
-where
-    T: SolveNumeric + From<i32>,
-{
-    use berth_alloc_solver::engine::ils::{HardRefetchMode, IteratedLocalSearchStrategy};
-    use berth_alloc_solver::engine::neighbors;
-    use berth_alloc_solver::search::operator_library::{
-        destroy::{RandomKRatioDestroy, ShawRelatedDestroy, TimeClusterDestroy, WorstCostDestroy},
-        local::{
-            CascadeInsertPolicy, CascadeRelocateK, CrossExchangeAcrossBerths,
-            HillClimbRelocateBest, OrOptBlockRelocate, RelocateSingleBest, ShiftEarlierOnSameBerth,
-            SwapPairSameBerth,
-        },
-        repair::{GreedyInsertion, KRegretInsertion},
-    };
-
-    let pm = model.proximity_map();
-    let n_any = neighbors::any(pm);
-    let n_dir = neighbors::direct_competitors(pm);
-    let n_same = neighbors::same_berth(pm);
-
-    let strat = IteratedLocalSearchStrategy::new()
-        .with_local_steps_range(p.local_lo..=p.local_hi)
-        .with_local_sideways(p.allow_sideways)
-        .with_local_worsening_prob(0.0)
-        .with_destroy_attempts(p.destroy_attempts)
-        .with_repair_attempts(p.repair_attempts)
-        .with_refetch_after_stale(p.refetch_after_stale)
-        .with_hard_refetch_every(p.hard_refetch_every)
-        .with_hard_refetch_mode(HardRefetchMode::IfBetter)
-        .with_kick_ops_after_refetch(p.kick_after_refetch)
-        // locals
-        .with_local_op(Box::new(
-            RelocateSingleBest::new(24..=64).with_neighbors(n_dir.clone()),
-        ))
-        .with_local_op(Box::new(
-            SwapPairSameBerth::new(40..=100).with_neighbors(n_same.clone()),
-        ))
-        .with_local_op(Box::new(
-            CrossExchangeAcrossBerths::new(48..=120).with_neighbors(n_dir.clone()),
-        ))
-        .with_local_op(Box::new(
-            HillClimbRelocateBest::new(24..=72).with_neighbors(n_dir.clone()),
-        ))
-        .with_local_op(Box::new(
-            OrOptBlockRelocate::new(4..=8, 1.25..=1.65).with_neighbors(n_same.clone()),
-        ))
-        .with_local_op(Box::new(
-            ShiftEarlierOnSameBerth::new(16..=48).with_neighbors(n_same.clone()),
-        ))
-        .with_local_op(Box::new(
-            CascadeRelocateK::new(3..=4, 8..=12, 12..=24)
-                .with_neighbors(n_dir.clone())
-                .with_insert_policy(CascadeInsertPolicy::BestEarliest),
-        ))
-        // destroy
-        .with_destroy_op(Box::new(
-            RandomKRatioDestroy::new(0.32..=0.58).with_neighbors(n_any.clone()),
-        ))
-        .with_destroy_op(Box::new(
-            WorstCostDestroy::new(0.30..=0.48).with_neighbors(n_dir.clone()),
-        ))
-        .with_destroy_op(Box::new(
-            ShawRelatedDestroy::new(0.28..=0.40, 1.6..=2.2, 1.into(), 1.into(), 5.into())
-                .with_neighbors(n_dir.clone()),
-        ))
-        .with_destroy_op(Box::new(
-            TimeClusterDestroy::<T>::new(
-                0.32..=0.50,
-                berth_alloc_core::prelude::TimeDelta::new(24.into()),
-            )
-            .with_alpha(1.55..=1.90)
-            .with_neighbors(n_any),
-        ))
-        // repair
-        .with_repair_op(Box::new(KRegretInsertion::new(8..=11)))
-        .with_repair_op(Box::new(GreedyInsertion));
-
-    Box::new(strat)
+// ---------- parameter spaces & mutations ----------
+trait ParamSpace: Clone + Serialize + Send + Sync + 'static {
+    fn sample_new(rng: &mut ChaCha8Rng) -> Self;
+    fn mutate(&self, rng: &mut ChaCha8Rng) -> Self;
+}
+fn jitter_usize(rng: &mut ChaCha8Rng, base: usize, pct: f64, min: usize, max: usize) -> usize {
+    let span = ((base as f64) * pct).round() as isize;
+    let off = rng.random_range(-(span as i64)..=(span as i64)) as isize;
+    (base as isize + off).clamp(min as isize, max as isize) as usize
+}
+fn jitter_f64(rng: &mut ChaCha8Rng, base: f64, pct: f64, lo: f64, hi: f64) -> f64 {
+    let span = base.abs() * pct;
+    let n = Normal::new(base, span.max(1e-9)).unwrap();
+    n.sample(rng).clamp(lo, hi)
+}
+fn pick_usize(rng: &mut ChaCha8Rng, lo: usize, hi: usize) -> usize {
+    rng.random_range(lo..=hi)
+}
+fn pick_f64(rng: &mut ChaCha8Rng, lo: f64, hi: f64) -> f64 {
+    rng.random_range(lo..=hi)
 }
 
-fn sa_strategy_with_params<T>(
-    model: &SolverModel<T>,
-    p: &SaParams,
-) -> Box<dyn SearchStrategy<T, ChaCha8Rng>>
-where
-    T: SolveNumeric + From<i32>,
-{
-    use berth_alloc_solver::engine::neighbors;
-    use berth_alloc_solver::engine::sa::{HardRefetchMode, SimulatedAnnealingStrategy};
-    use berth_alloc_solver::search::operator_library::local::*;
-    let pm = model.proximity_map();
-    let n_any = neighbors::any(pm);
-    let n_dir = neighbors::direct_competitors(pm);
-    let n_same = neighbors::same_berth(pm);
-
-    let strat = SimulatedAnnealingStrategy::new()
-        .with_init_temp(p.init_temp)
-        .with_cooling(p.cooling)
-        .with_min_temp(p.min_temp)
-        .with_steps_per_epoch(p.steps_per_epoch)
-        .with_hard_refetch_every(p.hard_refetch_every)
-        .with_hard_refetch_mode(HardRefetchMode::IfBetter)
-        .with_refetch_after_stale(p.refetch_after_stale)
-        .with_reheat_factor(p.reheat_factor)
-        .with_kick_ops_after_refetch(p.kick_after_refetch)
-        .with_big_m_for_energy(p.big_m)
-        .with_acceptance_targets(p.ar_low, p.ar_high)
-        // locals (your SA preset set)
-        .with_local_op(Box::new(
-            ShiftEarlierOnSameBerth::new(18..=52).with_neighbors(n_same.clone()),
-        ))
-        .with_local_op(Box::new(
-            RelocateSingleBest::new(20..=64).with_neighbors(n_dir.clone()),
-        ))
-        .with_local_op(Box::new(
-            SwapPairSameBerth::new(36..=96).with_neighbors(n_same.clone()),
-        ))
-        .with_local_op(Box::new(
-            CrossExchangeAcrossBerths::new(48..=128).with_neighbors(n_dir.clone()),
-        ))
-        .with_local_op(Box::new(
-            OrOptBlockRelocate::new(5..=9, 1.4..=1.9).with_neighbors(n_same.clone()),
-        ))
-        .with_local_op(Box::new(
-            RelocateSingleBestAllowWorsening::new(12..=24).with_neighbors(n_dir.clone()),
-        ))
-        .with_local_op(Box::new(
-            RandomRelocateAnywhere::new(12..=24).with_neighbors(n_any.clone()),
-        ))
-        .with_local_op(Box::new(
-            HillClimbRelocateBest::new(24..=72).with_neighbors(n_dir.clone()),
-        ))
-        .with_local_op(Box::new(
-            HillClimbBestSwapSameBerth::new(48..=120).with_neighbors(n_same.clone()),
-        ))
-        .with_local_op(Box::new(
-            RandomizedGreedyRelocateRcl::new(18..=48, 1.5..=2.2).with_neighbors(n_dir.clone()),
-        ))
-        .with_local_op(Box::new(
-            CrossExchangeBestAcrossBerths::new(32..=96).with_neighbors(n_any.clone()),
-        ))
-        .with_local_op(Box::new(
-            CascadeRelocateK::new(3..=5, 6..=10, 10..=20)
-                .with_neighbors(n_any)
-                .with_insert_policy(CascadeInsertPolicy::Rcl {
-                    alpha_range: 1.4..=2.0,
-                })
-                .allow_step_worsening(30),
-        ));
-
-    Box::new(strat)
+// ---- GLS params ----
+#[derive(Clone, Serialize, Deserialize)]
+struct GlsParams {
+    lambda: i64,
+    penalty_step: i64,
+    decay_num: u32,
+    decay_den: u32,
+    stagn_pulse: usize,
+    pulse_top_k: usize,
+    max_local_steps: usize,
+    refetch_after_stale: usize,
+    hard_refetch_every: usize,
+    kicks_on_reset: usize,
+    tgt_pen_low: f64,
+    tgt_pen_high: f64,
+    lambda_step_frac: f64,
 }
-
-fn gls_strategy_with_params<T>(
-    model: &SolverModel<T>,
-    p: &GlsParams,
-) -> Box<dyn SearchStrategy<T, ChaCha8Rng>>
-where
-    T: SolveNumeric + From<i32>,
-{
-    use berth_alloc_solver::engine::gls::gls_strategy;
-    let s = gls_strategy::<T, ChaCha8Rng>(model)
-        .with_lambda(p.lambda)
-        .with_penalty_step(p.penalty_step)
-        .with_max_local_steps(p.max_local_steps)
-        .with_pulse_params(p.stagnation_before_pulse, p.pulse_top_k)
-        .with_hard_refetch_every(p.hard_refetch_every)
-        .with_kick_steps_on_reset(p.kick_steps_on_reset);
+impl ParamSpace for GlsParams {
+    fn sample_new(rng: &mut ChaCha8Rng) -> Self {
+        let dec = [
+            (85, 100),
+            (90, 100),
+            (93, 100),
+            (95, 100),
+            (97, 100),
+            (99, 100),
+        ][pick_usize(rng, 0, 5)];
+        let low = pick_f64(rng, 0.05, 0.30);
+        let high = (low + pick_f64(rng, 0.1, 0.4)).clamp(low + 0.05, 0.85);
+        Self {
+            lambda: pick_usize(rng, 3, 40) as i64,
+            penalty_step: pick_usize(rng, 1, 4) as i64,
+            decay_num: dec.0,
+            decay_den: dec.1,
+            stagn_pulse: pick_usize(rng, 4, 24),
+            pulse_top_k: pick_usize(rng, 8, 64),
+            max_local_steps: pick_usize(rng, 800, 4000),
+            refetch_after_stale: pick_usize(rng, 0, 80),
+            hard_refetch_every: pick_usize(rng, 8, 64),
+            kicks_on_reset: pick_usize(rng, 0, 24),
+            tgt_pen_low: low,
+            tgt_pen_high: high,
+            lambda_step_frac: pick_f64(rng, 0.02, 0.15),
+        }
+    }
+    fn mutate(&self, rng: &mut ChaCha8Rng) -> Self {
+        let mut p = self.clone();
+        p.lambda = jitter_usize(rng, p.lambda as usize, 0.35, 1, 2_000_000) as i64;
+        p.penalty_step = jitter_usize(rng, p.penalty_step as usize, 0.40, 1, 16) as i64;
+        p.decay_num =
+            jitter_usize(rng, p.decay_num as usize, 0.05, 80, p.decay_den as usize) as u32;
+        p.stagn_pulse = jitter_usize(rng, p.stagn_pulse, 0.50, 3, 64);
+        p.pulse_top_k = jitter_usize(rng, p.pulse_top_k, 0.40, 6, 96);
+        p.max_local_steps = jitter_usize(rng, p.max_local_steps, 0.40, 400, 6000);
+        p.refetch_after_stale = jitter_usize(rng, p.refetch_after_stale, 0.60, 0, 120);
+        p.hard_refetch_every = jitter_usize(rng, p.hard_refetch_every, 0.60, 4, 120);
+        p.kicks_on_reset = jitter_usize(rng, p.kicks_on_reset, 0.60, 0, 32);
+        p.tgt_pen_low = jitter_f64(rng, p.tgt_pen_low, 0.40, 0.0, 0.9);
+        p.tgt_pen_high = (jitter_f64(rng, p.tgt_pen_high, 0.40, 0.0, 0.98))
+            .max((p.tgt_pen_low + 0.02).min(0.98));
+        p.lambda_step_frac = jitter_f64(rng, p.lambda_step_frac, 0.40, 0.01, 0.25);
+        p
+    }
+}
+fn build_gls<'p>(
+    model: &SolverModel<'p, i64>,
+    params: &GlsParams,
+) -> Box<dyn berth_alloc_solver::engine::search::SearchStrategy<i64, ChaCha8Rng>> {
+    let mut s = gls::gls_strategy::<i64, ChaCha8Rng>(model);
+    s = s
+        .with_lambda(params.lambda)
+        .with_penalty_step(params.penalty_step)
+        .with_decay(gls::DecayMode::Multiplicative {
+            num: params.decay_num,
+            den: params.decay_den,
+        })
+        .with_pulse_params(params.stagn_pulse, params.pulse_top_k)
+        .with_max_local_steps(params.max_local_steps)
+        .with_refetch_after_stale(params.refetch_after_stale)
+        .with_hard_refetch_every(params.hard_refetch_every)
+        .with_hard_refetch_mode(gls::HardRefetchMode::IfBetter)
+        .with_restart_on_publish(true)
+        .with_reset_on_refetch(true)
+        .with_kick_steps_on_reset(params.kicks_on_reset)
+        .with_adaptive_lambda(true)
+        .with_target_penalty_share(params.tgt_pen_low, params.tgt_pen_high)
+        .with_lambda_step_frac(params.lambda_step_frac)
+        .with_lambda_bounds(1, 2_000_000);
     Box::new(s)
 }
 
-/* ------------------------- engine builder ------------------------- */
-
-fn build_engine_with_single_strategy<T>(
-    strategy: Box<dyn SearchStrategy<T, ChaCha8Rng>>,
-    time_limit: Duration,
-) -> SolverEngine<T>
-where
-    T: SolveNumeric + Send + Sync + 'static,
-{
-    SolverEngineBuilder::<T>::default()
-        .with_worker_count(1)
-        .with_time_limit(time_limit)
-        .with_strategy(strategy)
-        .build()
+// ---- ILS params ----
+#[derive(Clone, Serialize, Deserialize)]
+struct IlsParams {
+    local_lo: usize,
+    local_hi: usize,
+    sideways: bool,
+    worsen_prob: f64,
+    destroy_attempts: usize,
+    repair_attempts: usize,
+    refetch_after_stale: usize,
+    hard_refetch_every: usize,
+    kicks_after_refetch: usize,
+    ewma_beta: f64,
+    sr_low: f64,
+    sr_high: f64,
+    upd_period: usize,
+    step_max: usize,
+    bias_explore: bool,
 }
-
-/* ------------------------- trial execution ------------------------- */
-
-fn run_one_trial<T>(
-    kind: StrategyKind,
-    params_json: &serde_json::Value,
-    problem: &Problem<T>,
-    filename: &str,
-    seed: u64,
-) -> TrialResult
-where
-    T: SolveNumeric + From<i32> + Send + Sync + 'static,
-{
-    // Build a temporary model to pass to strategy builders (for neighbors, etc.).
-    // Build a temporary model to pass to strategy builders (for neighbors, etc.).
-    let model = SolverModel::from_problem(problem)
-        .expect("SolverModel::from_problem() failed for the instance");
-
-    let strategy: Box<dyn SearchStrategy<T, ChaCha8Rng>> = match kind {
-        StrategyKind::Ils => {
-            let p: IlsParams = serde_json::from_value(params_json.clone()).unwrap();
-            ils_strategy_with_params::<T>(&model, &p)
-        }
-        StrategyKind::Sa => {
-            let p: SaParams = serde_json::from_value(params_json.clone()).unwrap();
-            sa_strategy_with_params::<T>(&model, &p)
-        }
-        StrategyKind::Gls => {
-            let p: GlsParams = serde_json::from_value(params_json.clone()).unwrap();
-            gls_strategy_with_params::<T>(&model, &p)
-        }
-    };
-
-    let mut engine = build_engine_with_single_strategy::<T>(strategy, solve_time_limit());
-
-    // If your engine exposes `set_seed`, you can uncomment:
-    // engine.set_seed(seed);
-
-    let start_ts = Utc::now();
-    let t0 = Instant::now();
-    let outcome = engine.solve(problem);
-    let runtime = t0.elapsed();
-    let end_ts = Utc::now();
-
-    let cost = match outcome {
-        Ok(Some(sol)) => Some(sol.cost()),
-        _ => None,
-    };
-
-    TrialResult {
-        strategy: kind,
-        params: params_json.clone(),
-        seed,
-        filename: filename.to_string(),
-        start_ts,
-        end_ts,
-        runtime_ms: runtime.as_millis(),
-        cost,
-    }
-}
-
-/* ------------------------- lightweight live summary ------------------------- */
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LiveSummary {
-    strategy: StrategyKind,
-    generated_at: DateTime<Utc>,
-    trials: usize,
-    feasible: usize,
-    best_cost: Option<i64>,
-    best_params: Option<serde_json::Value>,
-    avg_cost: Option<f64>,
-    avg_runtime_ms: f64,
-}
-
-fn update_and_write_summary(
-    kind: StrategyKind,
-    acc_trials: &mut usize,
-    acc_feasible: &mut usize,
-    acc_cost_sum: &mut i128,
-    acc_runtime_sum: &mut u128,
-    best: &mut Option<(i64, serde_json::Value)>,
-    res: &TrialResult,
-) {
-    *acc_trials += 1;
-    *acc_runtime_sum += res.runtime_ms;
-
-    if let Some(c) = res.cost {
-        *acc_feasible += 1;
-        *acc_cost_sum += c as i128;
-        if best.as_ref().map(|(b, _)| c < *b).unwrap_or(true) {
-            *best = Some((c, res.params.clone()));
+impl ParamSpace for IlsParams {
+    fn sample_new(rng: &mut ChaCha8Rng) -> Self {
+        let lo = pick_usize(rng, 600, 2200);
+        let hi = pick_usize(rng, lo + 100, (lo + 2400).min(3600));
+        let sr_low = pick_f64(rng, 0.12, 0.35);
+        let sr_high = (sr_low + pick_f64(rng, 0.18, 0.45)).clamp(sr_low + 0.05, 0.85);
+        Self {
+            local_lo: lo,
+            local_hi: hi,
+            sideways: rng.random_bool(0.7),
+            worsen_prob: pick_f64(rng, 0.0, 0.05),
+            destroy_attempts: pick_usize(rng, 6, 24),
+            repair_attempts: pick_usize(rng, 12, 48),
+            refetch_after_stale: pick_usize(rng, 24, 80),
+            hard_refetch_every: pick_usize(rng, 8, 40),
+            kicks_after_refetch: pick_usize(rng, 2, 16),
+            ewma_beta: pick_f64(rng, 0.20, 0.60),
+            sr_low,
+            sr_high,
+            upd_period: pick_usize(rng, 3, 8),
+            step_max: pick_usize(rng, 1, 4),
+            bias_explore: rng.random_bool(0.6),
         }
     }
-
-    // write summary every trial (cheap JSON)
-    let avg_cost = if *acc_feasible > 0 {
-        Some((*acc_cost_sum as f64) / (*acc_feasible as f64))
-    } else {
-        None
-    };
-    let avg_rt = (*acc_runtime_sum as f64) / (*acc_trials as f64);
-    let (best_cost, best_params) = match best {
-        Some((c, p)) => (Some(*c), Some(p.clone())),
-        None => (None, None),
-    };
-    let summary = LiveSummary {
-        strategy: kind,
-        generated_at: Utc::now(),
-        trials: *acc_trials,
-        feasible: *acc_feasible,
-        best_cost,
-        best_params,
-        avg_cost,
-        avg_runtime_ms: avg_rt,
-    };
-
-    ensure_out_dir();
-    let path = summary_path(kind);
-    let s = serde_json::to_string_pretty(&summary).expect("serialize summary");
-    let mut f = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&path)
-        .unwrap_or_else(|e| panic!("open {} failed: {}", path.display(), e));
-    let _ = f.write_all(s.as_bytes());
-}
-
-/* ------------------------- worker loops ------------------------- */
-
-fn worker_loop(
-    kind: StrategyKind,
-    problem: &Problem<i64>,
-    filename: &str,
-    trials: usize,
-    seed_base: u64,
-) {
-    let mut rng = ChaCha8Rng::seed_from_u64(seed_base);
-    let mut acc_trials = 0usize;
-    let mut acc_feasible = 0usize;
-    let mut acc_cost_sum: i128 = 0;
-    let mut acc_runtime_sum: u128 = 0;
-    let mut best: Option<(i64, serde_json::Value)> = None;
-
-    for i in 0..trials {
-        let params_json = match kind {
-            StrategyKind::Ils => serde_json::to_value(sample_ils_params(&mut rng)).unwrap(),
-            StrategyKind::Sa => serde_json::to_value(sample_sa_params(&mut rng)).unwrap(),
-            StrategyKind::Gls => serde_json::to_value(sample_gls_params(&mut rng)).unwrap(),
-        };
-        let seed = seed_base.wrapping_add((i as u64).wrapping_mul(1_000_003));
-
-        let res = run_one_trial::<i64>(kind, &params_json, problem, filename, seed);
-
-        // Log one-line & JSONL
-        if let Some(c) = res.cost {
-            tracing::info!(
-                "[{:?}] cost={} rt={}ms seed={} params={}",
-                kind,
-                c,
-                res.runtime_ms,
-                res.seed,
-                res.params
-            );
+    fn mutate(&self, rng: &mut ChaCha8Rng) -> Self {
+        let mut p = self.clone();
+        p.local_lo = jitter_usize(rng, p.local_lo, 0.40, 200, 4000);
+        p.local_hi = jitter_usize(rng, p.local_hi, 0.40, p.local_lo + 50, 5000);
+        p.sideways = if rng.random_bool(0.15) {
+            !p.sideways
         } else {
-            tracing::warn!(
-                "[{:?}] infeasible rt={}ms seed={} params={}",
-                kind,
-                res.runtime_ms,
-                res.seed,
-                res.params
-            );
-        }
-        append_jsonl(kind, &res);
+            p.sideways
+        };
+        p.worsen_prob = jitter_f64(rng, p.worsen_prob, 0.8, 0.0, 0.15);
+        p.destroy_attempts = jitter_usize(rng, p.destroy_attempts, 0.40, 3, 64);
+        p.repair_attempts = jitter_usize(rng, p.repair_attempts, 0.40, 6, 80);
+        p.refetch_after_stale = jitter_usize(rng, p.refetch_after_stale, 0.40, 8, 120);
+        p.hard_refetch_every = jitter_usize(rng, p.hard_refetch_every, 0.60, 0, 64);
+        p.kicks_after_refetch = jitter_usize(rng, p.kicks_after_refetch, 0.60, 0, 24);
+        p.ewma_beta = jitter_f64(rng, p.ewma_beta, 0.40, 0.05, 0.95);
+        p.sr_low = jitter_f64(rng, p.sr_low, 0.40, 0.0, 0.9);
+        p.sr_high = (jitter_f64(rng, p.sr_high, 0.40, 0.0, 0.98)).max((p.sr_low + 0.05).min(0.98));
+        p.upd_period = jitter_usize(rng, p.upd_period, 0.60, 1, 12);
+        p.step_max = jitter_usize(rng, p.step_max, 0.60, 1, 6);
+        p.bias_explore = if rng.random_bool(0.10) {
+            !p.bias_explore
+        } else {
+            p.bias_explore
+        };
+        p
+    }
+}
+fn build_ils<'p>(
+    model: &SolverModel<'p, i64>,
+    params: &IlsParams,
+) -> Box<dyn berth_alloc_solver::engine::search::SearchStrategy<i64, ChaCha8Rng>> {
+    let mut s = ils::ils_strategy::<i64, ChaCha8Rng>(model);
+    s = s
+        .with_local_steps_range(params.local_lo..=params.local_hi)
+        .with_local_sideways(params.sideways)
+        .with_local_worsening_prob(params.worsen_prob)
+        .with_destroy_attempts(params.destroy_attempts)
+        .with_repair_attempts(params.repair_attempts)
+        .with_shuffle_local_each_step(true)
+        .with_refetch_after_stale(params.refetch_after_stale)
+        .with_hard_refetch_every(params.hard_refetch_every)
+        .with_hard_refetch_mode(ils::HardRefetchMode::IfBetter)
+        .with_kick_ops_after_refetch(params.kicks_after_refetch)
+        .with_online_perturbation(true)
+        .with_destroy_cap_bounds(4, 48)
+        .with_repair_cap_bounds(8, 64)
+        .with_online_ewma_beta(params.ewma_beta)
+        .with_online_success_band(params.sr_low, params.sr_high)
+        .with_online_cap_update_period(params.upd_period)
+        .with_online_cap_step_max(params.step_max)
+        .with_online_bias_explore_on_stagnation(params.bias_explore);
+    Box::new(s)
+}
 
-        // Update live summary
-        update_and_write_summary(
-            kind,
-            &mut acc_trials,
-            &mut acc_feasible,
-            &mut acc_cost_sum,
-            &mut acc_runtime_sum,
-            &mut best,
-            &res,
-        );
+// ---- SA params ----
+#[derive(Clone, Serialize, Deserialize)]
+struct SaParams {
+    t0: f64,
+    cooling: f64,
+    steps_per_epoch: usize,
+    refetch_every: usize,
+    stale_epochs: usize,
+    reheat: f64,
+    kicks: usize,
+    low: f64,
+    high: f64,
+    nudge_up: f64,
+    extra_cool: f64,
+    blend_geo: f64,
+    blend_tgt: f64,
+    beta: f64,
+}
+impl ParamSpace for SaParams {
+    fn sample_new(rng: &mut ChaCha8Rng) -> Self {
+        let low = pick_f64(rng, 0.12, 0.35);
+        let high = (low + pick_f64(rng, 0.25, 0.5)).clamp(low + 0.2, 0.9);
+        let blend_geo = pick_f64(rng, 0.4, 0.9);
+        let blend_tgt = (1.0 - blend_geo).max(0.05);
+        Self {
+            t0: pick_f64(rng, 12.0, 90.0),
+            cooling: pick_f64(rng, 0.9982, 0.99995),
+            steps_per_epoch: pick_usize(rng, 600, 2000),
+            refetch_every: pick_usize(rng, 60, 200),
+            stale_epochs: pick_usize(rng, 30, 100),
+            reheat: pick_f64(rng, 0.6, 0.95),
+            kicks: pick_usize(rng, 4, 32),
+            low,
+            high,
+            nudge_up: pick_f64(rng, 1.02, 1.12),
+            extra_cool: pick_f64(rng, 0.990, 1.0),
+            blend_geo,
+            blend_tgt,
+            beta: pick_f64(rng, 0.80, 0.96),
+        }
+    }
+    fn mutate(&self, rng: &mut ChaCha8Rng) -> Self {
+        let mut p = self.clone();
+        p.t0 = jitter_f64(rng, p.t0, 0.40, 6.0, 120.0);
+        p.cooling = jitter_f64(rng, p.cooling, 0.0006, 0.9975, 0.99999);
+        p.steps_per_epoch = jitter_usize(rng, p.steps_per_epoch, 0.40, 300, 3000);
+        p.refetch_every = jitter_usize(rng, p.refetch_every, 0.40, 40, 300);
+        p.stale_epochs = jitter_usize(rng, p.stale_epochs, 0.40, 20, 160);
+        p.reheat = jitter_f64(rng, p.reheat, 0.20, 0.5, 0.99);
+        p.kicks = jitter_usize(rng, p.kicks, 0.40, 0, 48);
+        p.low = jitter_f64(rng, p.low, 0.40, 0.05, 0.5);
+        p.high = jitter_f64(rng, p.high, 0.40, p.low + 0.1, 0.95);
+        p.nudge_up = jitter_f64(rng, p.nudge_up, 0.20, 1.01, 1.20);
+        p.extra_cool = jitter_f64(rng, p.extra_cool, 0.05, 0.96, 1.0);
+        let g = jitter_f64(rng, p.blend_geo, 0.30, 0.15, 0.95);
+        p.blend_geo = g;
+        p.blend_tgt = (1.0 - g).max(0.02);
+        p.beta = jitter_f64(rng, p.beta, 0.10, 0.6, 0.98);
+        p
+    }
+}
+fn build_sa<'p>(
+    model: &SolverModel<'p, i64>,
+    params: &SaParams,
+) -> Box<dyn berth_alloc_solver::engine::search::SearchStrategy<i64, ChaCha8Rng>> {
+    let mut s = sa::sa_strategy::<i64, ChaCha8Rng>(model);
+    s = s
+        .with_init_temp(params.t0)
+        .with_cooling(params.cooling)
+        .with_min_temp(1e-4)
+        .with_steps_per_epoch(params.steps_per_epoch)
+        .with_hard_refetch_every(params.refetch_every)
+        .with_hard_refetch_mode(sa::HardRefetchMode::IfBetter)
+        .with_refetch_after_stale(params.stale_epochs)
+        .with_reheat_factor(params.reheat)
+        .with_kick_ops_after_refetch(params.kicks)
+        .with_big_m_for_energy(900_000_000)
+        .with_acceptance_targets(params.low, params.high)
+        .with_ar_nudge_up(params.nudge_up)
+        .with_ar_extra_cooling(params.extra_cool)
+        .with_online_temp_blend(params.blend_geo, params.blend_tgt)
+        .with_auto_temperatures(true)
+        .with_ewma_beta(params.beta);
+    Box::new(s)
+}
+
+// ---------- thread-safe archives & IO per strategy ----------
+struct SharedSpace<P: ParamSpace> {
+    archive: Mutex<Archive<P>>,
+    paths: IoPaths,
+    lock: &'static Mutex<()>, // for file IO
+}
+impl<P: ParamSpace> SharedSpace<P> {
+    fn new(kind: StratKind, top_cap: usize) -> AppResult<Self> {
+        let paths = io_paths(kind);
+        ensure_dir(&paths.dir)?;
+        Ok(Self {
+            archive: Mutex::new(Archive::new(top_cap)),
+            paths,
+            lock: match kind {
+                StratKind::Gls => &GLS_IO_LOCK,
+                StratKind::Ils => &ILS_IO_LOCK,
+                StratKind::Sa => &SA_IO_LOCK,
+            },
+        })
+    }
+    fn append_trial(&self, rec: &TrialRecord<P>) -> AppResult<()> {
+        let _g = self.lock.lock();
+        let f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.paths.trials_jsonl)?;
+        let mut w = BufWriter::new(f);
+        serde_json::to_writer(&mut w, rec)?;
+        w.write_all(b"\n")?;
+        w.flush()?;
+        Ok(())
+    }
+    fn write_best(&self, best: &BestSnapshot<P>) -> AppResult<()> {
+        let _g = self.lock.lock();
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.paths.best_json)?;
+        let mut w = BufWriter::new(f);
+        serde_json::to_writer_pretty(&mut w, best)?;
+        w.flush()?;
+        Ok(())
+    }
+    fn write_top(&self) -> AppResult<()> {
+        let tops: Vec<Scored<P>> = {
+            let arc = self.archive.lock();
+            arc.top.clone()
+        };
+        let _g = self.lock.lock();
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.paths.top_json)?;
+        let mut w = BufWriter::new(f);
+        serde_json::to_writer_pretty(&mut w, &tops)?;
+        w.flush()?;
+        Ok(())
     }
 }
 
-/* ------------------------- main ------------------------- */
+// ---------- core worker ----------
+fn worker_loop<P, Bldr>(
+    kind: StratKind,
+    shared: Arc<SharedSpace<P>>,
+    problem: Arc<Problem<i64>>,
+    file_name: String,
+    mut build_strategy: Bldr,
+) where
+    P: ParamSpace,
+    Bldr: FnMut(
+            &SolverModel<'_, i64>,
+            &P,
+        )
+            -> Box<dyn berth_alloc_solver::engine::search::SearchStrategy<i64, ChaCha8Rng>>
+        + Send
+        + 'static,
+{
+    let tid: u64 = rand::random::<u64>();
+    let mut rng = ChaCha8Rng::seed_from_u64(tid ^ 0xBADC0FFE_u64);
+    loop {
+        let params = {
+            let arc = shared.archive.lock();
+            let mode = arc.choose_mode(&mut rng);
+            let candidate = match mode {
+                Mode::Explore => P::sample_new(&mut rng),
+                Mode::Exploit => {
+                    if let Some(base) = arc.exploit_weighted_pick(&mut rng) {
+                        base.params.clone().mutate(&mut rng)
+                    } else {
+                        P::sample_new(&mut rng)
+                    }
+                }
+            };
+            drop(arc);
+            candidate
+        };
 
-fn main() {
-    enable_tracing();
+        let model = match SolverModel::from_problem(&problem) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("Model build failed: {e}");
+                continue;
+            }
+        };
 
-    let (problem, filename) = load_first_instance();
-    tracing::info!(
-        "Random tuner on first instance: {} (|berths|={}, |flex|={})",
-        filename,
-        problem.berths().len(),
-        problem.flexible_requests().len()
+        let strategy = (build_strategy)(&model, &params);
+
+        // One-strategy engine, one worker inside → lots of outer threads saturate CPU
+        let mut engine = SolverEngineBuilder::<i64>::default()
+            .with_config(SolverEngineConfig {
+                num_workers: 1,
+                time_limit: Duration::from_secs(20),
+            })
+            .with_strategy(strategy)
+            .build();
+
+        let start_ts = Utc::now();
+        let t0 = Instant::now();
+        let outcome = engine.solve(&problem);
+        let runtime = t0.elapsed();
+        let end_ts = Utc::now();
+
+        let cost_opt: Option<i64> = match outcome {
+            Ok(Some(sol)) => Some(sol.cost()),
+            Ok(None) => None,
+            Err(_) => None,
+        };
+
+        let rec = TrialRecord {
+            strategy: kind.as_str().to_string(),
+            params: params.clone(),
+            seed: tid,
+            start_ts,
+            end_ts,
+            runtime_ms: runtime.as_millis(),
+            cost: cost_opt,
+        };
+
+        let mut new_best = false;
+        if let Some(cost) = cost_opt {
+            let scored = Scored {
+                params: params.clone(),
+                seed: tid,
+                cost,
+                runtime_ms: runtime.as_millis(),
+            };
+            let (is_best, _improved_top) = {
+                let mut arc = shared.archive.lock();
+                let (b, t) = arc.register(scored.clone());
+                // reward by new global best (simple streaming signal)
+                let mode_now = arc.choose_mode(&mut rng);
+                arc.reward(mode_now, b);
+                (b, t)
+            };
+            new_best = is_best;
+            if is_best {
+                let snap = BestSnapshot {
+                    strategy: kind.as_str().to_string(),
+                    params: params.clone(),
+                    seed: tid,
+                    cost,
+                    runtime_ms: runtime.as_millis(),
+                    filename: file_name.clone(),
+                    at: end_ts,
+                };
+                let _ = shared.write_best(&snap);
+                let _ = shared.write_top();
+            }
+        }
+
+        let _ = shared.append_trial(&rec);
+        if new_best {
+            info!(
+                "[{}] NEW BEST: {:?}",
+                kind.as_str(),
+                rec.cost.unwrap_or(i64::MAX)
+            );
+        }
+    }
+}
+
+// ---------- main ----------
+fn main() -> AppResult<()> {
+    // tracing
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".parse().unwrap()),
+        )
+        .with_target(false)
+        .compact()
+        .init();
+
+    ensure_dir(Path::new("tuning"))?;
+
+    // load one instance (as requested)
+    let (problem, filename) = load_first_instance()?;
+    let problem = Arc::new(problem);
+
+    // archives per strategy
+    let gls_space: Arc<SharedSpace<GlsParams>> = Arc::new(SharedSpace::new(StratKind::Gls, 64)?);
+    let ils_space: Arc<SharedSpace<IlsParams>> = Arc::new(SharedSpace::new(StratKind::Ils, 64)?);
+    let sa_space: Arc<SharedSpace<SaParams>> = Arc::new(SharedSpace::new(StratKind::Sa, 64)?);
+
+    // ctrl-c: exit (files are flushed on every write)
+    ctrlc::set_handler(move || {
+        eprintln!("\nCtrl-C: stopping tuners (logs already flushed).");
+        std::process::exit(0);
+    })?;
+
+    // decide thread count and split across strategies to max out CPU
+    let total = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(3);
+    let base = total / 3;
+    let mut rem = total % 3;
+    let mut counts = [base, base, base];
+    for item in &mut counts {
+        if rem > 0 {
+            *item += 1;
+            rem -= 1;
+        }
+    }
+    info!(
+        "Launching {} tuner threads (GLS={}, ILS={}, SA={}) — 20s/trial, running forever.",
+        total, counts[0], counts[1], counts[2]
     );
 
-    let threads = threads_per_strategy();
-    let trials = trials_per_worker();
-    let base_seed = cfg_u64("TUNER_BASE_SEED", 0x00C0_FFEE_1234_ABCD);
+    // thread spawns
+    let mut handles = Vec::new();
 
-    // Run ILS / SA / GLS groups concurrently
-    thread::scope(|scope| {
-        // ILS
-        for w in 0..threads {
-            let prob_ref = &problem;
-            let fname = filename.clone();
-            let seed = base_seed.wrapping_add(0x11_0000).wrapping_add(w as u64);
-            scope.spawn(move || worker_loop(StrategyKind::Ils, prob_ref, &fname, trials, seed));
-        }
-        // SA
-        for w in 0..threads {
-            let prob_ref = &problem;
-            let fname = filename.clone();
-            let seed = base_seed.wrapping_add(0x22_0000).wrapping_add(w as u64);
-            scope.spawn(move || worker_loop(StrategyKind::Sa, prob_ref, &fname, trials, seed));
-        }
-        // GLS
-        for w in 0..threads {
-            let prob_ref = &problem;
-            let fname = filename.clone();
-            let seed = base_seed.wrapping_add(0x33_0000).wrapping_add(w as u64);
-            scope.spawn(move || worker_loop(StrategyKind::Gls, prob_ref, &fname, trials, seed));
-        }
-    });
+    for _ in 0..counts[0] {
+        let space = gls_space.clone();
+        let problem = problem.clone();
+        let fname = filename.clone();
+        handles.push(thread::spawn(move || {
+            worker_loop(StratKind::Gls, space, problem, fname, |model, params| {
+                build_gls(model, params)
+            });
+        }));
+    }
+    for _ in 0..counts[1] {
+        let space = ils_space.clone();
+        let problem = problem.clone();
+        let fname = filename.clone();
+        handles.push(thread::spawn(move || {
+            worker_loop(StratKind::Ils, space, problem, fname, |model, params| {
+                build_ils(model, params)
+            });
+        }));
+    }
+    for _ in 0..counts[2] {
+        let space = sa_space.clone();
+        let problem = problem.clone();
+        let fname = filename.clone();
+        handles.push(thread::spawn(move || {
+            worker_loop(StratKind::Sa, space, problem, fname, |model, params| {
+                build_sa(model, params)
+            });
+        }));
+    }
 
-    tracing::info!(
-        "Tuner finished batch (workers_per_strategy={}, trials_per_worker={}).",
-        threads,
-        trials
-    );
+    // park forever
+    for h in handles {
+        let _ = h.join();
+    }
+    Ok(())
 }

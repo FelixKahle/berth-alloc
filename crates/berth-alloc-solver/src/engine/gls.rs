@@ -19,11 +19,10 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use crate::engine::acceptor::Acceptor;
 use crate::{
     core::numeric::SolveNumeric,
     engine::{
-        acceptor::LexStrictAcceptor,
+        acceptor::{Acceptor, LexStrictAcceptor},
         neighbors,
         operators::{LocalPool, SoftmaxSelector},
         search::{SearchContext, SearchStrategy},
@@ -53,14 +52,15 @@ use crate::{
 };
 use berth_alloc_core::prelude::{Cost, TimePoint};
 use num_traits::ToPrimitive;
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::Ordering as AtomicOrdering};
 
 // ===============================
-// Feature extraction & penalties
+// Features & penalties
 // ===============================
 
-/// Generalized penalizable feature.
+/// Penalizable feature keys for GLS.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Feature {
     /// (request, berth)
@@ -77,18 +77,17 @@ pub enum Feature {
     RequestTime { req: usize, tb: i64 },
 }
 
-/// Extracts all features “touched” by placing `request` at `(berth, start_time)`.
 pub trait FeatureExtractor<T> {
     fn features_for(
         &self,
         request: RequestIndex,
         berth: BerthIndex,
         start_time: TimePoint<T>,
-        out: &mut smallvec::SmallVec<[Feature; 6]>,
+        out: &mut SmallVec<[Feature; 6]>,
     );
 }
 
-/// Configurable extractor using a caller-provided time bucketizer.
+/// Configurable extractor using a time bucketizer.
 #[derive(Clone)]
 pub struct DefaultFeatureExtractor<T, FBucket>
 where
@@ -157,7 +156,7 @@ where
         req: RequestIndex,
         berth: BerthIndex,
         start_time: TimePoint<T>,
-        out: &mut smallvec::SmallVec<[Feature; 6]>,
+        out: &mut SmallVec<[Feature; 6]>,
     ) {
         let r = req.get();
         let b = berth.get();
@@ -186,9 +185,7 @@ where
 
 #[derive(Clone, Copy, Debug)]
 pub enum DecayMode {
-    /// Multiply by num/den each outer round (integer arithmetic).
     Multiplicative { num: u32, den: u32 },
-    /// Subtract constant (floored at 0).
     Subtractive { step: i64 },
 }
 
@@ -227,12 +224,10 @@ impl PenaltyStore {
         let e = self.map.entry(f).or_insert(0);
         *e = (*e + step).min(self.max_penalty);
     }
-
     #[inline]
     pub fn get(&self, f: &Feature) -> i64 {
         *self.map.get(f).unwrap_or(&0)
     }
-
     #[inline]
     pub fn sum<'a>(&self, feats: impl IntoIterator<Item = &'a Feature>) -> i64 {
         let mut s = 0i64;
@@ -242,7 +237,6 @@ impl PenaltyStore {
         s
     }
 
-    /// Apply decay once per outer round.
     pub fn decay_once(&mut self) {
         if let Some(d) = self.decay {
             match d {
@@ -309,7 +303,7 @@ where
         let base = self
             .base
             .eval_request(model, request, start_time, berth_index)?;
-        let mut buf: smallvec::SmallVec<[Feature; 6]> = smallvec::SmallVec::new();
+        let mut buf: SmallVec<[Feature; 6]> = SmallVec::new();
         self.feats
             .features_for(request, berth_index, start_time, &mut buf);
         let pen_sum = self.penalties.sum(buf.iter()) as Cost;
@@ -318,7 +312,7 @@ where
 }
 
 // ===============================
-// Small pure helpers (testable)
+// Pure helpers
 // ===============================
 
 #[inline]
@@ -332,7 +326,6 @@ fn gls_lex_accept(
         || (cand_unassigned == cur_unassigned && cand_aug < cur_aug_cost)
 }
 
-/// Recompute true/base delta for a plan using “last patch wins”.
 fn recompute_true_delta<T>(
     model: &SolverModel<'_, T>,
     before: &SolverState<'_, T>,
@@ -364,7 +357,6 @@ where
     base_delta
 }
 
-/// Compute augmented cost of a state given penalties and feature extractor.
 fn augmented_cost_of_state<T, FX>(
     state: &SolverState<'_, T>,
     feats: &FX,
@@ -375,7 +367,6 @@ where
     T: Copy + Ord,
     FX: FeatureExtractor<T> + ?Sized,
 {
-    use smallvec::SmallVec;
     let mut buf: SmallVec<[Feature; 6]> = SmallVec::new();
     let mut p_sum: i64 = 0;
 
@@ -396,7 +387,39 @@ where
         .saturating_add(lambda_cost.saturating_mul(p_sum as Cost))
 }
 
-/// Pulse penalties when stalled: compute utilities per feature and add step to top_k.
+fn penalty_share_of_state<T, FX>(
+    state: &SolverState<'_, T>,
+    feats: &FX,
+    store: &PenaltyStore,
+    lambda_cost: i64,
+) -> f64
+where
+    T: Copy + Ord,
+    FX: FeatureExtractor<T> + ?Sized,
+{
+    let mut buf: SmallVec<[Feature; 6]> = SmallVec::new();
+    let mut p_sum: i64 = 0;
+
+    for (i, dv) in state.decision_variables().iter().enumerate() {
+        if let DecisionVar::Assigned(Decision {
+            berth_index,
+            start_time,
+        }) = *dv
+        {
+            buf.clear();
+            feats.features_for(RequestIndex::new(i), berth_index, start_time, &mut buf);
+            p_sum = p_sum.saturating_add(store.sum(buf.iter()));
+        }
+    }
+    let true_cost = state.fitness().cost as f64;
+    let pen_cost = (lambda_cost as f64) * (p_sum as f64);
+    if true_cost <= 0.0 && pen_cost <= 0.0 {
+        0.0
+    } else {
+        pen_cost / (true_cost + pen_cost)
+    }
+}
+
 fn pulse_penalties<T, FX>(
     model: &SolverModel<'_, T>,
     current: &SolverState<'_, T>,
@@ -415,7 +438,7 @@ fn pulse_penalties<T, FX>(
     let mut util_by_feature: HashMap<Feature, i128> = HashMap::new();
 
     pc.builder().with_explorer(|ex| {
-        let mut feats_buf: smallvec::SmallVec<[Feature; 6]> = smallvec::SmallVec::new();
+        let mut feats_buf: SmallVec<[Feature; 6]> = SmallVec::new();
         for (i, dv) in ex.decision_vars().iter().enumerate() {
             if let DecisionVar::Assigned(Decision {
                 berth_index,
@@ -432,8 +455,7 @@ fn pulse_penalties<T, FX>(
                 );
                 for f in feats_buf.iter().cloned() {
                     let p = *store.map.get(&f).unwrap_or(&0) as i128;
-                    // GLS proxy utility: higher base & lower current penalty -> higher utility
-                    let u = (base as i128) / (1 + p);
+                    let u = (base as i128) / (1 + p); // higher base, lower penalty → higher utility
                     *util_by_feature.entry(f).or_insert(0) += u;
                 }
             }
@@ -466,7 +488,7 @@ where
     R: rand::Rng,
     FX: FeatureExtractor<T> + ?Sized,
 {
-    // Operators as a pool (evaluated on augmented costs)
+    // Operator pool (augmented objective)
     pool: LocalPool<T, AugmentedCostEvaluator<DefaultCostEvaluator, T, FX>, R>,
 
     // GLS parameters
@@ -476,22 +498,28 @@ where
     pulse_top_k: usize,
     max_local_steps: usize,
 
-    // Penalty store & extractor
+    // Penalties & extractor
     penalty_store: PenaltyStore,
     feature_extractor: Arc<FX>,
 
-    // Acceptance
-    true_acceptor: LexStrictAcceptor, // TRUE objective (for publish)
+    // Acceptance/publish on TRUE objective
+    true_acceptor: LexStrictAcceptor,
 
-    // Refetch knobs
-    refetch_after_stale: usize, // 0 => derive from pulse threshold
-    hard_refetch_every: usize,  // 0 => disabled
+    // Refetch & restarts
+    refetch_after_stale: usize,
+    hard_refetch_every: usize,
     hard_refetch_mode: HardRefetchMode,
-
-    // Reset / restart behavior (penalties are preserved across resets)
     restart_on_publish: bool,
     reset_on_refetch: bool,
     kick_steps_on_reset: usize,
+
+    // -------- Online λ control --------
+    adaptive_lambda: bool,
+    tgt_pen_share_low: f64,
+    tgt_pen_share_high: f64,
+    lambda_step_frac: f64,
+    lambda_min: i64,
+    lambda_max: i64,
 }
 
 impl<T, R, FX> GuidedLocalSearchStrategy<T, R, FX>
@@ -517,15 +545,23 @@ where
                 .with_decay(DecayMode::Multiplicative { num: 9, den: 10 }),
             feature_extractor,
             true_acceptor: LexStrictAcceptor,
-            refetch_after_stale: 0, // derive from pulse threshold by default
+            refetch_after_stale: 0,
             hard_refetch_every: 0,
             hard_refetch_mode: HardRefetchMode::IfBetter,
             restart_on_publish: true,
             reset_on_refetch: true,
             kick_steps_on_reset: 3,
+            // online λ defaults
+            adaptive_lambda: false,
+            tgt_pen_share_low: 0.18,
+            tgt_pen_share_high: 0.38,
+            lambda_step_frac: 0.08,
+            lambda_min: 1,
+            lambda_max: i64::MAX / 4,
         }
     }
 
+    // ---------- builders ----------
     pub fn with_local_op(
         mut self,
         op: Box<
@@ -538,15 +574,15 @@ where
         self
     }
     pub fn with_lambda(mut self, lambda: i64) -> Self {
-        self.lambda = lambda;
+        self.lambda = lambda.max(1);
         self
     }
     pub fn with_penalty_step(mut self, step: i64) -> Self {
-        self.penalty_step = step;
+        self.penalty_step = step.max(1);
         self
     }
     pub fn with_max_local_steps(mut self, steps: usize) -> Self {
-        self.max_local_steps = steps;
+        self.max_local_steps = steps.max(1);
         self
     }
     pub fn with_refetch_after_stale(mut self, rounds: usize) -> Self {
@@ -586,6 +622,25 @@ where
         self.pulse_top_k = top_k.max(1);
         self
     }
+    // online λ
+    pub fn with_adaptive_lambda(mut self, yes: bool) -> Self {
+        self.adaptive_lambda = yes;
+        self
+    }
+    pub fn with_target_penalty_share(mut self, low: f64, high: f64) -> Self {
+        self.tgt_pen_share_low = low.clamp(0.0, 0.95);
+        self.tgt_pen_share_high = high.max(self.tgt_pen_share_low + 0.02).min(0.98);
+        self
+    }
+    pub fn with_lambda_step_frac(mut self, step: f64) -> Self {
+        self.lambda_step_frac = step.clamp(0.01, 0.25);
+        self
+    }
+    pub fn with_lambda_bounds(mut self, lo: i64, hi: i64) -> Self {
+        self.lambda_min = lo.max(1);
+        self.lambda_max = hi.max(self.lambda_min + 1);
+        self
+    }
 
     #[inline]
     fn should_hard_refetch(&self, outer_rounds: usize) -> bool {
@@ -594,7 +649,6 @@ where
             && outer_rounds.is_multiple_of(self.hard_refetch_every)
     }
 
-    /// Periodic refetch; returns true if a refetch happened.
     #[inline]
     fn periodic_refetch<'e, 'm, 'p>(
         &self,
@@ -633,7 +687,6 @@ where
         false
     }
 
-    /// Staleness-triggered refetch; returns true if a refetch happened.
     #[inline]
     fn stale_refetch<'e, 'm, 'p>(
         &self,
@@ -667,8 +720,6 @@ where
         false
     }
 
-    /// Apply up to `kick_steps_on_reset` local proposals from the pool with the augmented evaluator.
-    /// Uses neutral reward and recomputes TRUE delta to keep state consistent.
     fn reset_state<'p>(
         &mut self,
         model: &SolverModel<'p, T>,
@@ -694,7 +745,6 @@ where
             let mut prop = self.pool.apply(&mut pc, rng, None);
 
             if let Some(mut plan) = prop.take_plan() {
-                // Build patches list
                 let patches: Vec<(RequestIndex, DecisionVar<T>)> = plan
                     .decision_var_patches
                     .iter()
@@ -705,10 +755,9 @@ where
                 plan.delta_cost = delta;
 
                 current.apply_plan(plan);
-                prop.accept(0); // neutral reward for kick
+                prop.accept(0);
             } else {
                 prop.reject();
-                // Try next step regardless (pool will vary selection)
             }
         }
 
@@ -743,17 +792,13 @@ where
         let mut current: SolverState<'p, T> = context.shared_incumbent().snapshot();
         let mut best_true: SolverState<'p, T> = current.clone();
 
-        // Buffers & data-driven trackers (ε & refetch)
+        // Buffers & trackers
         let mut dv_buf: Vec<DecisionVar<T>> =
             vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-
-        let mut eps_src = MedianHistoryEpsilon::new(/*history_cap*/ 32, /*min_eps*/ 1);
-        let mut stale_best = StaleTracker::new(*current.fitness(), /*history_cap*/ 32);
-
-        // Pulse staleness (rounds with *no accepted move*), separate from best-tracker
+        let mut eps_src = MedianHistoryEpsilon::new(32, 1);
+        let mut stale_best = StaleTracker::new(*current.fitness(), 32);
         let mut pulse_stale_rounds = 0usize;
 
-        // Derive patience for refetch if requested
         let patience_epochs = if self.refetch_after_stale == 0 {
             patience_from_pulse_threshold(self.stagnation_rounds_before_pulse)
         } else {
@@ -768,13 +813,9 @@ where
             }
             outer_rounds = outer_rounds.saturating_add(1);
 
-            // Time decay once per round
             self.penalty_store.decay_once();
-
-            // ε from history (snapshot for decisions this round)
             let eps = eps_src.epsilon();
 
-            // Periodic refetch (ε-guarded materiality); optional reset
             if self.periodic_refetch(&mut current, &mut best_true, context, outer_rounds, eps)
                 && self.reset_on_refetch
             {
@@ -789,32 +830,28 @@ where
 
             let mut accepted_any = false;
 
-            // Augmented evaluator snapshot for the round
             let aug_eval = AugmentedCostEvaluator::new(
                 DefaultCostEvaluator,
                 self.penalty_store.clone(),
                 self.lambda as Cost,
-                self.feature_extractor.clone(), // cheap Arc clone
+                self.feature_extractor.clone(),
             );
 
-            // ------------ Local improvement on augmented objective ------------
+            // Local augmented improvement
             for _ in 0..self.max_local_steps {
                 if stop.load(AtomicOrdering::Relaxed) {
                     break 'outer;
                 }
 
-                // One attempt via the operator pool (softmax over stats).
                 let mut pc =
                     PlanningContext::new(model, &current, &aug_eval, dv_buf.as_mut_slice());
                 let mut prop = self.pool.apply(&mut pc, context.rng(), None);
 
-                // If no plan, reject and continue to pulse/refetch logic.
                 let Some(mut plan) = prop.take_plan() else {
                     prop.reject();
                     break;
                 };
 
-                // Recompute TRUE/base delta (last-patch-wins)
                 let patches: Vec<(RequestIndex, DecisionVar<T>)> = plan
                     .decision_var_patches
                     .iter()
@@ -826,7 +863,6 @@ where
                 let mut cand = current.clone();
                 cand.apply_plan(plan);
 
-                // GLS acceptor on augmented objective (pure function)
                 let cur_aug = augmented_cost_of_state(
                     &current,
                     self.feature_extractor.as_ref(),
@@ -843,7 +879,6 @@ where
                 let cur_unassigned = current.fitness().unassigned_requests;
                 let cand_unassigned = cand.fitness().unassigned_requests;
 
-                // TRUE reward/improvement (positive = good) used to inform pool stats
                 let true_improvement = current
                     .fitness()
                     .cost
@@ -851,11 +886,9 @@ where
                     .max(0);
 
                 if gls_lex_accept(cur_unassigned, cur_aug, cand_unassigned, cand_aug) {
-                    // Accept on augmented; reward by TRUE improvement
                     current = cand;
                     prop.accept(true_improvement);
 
-                    // TRUE objective for best publishing + ε-history
                     if self
                         .true_acceptor
                         .accept(best_true.fitness(), current.fitness())
@@ -866,7 +899,6 @@ where
                             .saturating_sub(current.fitness().cost)
                             .max(0);
                         eps_src.record(drop);
-
                         best_true = current.clone();
                         let _ = context.shared_incumbent().try_update(&best_true, model);
 
@@ -883,29 +915,23 @@ where
                     }
 
                     accepted_any = true;
-                    // restart local climb from updated state
                 } else {
-                    // Rejected on augmented objective
                     prop.reject();
                     break;
                 }
             }
 
-            // ----------------- Pulse / Refetch logic -----------------
-
-            // Maintain pulse staleness on "no accepted move"
+            // Pulse/Refetch
             if !accepted_any {
                 pulse_stale_rounds = pulse_stale_rounds.saturating_add(1);
             } else {
                 pulse_stale_rounds = 0;
             }
 
-            // Track best-TRUE improvements for ε and refetch patience
             if let Some(delta) = stale_best.on_round_end(*best_true.fitness()) {
                 eps_src.record(delta);
             }
 
-            // Pulse penalties when local search stalls (independent of refetch)
             if pulse_stale_rounds >= self.stagnation_rounds_before_pulse {
                 pulse_penalties(
                     model,
@@ -924,7 +950,6 @@ where
                 );
             }
 
-            // Stale refetch on TRUE-best stagnation, ε-guarded materiality
             if stale_best.is_stale(patience_epochs) {
                 let eps_now = eps_src.epsilon();
                 if self.stale_refetch(&mut current, &mut best_true, context, eps_now)
@@ -937,13 +962,31 @@ where
                         &mut current,
                         "stale-refetch",
                     );
-                    // After a reset/refetch, require one strict best improvement before refetching again
                     stale_best.arm_cooldown_until_next_improvement();
+                }
+            }
+
+            // -------- Online λ control --------
+            if self.adaptive_lambda {
+                let share = penalty_share_of_state(
+                    &current,
+                    self.feature_extractor.as_ref(),
+                    &self.penalty_store,
+                    self.lambda,
+                );
+                let step = self.lambda_step_frac;
+                if share < self.tgt_pen_share_low {
+                    let nl = ((self.lambda as f64) * (1.0 + step)).round() as i64;
+                    self.lambda = nl.clamp(self.lambda_min, self.lambda_max);
+                    tracing::trace!("GLS: λ↑ → {} (penalty share {:.3})", self.lambda, share);
+                } else if share > self.tgt_pen_share_high {
+                    let nl = ((self.lambda as f64) * (1.0 - step)).round().max(1.0) as i64;
+                    self.lambda = nl.clamp(self.lambda_min, self.lambda_max);
+                    tracing::trace!("GLS: λ↓ → {} (penalty share {:.3})", self.lambda, share);
                 }
             }
         }
 
-        // Final publish (no-op if not better).
         let _ = context.shared_incumbent().try_update(&best_true, model);
     }
 }
@@ -960,12 +1003,11 @@ where
     T: SolveNumeric + ToPrimitive + Copy + From<i32>,
     R: rand::Rng + Send + Sync,
 {
-    // Slightly finer buckets to better target conflicts with PT 12–30
     let bucketizer: fn(TimePoint<T>) -> i64 = |t: TimePoint<T>| -> i64 {
         let v_i64 = t
             .value()
             .to_i64()
-            .expect("TimePoint<T>::value() must be convertible to i64 for bucketing");
+            .expect("TimePoint<T> must be i64-convertible");
         v_i64 / 75
     };
 
@@ -977,14 +1019,13 @@ where
         .set_include_berth(true)
         .set_include_request(true);
 
-    let feats_arc = std::sync::Arc::new(feats);
+    let feats_arc = Arc::new(feats);
 
     let proximity_map = model.proximity_map();
     let neighbors_any = neighbors::any(proximity_map);
     let neighbors_direct_competitors = neighbors::direct_competitors(proximity_map);
     let neighbors_same_berth = neighbors::same_berth(proximity_map);
 
-    // Guidance tuned to intensify without over-penalizing; ε-guarded refetch like ILS/SA.
     GuidedLocalSearchStrategy::new(feats_arc)
         .with_lambda(9)
         .with_penalty_step(2)
@@ -992,13 +1033,17 @@ where
         .with_max_penalty(1_000_000_000)
         .with_pulse_params(8, 20)
         .with_max_local_steps(2100)
-        // Refetch: derive patience from pulse threshold; also allow periodic cadence
-        .with_refetch_after_stale(0) // 0 => derive from pulse threshold
+        .with_refetch_after_stale(0)
         .with_hard_refetch_every(24)
         .with_hard_refetch_mode(HardRefetchMode::IfBetter)
         .with_restart_on_publish(true)
         .with_reset_on_refetch(true)
         .with_kick_steps_on_reset(6)
+        // online λ defaults (engine may override)
+        .with_adaptive_lambda(true)
+        .with_target_penalty_share(0.18, 0.38)
+        .with_lambda_step_frac(0.08)
+        .with_lambda_bounds(1, 2_000_000)
         // ------------------------- Local operators -------------------------
         .with_local_op(Box::new(
             ShiftEarlierOnSameBerth::new(18..=52).with_neighbors(neighbors_same_berth.clone()),
@@ -1039,7 +1084,7 @@ where
         ))
         .with_local_op(Box::new(
             CascadeRelocateK::new(3..=4, 8..=12, 12..=24)
-                .with_neighbors(neighbors_direct_competitors.clone())
-                .with_insert_policy(CascadeInsertPolicy::BestEarliest), // greedy & cheap
+                .with_neighbors(neighbors_direct_competitors)
+                .with_insert_policy(CascadeInsertPolicy::BestEarliest),
         ))
 }
