@@ -20,69 +20,85 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    model::index::RequestIndex,
-    search::planner::{CostEvaluator, PlanningContext},
-    state::plan::Plan,
+    search::eval::CostEvaluator,
+    state::{plan::Plan, solver_state::SolverState},
 };
 
-// Some operators can be restricted to "nearby" candidates via callbacks.
-// If none are provided, we revert to the full space (i.e., all berths / all slots).
-pub type NeighborFn = dyn Fn(RequestIndex) -> Vec<RequestIndex> + Send + Sync;
-
-pub trait Operator<T: Copy + Ord, C: CostEvaluator<T>, R: rand::Rng>: Send + Sync {
+pub trait LocalSearchOperator<'p, T, C, R>: Send + Sync
+where
+    T: Copy + Ord,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+{
     fn name(&self) -> &str;
-    fn propose<'b, 'c, 's, 'm, 'p>(
-        &self,
-        context: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
-        rng: &mut R,
-    ) -> Option<Plan<'p, T>>;
+    fn synchronize<'s>(&mut self, state: &'s SolverState<'p, T>);
+    fn enter_search(&mut self, random: &mut R);
+    fn make_next_neighbor(&mut self) -> Option<Plan<'p, T>>;
+    fn reset(&mut self);
+    fn has_fragments(&self) -> bool;
+
+    #[inline]
+    fn iter_neighbors<'o>(&'o mut self) -> LocalSearchOperatorIterator<'o, 'p, T, C, R, Self>
+    where
+        Self: Sized,
+    {
+        LocalSearchOperatorIterator::new(self)
+    }
 }
 
-pub trait LocalMoveOperator<T: Copy + Ord, C: CostEvaluator<T>, R: rand::Rng>: Send + Sync {
-    fn name(&self) -> &str;
-    fn propose<'b, 'c, 's, 'm, 'p>(
-        &self,
-        ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
-        rng: &mut R,
-    ) -> Option<Plan<'p, T>>;
+#[derive(Debug)]
+pub struct LocalSearchOperatorIterator<'o, 'p, T, C, R, O>
+where
+    T: Copy + Ord,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+    O: LocalSearchOperator<'p, T, C, R>,
+{
+    operator: &'o mut O,
+    _phantom: std::marker::PhantomData<(&'p T, C, R)>,
 }
 
-pub trait DestroyOperator<T: Copy + Ord, C: CostEvaluator<T>, R: rand::Rng>: Send + Sync {
-    fn name(&self) -> &str;
-    fn propose<'b, 'c, 's, 'm, 'p>(
-        &self,
-        ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
-        rng: &mut R,
-    ) -> Option<Plan<'p, T>>;
+impl<'o, 'p, T, C, R, O> LocalSearchOperatorIterator<'o, 'p, T, C, R, O>
+where
+    T: Copy + Ord,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+    O: LocalSearchOperator<'p, T, C, R>,
+{
+    pub fn new(operator: &'o mut O) -> Self {
+        Self {
+            operator,
+            _phantom: std::marker::PhantomData,
+        }
+    }
 }
 
-pub trait RepairOperator<T: Copy + Ord, C: CostEvaluator<T>, R: rand::Rng>: Send + Sync {
-    fn name(&self) -> &str;
-    fn repair<'b, 'c, 's, 'm, 'p>(
-        &self,
-        ctx: &mut PlanningContext<'b, 'c, 's, 'm, 'p, T, C>,
-        rng: &mut R,
-    ) -> Option<Plan<'p, T>>;
+impl<'o, 'p, T, C, R, O> Iterator for LocalSearchOperatorIterator<'o, 'p, T, C, R, O>
+where
+    T: Copy + Ord,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+    O: LocalSearchOperator<'p, T, C, R>,
+{
+    type Item = Plan<'p, T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.operator.make_next_neighbor()
+    }
 }
 
 #[cfg(test)]
 mod static_assertions {
     use super::*;
-    use crate::search::planner::DefaultCostEvaluator;
+    use crate::search::eval::DefaultCostEvaluator;
     use ::static_assertions::{assert_impl_all, assert_obj_safe};
     use rand_chacha::ChaCha8Rng;
 
     macro_rules! test_integer_types {
         ($($t:ty),* $(,)?) => {
             $(
-                assert_obj_safe!(Operator<$t, DefaultCostEvaluator, ChaCha8Rng>);
-                assert_impl_all!(dyn Operator<$t, DefaultCostEvaluator, ChaCha8Rng> + Send + Sync: Send, Sync);
-                assert_obj_safe!(LocalMoveOperator<$t, DefaultCostEvaluator, ChaCha8Rng>);
-                assert_impl_all!(dyn LocalMoveOperator<$t, DefaultCostEvaluator, ChaCha8Rng> + Send + Sync: Send, Sync);
-                assert_obj_safe!(DestroyOperator<$t, DefaultCostEvaluator, ChaCha8Rng>);
-                assert_impl_all!(dyn DestroyOperator<$t, DefaultCostEvaluator, ChaCha8Rng> + Send + Sync: Send, Sync);
-                assert_obj_safe!(RepairOperator<$t, DefaultCostEvaluator, ChaCha8Rng>);
-                assert_impl_all!(dyn RepairOperator<$t, DefaultCostEvaluator, ChaCha8Rng> + Send + Sync: Send, Sync);
+                assert_obj_safe!(LocalSearchOperator<$t, DefaultCostEvaluator, ChaCha8Rng>);
+                assert_impl_all!(dyn LocalSearchOperator<$t, DefaultCostEvaluator, ChaCha8Rng> + Send + Sync: Send, Sync);
             )*
         };
     }

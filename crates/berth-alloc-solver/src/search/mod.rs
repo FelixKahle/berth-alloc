@@ -20,6 +20,6 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 pub mod err;
+pub mod eval;
 pub mod operator;
-pub mod operator_library;
 pub mod planner;

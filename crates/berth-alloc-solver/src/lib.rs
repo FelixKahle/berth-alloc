@@ -20,7 +20,6 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 pub mod core;
-pub mod engine;
 pub mod model;
 pub mod search;
 pub mod state;

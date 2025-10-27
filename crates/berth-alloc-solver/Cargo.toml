@@ -49,8 +49,3 @@ features = ["std", "attributes"]
 [dev-dependencies]
 static_assertions = "1.1.0"
 criterion = "0.7.0"
-
-[[bench]]
-name = "planner_benches"
-path = "benches/search/planner_benches.rs"
-harness = false
