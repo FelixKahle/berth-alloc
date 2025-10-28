@@ -38,10 +38,33 @@ use berth_alloc_model::{
 use num_traits::{CheckedAdd, CheckedSub};
 use std::ops::Mul;
 
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SolverStateVersion(u64);
+
+impl SolverStateVersion {
+    #[inline]
+    pub const fn new(v: u64) -> Self {
+        Self(v)
+    }
+
+    #[inline]
+    pub fn increment(&mut self) {
+        self.0 = self.0.checked_add(1).expect("SolverStateVersion overflow");
+    }
+}
+
+impl std::fmt::Display for SolverStateVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SolverStateVersion({})", self.0)
+    }
+}
+
 pub trait SolverStateView<'p, T: Copy + Ord> {
     fn decision_variables(&self) -> &[DecisionVar<T>];
     fn terminal_occupancy(&self) -> &TerminalOccupancy<'p, T>;
     fn fitness(&self) -> &Fitness;
+    fn version(&self) -> SolverStateVersion;
 
     fn is_feasible(&self) -> bool {
         self.fitness().unassigned_requests == 0
@@ -57,6 +80,7 @@ pub struct SolverState<'p, T: Copy + Ord> {
     decision_variables: DecisionVarVec<T>,
     terminal_occupancy: TerminalOccupancy<'p, T>,
     fitness: Fitness,
+    version: SolverStateVersion,
 }
 
 impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cost>>
@@ -72,6 +96,7 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cos
             decision_variables,
             terminal_occupancy,
             fitness,
+            version: SolverStateVersion::default(),
         }
     }
 
@@ -112,6 +137,9 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cos
                 .expect("unassigned delta overflow");
             self.fitness.unassigned_requests = new_unassigned;
         }
+
+        // Increment version
+        self.version.increment();
 
         #[cfg(debug_assertions)]
         {
@@ -258,6 +286,11 @@ impl<'p, T: Copy + Ord> SolverStateView<'p, T> for SolverState<'p, T> {
     #[inline]
     fn decision_variables(&self) -> &[DecisionVar<T>] {
         &self.decision_variables
+    }
+
+    #[inline]
+    fn version(&self) -> SolverStateVersion {
+        self.version
     }
 }
 
@@ -760,5 +793,69 @@ mod tests {
 
         let plan = Plan::new_delta(Vec::new(), delta, 0, 0);
         st.apply_plan(plan); // debug_assert!(res.is_ok()) panics
+    }
+
+    #[test]
+    fn test_version_initial_is_zero() {
+        let base = vec![berth(1, 0, 100)];
+        let term = TerminalOccupancy::new(&base);
+        let dv = DecisionVarVec::from(vec![DecisionVar::unassigned()]);
+        let fit = Fitness::new(0, 1);
+
+        let st = SolverState::new(dv, term, fit);
+        assert_eq!(
+            st.version(),
+            SolverStateVersion::new(0),
+            "new solver state must start with version 0"
+        );
+    }
+
+    #[test]
+    fn test_version_increments_on_apply_plan() {
+        let base = vec![berth(1, 0, 100)];
+        let term = TerminalOccupancy::new(&base);
+        let dv = DecisionVarVec::from(vec![DecisionVar::unassigned()]);
+        // Start with positive cost to satisfy apply_plan's debug assertion (cost must be > 0)
+        let mut st = SolverState::new(dv, term, Fitness::new(1, 1));
+
+        let v0 = st.version();
+
+        // No-op plan (keeps DV same, empty terminal delta, zero fitness deltas)
+        let patches = vec![DecisionVarPatch::new(ri(0), DecisionVar::unassigned())];
+        let delta = crate::state::terminal::delta::TerminalDelta::empty();
+        let plan = Plan::new_delta(patches, delta, 0, 0);
+
+        st.apply_plan(plan);
+        let v1 = st.version();
+        assert!(v1 > v0, "version must increment after first apply_plan");
+
+        // Apply another no-op plan and verify monotonic increment
+        let patches2 = vec![DecisionVarPatch::new(ri(0), DecisionVar::unassigned())];
+        let delta2 = crate::state::terminal::delta::TerminalDelta::empty();
+        let plan2 = Plan::new_delta(patches2, delta2, 0, 0);
+
+        st.apply_plan(plan2);
+        let v2 = st.version();
+        assert!(v2 > v1, "version must increment after second apply_plan");
+    }
+
+    #[test]
+    fn test_version_unchanged_by_make_flexible_assignments() {
+        // Problem with two requests both feasible on berth 1
+        let prob = make_problem_simple();
+        let model = SolverModel::try_from(&prob).expect("build model");
+
+        let term = TerminalOccupancy::new(prob.berths().iter());
+        let dv = DecisionVarVec::from(vec![DecisionVar::unassigned(), DecisionVar::unassigned()]);
+        let st = SolverState::new(dv, term, Fitness::new(0, 2));
+
+        let v_before = st.version();
+        let _assignments = st.make_flexible_assignments(&model);
+        let v_after = st.version();
+
+        assert_eq!(
+            v_before, v_after,
+            "read-only operations must not change the version"
+        );
     }
 }

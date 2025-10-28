@@ -53,10 +53,33 @@ pub struct Savepoint {
     saved_delta_unassigned: i32,
 }
 
+impl std::fmt::Display for Savepoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Savepoint(undo_len={}, patches_len={}, saved_delta_cost={}, saved_delta_unassigned={})",
+            self.undo_len, self.patches_len, self.saved_delta_cost, self.saved_delta_unassigned
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 enum TerminalUndoAction<T: Copy + Ord> {
     Occupy(BerthIndex, TimeInterval<T>),
     Release(BerthIndex, TimeInterval<T>),
+}
+
+impl<T: Copy + Ord + std::fmt::Display> std::fmt::Display for TerminalUndoAction<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TerminalUndoAction::Occupy(b, iv) => {
+                write!(f, "Occupy(berth_index={}, interval={})", b, iv)
+            }
+            TerminalUndoAction::Release(b, iv) => {
+                write!(f, "Release(berth_index={}, interval={})", b, iv)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -65,10 +88,29 @@ pub struct DecisionVarUndoAction<T: Copy + Ord> {
     previous_value: DecisionVar<T>,
 }
 
+impl<T: Copy + Ord + std::fmt::Display> std::fmt::Display for DecisionVarUndoAction<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "DecisionVarUndoAction(request_index={}, previous_value={})",
+            self.request_index, self.previous_value
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 enum UndoAction<T: Copy + Ord> {
     Terminal(TerminalUndoAction<T>),
     Decision(DecisionVarUndoAction<T>),
+}
+
+impl<T: Copy + Ord + std::fmt::Display> std::fmt::Display for UndoAction<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UndoAction::Terminal(action) => write!(f, "Terminal({})", action),
+            UndoAction::Decision(action) => write!(f, "Decision({})", action),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
