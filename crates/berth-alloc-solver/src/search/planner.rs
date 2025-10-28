@@ -1227,4 +1227,260 @@ mod tests {
         assert_eq!(plan.decision_var_patches.len(), 1);
         assert!(!plan.terminal_delta.is_empty());
     }
+
+    #[test]
+    fn test_explorer_peek_cost_matches_model() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        let r1 = model.index_manager().request_index(rid(1)).unwrap();
+        let b1 = model.index_manager().berth_index(bid(1)).unwrap();
+
+        pb.with_explorer(|ex| {
+            let start = tp(0);
+            let peek = ex.peek_cost(r1, start, b1).expect("peek must have cost");
+            let expected = model.cost_of_assignment(r1, b1, start).expect("model cost");
+            assert_eq!(peek, expected);
+        });
+    }
+
+    #[test]
+    fn test_peek_fitness_some_matches_model() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        let r1 = model.index_manager().request_index(rid(1)).unwrap();
+        let b1 = model.index_manager().berth_index(bid(1)).unwrap();
+
+        // Assign r1 at t=0
+        let free1 = pb
+            .sandbox()
+            .inner()
+            .iter_free_intervals_for_berths_in([b1], model.feasible_interval(r1))
+            .next()
+            .unwrap();
+        pb.propose_assignment(r1, tp(0), &free1).unwrap();
+
+        // peek_fitness should be Some and match model’s cost
+        let fit = pb.peek_fitness().expect("peek_fitness should return Some");
+        let expected_cost = model
+            .cost_of_assignment(r1, b1, tp(0))
+            .expect("valid assignment must have a cost");
+
+        assert_eq!(fit.cost, expected_cost);
+        assert_eq!(fit.unassigned_requests, model.flexible_requests_len() - 1);
+    }
+
+    #[test]
+    fn test_propose_unassignment_not_assigned_error() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        let r1 = model.index_manager().request_index(rid(1)).unwrap();
+        let err = pb.propose_unassignment(r1).unwrap_err();
+        match err {
+            ProposeUnassignmentError::NotAssigned(_) => {}
+            other => panic!("expected NotAssigned, got: {other:?}"),
+        }
+        assert_eq!(pb.delta_unassigned(), 0);
+        assert_eq!(pb.delta_cost(), 0);
+    }
+
+    fn problem_two_berths_flex_only_on_first() -> Problem<i64> {
+        let mut berths = berth_alloc_model::problem::berth::BerthContainer::new();
+        berths.insert(berth(1, 0, 100)); // allowed
+        berths.insert(berth(2, 0, 100)); // not allowed
+
+        let fixed = AssignmentContainer::<FixedKind, i64, Assignment<FixedKind, i64>>::new();
+
+        let mut flex = RequestContainer::<i64, Request<FlexibleKind, i64>>::new();
+        // Only berth 1 allowed
+        flex.insert(flex_req(1, (0, 100), &[(1, 10)], 1));
+
+        Problem::new(berths, fixed, flex).unwrap()
+    }
+
+    #[test]
+    fn test_propose_assignment_not_allowed_on_berth_error() {
+        let prob = problem_two_berths_flex_only_on_first();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        let r1 = model.index_manager().request_index(rid(1)).unwrap();
+        let b2 = model.index_manager().berth_index(bid(2)).unwrap();
+
+        // Craft a free berth interval on b2 (exists), but the request isn't allowed there
+        let free_b2 = pb
+            .sandbox()
+            .inner()
+            .iter_free_intervals_for_berths_in([b2], model.feasible_interval(r1))
+            .next()
+            .expect("free window on berth 2 exists");
+
+        let err = pb
+            .propose_assignment(r1, free_b2.interval().start(), &free_b2)
+            .unwrap_err();
+        match err {
+            ProposeAssignmentError::NotAllowedOnBerth(e) => {
+                assert_eq!(e.request_index(), r1);
+                assert_eq!(e.berth_index(), b2);
+            }
+            other => panic!("expected NotAllowedOnBerth, got: {other:?}"),
+        }
+        assert_eq!(pb.delta_unassigned(), 0);
+        assert_eq!(pb.delta_cost(), 0);
+    }
+
+    #[test]
+    fn test_has_changes_toggles_after_propose() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        assert!(!pb.has_changes(), "initially no changes");
+
+        let r1 = model.index_manager().request_index(rid(1)).unwrap();
+        let b1 = model.index_manager().berth_index(bid(1)).unwrap();
+        let free1 = pb
+            .sandbox()
+            .inner()
+            .iter_free_intervals_for_berths_in([b1], model.feasible_interval(r1))
+            .next()
+            .unwrap();
+        pb.propose_assignment(r1, tp(0), &free1).unwrap();
+
+        assert!(pb.has_changes(), "after propose, changes should be present");
+    }
+
+    #[test]
+    fn test_reassign_keeps_delta_unassigned_constant() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        let r1 = model.index_manager().request_index(rid(1)).unwrap();
+        let b1 = model.index_manager().berth_index(bid(1)).unwrap();
+
+        // First assignment at t=0
+        let free1 = pb
+            .sandbox()
+            .inner()
+            .iter_free_intervals_for_berths_in([b1], model.feasible_interval(r1))
+            .next()
+            .unwrap();
+        pb.propose_assignment(r1, tp(0), &free1).unwrap();
+        let delta_unassigned_after_first = pb.delta_unassigned();
+        assert_eq!(delta_unassigned_after_first, -1);
+
+        // Compute end of the assigned interval
+        let pt1 = model.processing_time(r1, b1).unwrap();
+        let assigned_end = tp(0) + pt1;
+
+        // Reassign to a later free slot (start >= end of assigned interval)
+        let later_free = pb
+            .sandbox()
+            .inner()
+            .iter_free_intervals_for_berths_in([b1], model.feasible_interval(r1))
+            .find(|fb| fb.interval().start() >= assigned_end)
+            .expect("later free exists");
+        pb.propose_assignment(r1, later_free.interval().start(), &later_free)
+            .unwrap();
+
+        // Still one net assignment (unassigned delta unchanged)
+        assert_eq!(pb.delta_unassigned(), -1);
+        assert!(
+            pb.delta_cost() != 0.into(),
+            "cost should reflect reassignment"
+        );
+    }
+
+    #[test]
+    fn test_finalize_no_changes_yields_empty_plan() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        let plan = pb.finalize();
+        assert_eq!(plan.delta_cost, 0);
+        assert_eq!(plan.delta_unassigned, 0);
+        assert!(plan.decision_var_patches.is_empty());
+        assert!(plan.terminal_delta.is_empty());
+    }
+
+    #[test]
+    fn test_discard_noop() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        // Just ensure it compiles and is a no-op
+        pb.discard();
+    }
 }
