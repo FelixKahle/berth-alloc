@@ -456,7 +456,7 @@ impl<'a, T: Copy + Ord> From<&'a Request<FlexibleKind, T>> for AnyRequestRef<'a,
 }
 
 #[repr(transparent)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestContainer<T: Ord + Copy, V: RequestView<T>> {
     inner: HashMap<RequestIdentifier, V>,
     _phantom: std::marker::PhantomData<T>,

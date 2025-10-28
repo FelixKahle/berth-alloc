@@ -352,7 +352,7 @@ impl<'r, 'b, K: Kind, T: Ord + Copy + CheckedSub + Display> std::fmt::Display
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignmentContainer<K, T, V>
 where
     K: Kind,

@@ -20,7 +20,6 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 pub mod adjacency_mask;
-pub mod calendar;
 pub mod err;
 pub mod index;
 pub mod index_manager;

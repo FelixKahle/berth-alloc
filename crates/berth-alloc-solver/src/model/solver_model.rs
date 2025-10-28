@@ -21,13 +21,12 @@
 
 use crate::{
     model::{
-        calendar::BerthCalendar,
         err::{MissingRequestError, SolverModelBuildError},
         index::{BerthIndex, RequestIndex},
         index_manager::SolverIndexManager,
         neighborhood::{ProximityMap, ProximityMapConfig},
     },
-    state::berth::berthocc::{BerthOccupancy, BerthRead, BerthWrite},
+    state::berth::berthocc::{BerthOccupancy, BerthWrite},
 };
 use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval, TimePoint};
 use berth_alloc_model::{
@@ -36,7 +35,7 @@ use berth_alloc_model::{
 };
 use num_traits::{CheckedAdd, CheckedSub, Zero};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolverModel<'problem, T: Copy + Ord> {
     index_manager: SolverIndexManager,
     weights: Vec<Cost>,                          // len = R
@@ -44,7 +43,6 @@ pub struct SolverModel<'problem, T: Copy + Ord> {
     processing_times: Vec<Option<TimeDelta<T>>>, // len = R * B
     berths_len: usize,                           // B
     requests_len: usize,                         // R
-    calendars: Vec<BerthCalendar<T>>,            // len = B
     berths: Vec<Berth<T>>,                       // len = B
     allowed_berth_indices: Vec<Vec<BerthIndex>>, // len = R
     proximity_map: ProximityMap,                 // Neighborhood info
@@ -57,6 +55,7 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
         &self.weights
     }
 
+    #[inline]
     pub fn weight(&self, req: RequestIndex) -> Cost {
         let index = req.get();
         debug_assert!(index < self.weights.len());
@@ -119,11 +118,6 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
     }
 
     #[inline]
-    pub fn calendars(&self) -> &[BerthCalendar<T>] {
-        &self.calendars
-    }
-
-    #[inline]
     pub fn berths(&self) -> &[Berth<T>] {
         &self.berths
     }
@@ -134,11 +128,6 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
         debug_assert!(index < self.berths_len());
 
         &self.berths[index]
-    }
-
-    #[inline]
-    pub fn calendar_for_berth(&self, berth: BerthIndex) -> Option<&BerthCalendar<T>> {
-        self.calendars.get(berth.0)
     }
 
     #[inline]
@@ -271,6 +260,7 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
             baseline_occupancies.push(BerthOccupancy::new(berth_ref));
             berths.push(berth_ref.clone());
         }
+
         for a in p.iter_fixed_assignments() {
             let bid = a.berth_id();
             let bi = index_manager
@@ -281,12 +271,6 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
                 .occupy(iv)
                 .expect("seeding fixed assignment should not fail");
         }
-
-        let calendars = baseline_occupancies
-            .iter()
-            .map(|occ| occ.iter_free_intervals().collect())
-            .map(BerthCalendar::new)
-            .collect();
 
         let proximity_map = ProximityMap::from_lists(
             &feasible_intervals,
@@ -303,7 +287,6 @@ impl<'problem, T: Copy + Ord + CheckedAdd + CheckedSub> SolverModel<'problem, T>
             processing_times,
             berths_len,
             requests_len,
-            calendars,
             berths,
             proximity_map,
             problem: p,
@@ -333,10 +316,8 @@ where
 mod tests {
     use super::*;
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
-    use berth_alloc_model::common::{FixedKind, FlexibleKind};
-    use berth_alloc_model::prelude::{
-        Assignment, Berth, BerthIdentifier, Problem, RequestIdentifier,
-    };
+    use berth_alloc_model::common::FlexibleKind;
+    use berth_alloc_model::prelude::{Berth, BerthIdentifier, Problem, RequestIdentifier};
     use berth_alloc_model::problem::builder::ProblemBuilder;
     use berth_alloc_model::problem::loader::ProblemLoader;
     use berth_alloc_model::problem::req::Request;
@@ -375,26 +356,6 @@ mod tests {
     #[inline]
     fn ri(n: usize) -> RequestIndex {
         RequestIndex(n)
-    }
-
-    fn req_fixed(id: u32, window: (i64, i64), pts: &[(u32, i64)]) -> Request<FixedKind, i64> {
-        let mut m = BTreeMap::new();
-        for (b, d) in pts {
-            m.insert(bid(*b), td(*d));
-        }
-        Request::<FixedKind, i64>::new(rid(id), iv(window.0, window.1), 1, m).unwrap()
-    }
-
-    fn berth(id: u32, s: i64, e: i64) -> Berth<i64> {
-        Berth::from_windows(bid(id), [iv(s, e)])
-    }
-
-    fn asg_fixed(
-        req: &Request<FixedKind, i64>,
-        berth: &Berth<i64>,
-        start: i64,
-    ) -> Assignment<FixedKind, i64> {
-        Assignment::<FixedKind, i64>::new(req.clone(), berth.clone(), tp(start)).unwrap()
     }
 
     fn make_problem_basic() -> Problem<i64> {
@@ -498,96 +459,6 @@ mod tests {
                 assert_eq!(berth_not_found_error.requested_berth(), bid(99));
             }
         }
-    }
-
-    #[test]
-    fn test_calendars_disjoint_intervals_single_berth() {
-        // Berth window: [0, 100)
-        let b = berth(1, 0, 100);
-
-        // Fixed assignments on berth 1 (non-overlapping):
-        // [10, 20), [30, 40), [60, 80)
-        let rf1 = req_fixed(101, (0, 100), &[(1, 10)]);
-        let rf2 = req_fixed(102, (0, 100), &[(1, 10)]);
-        let rf3 = req_fixed(103, (0, 100), &[(1, 20)]);
-        let a1 = asg_fixed(&rf1, &b, 10);
-        let a2 = asg_fixed(&rf2, &b, 30);
-        let a3 = asg_fixed(&rf3, &b, 60);
-
-        let mut builder = ProblemBuilder::new();
-        builder.add_berth(b.clone());
-        builder.add_fixed(a1);
-        builder.add_fixed(a2);
-        builder.add_fixed(a3);
-
-        let p = builder
-            .build()
-            .expect("problem with fixed assignments should be valid");
-        let m = SolverModel::try_from(&p).expect("solver model should build");
-
-        assert_eq!(m.berths_len(), 1);
-
-        let cal = m
-            .calendar_for_berth(bi(0))
-            .expect("calendar must exist for berth 0");
-
-        // Free intervals are berth window minus the fixed assignments, must be disjoint and in order.
-        assert_eq!(
-            cal.free_intervals(),
-            &[
-                iv(0, 10),   // before first assignment
-                iv(20, 30),  // between [10,20) and [30,40)
-                iv(40, 60),  // between [30,40) and [60,80)
-                iv(80, 100), // after last assignment
-            ]
-        );
-    }
-
-    #[test]
-    fn test_calendars_disjoint_intervals_two_berths() {
-        // Two berths with [0, 50)
-        let b1 = berth(1, 0, 50);
-        let b2 = berth(2, 0, 50);
-
-        // On berth 1: fixed [0,10), [20,25)
-        let r1_b1 = req_fixed(201, (0, 50), &[(1, 10)]);
-        let r2_b1 = req_fixed(202, (0, 50), &[(1, 5)]);
-        let a1_b1 = asg_fixed(&r1_b1, &b1, 0);
-        let a2_b1 = asg_fixed(&r2_b1, &b1, 20);
-
-        // On berth 2: fixed [5,15), [30,50)
-        let r1_b2 = req_fixed(203, (0, 50), &[(2, 10)]);
-        let r2_b2 = req_fixed(204, (0, 50), &[(2, 20)]);
-        let a1_b2 = asg_fixed(&r1_b2, &b2, 5);
-        let a2_b2 = asg_fixed(&r2_b2, &b2, 30);
-
-        let mut builder = ProblemBuilder::new();
-        builder.add_berth(b1.clone());
-        builder.add_berth(b2.clone());
-        builder.add_fixed(a1_b1);
-        builder.add_fixed(a2_b1);
-        builder.add_fixed(a1_b2);
-        builder.add_fixed(a2_b2);
-
-        let p = builder
-            .build()
-            .expect("problem with fixed assignments should be valid");
-        let m = SolverModel::try_from(&p).expect("solver model should build");
-
-        assert_eq!(m.berths_len(), 2);
-
-        let cal_b1 = m
-            .calendar_for_berth(bi(0))
-            .expect("calendar for berth 0 must exist");
-        let cal_b2 = m
-            .calendar_for_berth(bi(1))
-            .expect("calendar for berth 1 must exist");
-
-        // Berth 1 free intervals: [10,20), [25,50)
-        assert_eq!(cal_b1.free_intervals(), &[iv(10, 20), iv(25, 50)]);
-
-        // Berth 2 free intervals: [0,5), [15,30)
-        assert_eq!(cal_b2.free_intervals(), &[iv(0, 5), iv(15, 30)]);
     }
 
     #[test]

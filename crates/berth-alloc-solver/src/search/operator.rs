@@ -19,10 +19,9 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use std::ops::Mul;
-
 use berth_alloc_core::prelude::Cost;
 use num_traits::{CheckedAdd, CheckedSub};
+use std::ops::Mul;
 
 use crate::{
     model::solver_model::SolverModel,
@@ -34,6 +33,7 @@ use crate::{
     },
 };
 
+#[derive(Debug, PartialEq)]
 pub struct OperatorContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>
 where
     T: Copy + Ord,
@@ -54,34 +54,34 @@ where
     C: CostEvaluator<T>,
     R: rand::Rng,
 {
+    #[inline]
     pub fn state(&self) -> &'s SolverState<'p, T> {
         self.state
     }
 
+    #[inline]
     pub fn model(&self) -> &'m SolverModel<'p, T> {
         self.model
     }
 
+    #[inline]
     pub fn cost_evaluator(&self) -> &'c C {
         self.evaluator
     }
 
+    #[inline]
     pub fn rng(&mut self) -> &mut R {
         self.rng
     }
 
-    // Build a plan using a closure to configure the builder.
     #[inline]
     pub fn with_builder<F>(&mut self, f: F) -> Plan<'p, T>
     where
         F: FnOnce(&mut PlanBuilder<'_, 'c, 's, 'm, 'p, T, C>),
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
-        // Seed the work buffer with the current decision variables.
         self.buffer.copy_from_slice(self.state.decision_variables());
 
-        // For now we do not use specialized overlays. Just the cloned ledger and terminal,
-        // so proposals can be made on them independently from the master state.
         let mut pb = PlanBuilder::new(
             self.model,
             self.state.terminal_occupancy(),
@@ -98,7 +98,6 @@ where
     where
         T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     {
-        // Seed the work buffer with the current decision variables.
         self.buffer.copy_from_slice(self.state.decision_variables());
 
         PlanBuilder::new(
@@ -185,6 +184,28 @@ where
         &mut self,
         ctx: &mut OperatorContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
     ) -> Option<Plan<'p, T>>;
+}
+
+impl<T, C, R> std::fmt::Debug for dyn LocalSearchOperator<T, C, R>
+where
+    T: Copy + Ord,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LocalSearchOperator {{ name: {} }}", self.name())
+    }
+}
+
+impl<T, C, R> std::fmt::Display for dyn LocalSearchOperator<T, C, R>
+where
+    T: Copy + Ord,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
 }
 
 #[cfg(test)]

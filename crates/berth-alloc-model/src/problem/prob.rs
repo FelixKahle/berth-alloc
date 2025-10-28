@@ -30,7 +30,7 @@ use crate::problem::{
 };
 use num_traits::{CheckedAdd, CheckedSub};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Problem<T: Copy + Ord> {
     berths: BerthContainer<T>,
     fixed_assignments: AssignmentContainer<FixedKind, T, Assignment<FixedKind, T>>,

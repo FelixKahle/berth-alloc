@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn new_builds_index_and_exposes_berths() {
+    fn test_new_builds_index_and_exposes_berths() {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
@@ -259,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn iter_free_across_selected_indices() {
+    fn test_iter_free_across_selected_indices() {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
@@ -273,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn iter_free_clamps_to_window() {
+    fn test_iter_free_clamps_to_window() {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn iter_free_empty_window_yields_none() {
+    fn test_iter_free_empty_window_yields_none() {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn occupy_then_query_then_release() {
+    fn test_occupy_then_query_then_release() {
         let base = vec![Berth::from_windows(bid(10), vec![iv(0, 10)])];
         let mut term = TerminalOccupancy::new(&base);
 
@@ -322,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn occupy_outside_availability_is_error() {
+    fn test_occupy_outside_availability_is_error() {
         let base = vec![Berth::from_windows(bid(20), vec![iv(0, 10)])];
         let mut term = TerminalOccupancy::new(&base);
 
@@ -335,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn release_outside_availability_is_error() {
+    fn test_release_outside_availability_is_error() {
         let base = vec![Berth::from_windows(bid(21), vec![iv(10, 20)])];
         let mut term = TerminalOccupancy::new(&base);
 
@@ -348,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn occupy_when_not_free_is_error() {
+    fn test_occupy_when_not_free_is_error() {
         let base = vec![Berth::from_windows(bid(30), vec![iv(0, 10)])];
         let mut term = TerminalOccupancy::new(&base);
 
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn unknown_index_panics_on_mutations() {
+    fn test_unknown_index_panics_on_mutations() {
         let base = mk_berths();
         let mut term = TerminalOccupancy::new(&base);
 
@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn mutate_one_berth_does_not_affect_others() {
+    fn test_mutate_one_berth_does_not_affect_others() {
         let base = mk_berths();
         let mut term = TerminalOccupancy::new(&base);
 
@@ -399,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_length_mutations_are_noops() {
+    fn test_zero_length_mutations_are_noops() {
         let base = vec![Berth::from_windows(bid(77), vec![iv(0, 10)])];
         let mut term = TerminalOccupancy::new(&base);
 
@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn iter_free_mixed_order_indices_yields_concatenated() {
+    fn test_iter_free_mixed_order_indices_yields_concatenated() {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
@@ -434,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn iter_free_indices_respects_order_and_window() {
+    fn test_iter_free_indices_respects_order_and_window() {
         let base = mk_berths();
         let term = TerminalOccupancy::new(&base);
 
@@ -462,5 +462,121 @@ mod tests {
             .map(|fb| fb.interval())
             .collect();
         assert_eq!(v2, vec![iv(8, 10), iv(20, 25)]);
+    }
+
+    #[test]
+    fn test_apply_delta_updates_multiple_berths() {
+        let base = mk_berths();
+        let mut term = TerminalOccupancy::new(&base);
+
+        // Prepare updates:
+        // - For idx 0 (id:1), occupy [3,7) -> free becomes [0,3) and [7,10) for that berth
+        // - For idx 2 (id:3), occupy [40,50) -> free becomes [-10,-5)
+        let mut occ0 = term.berth(bi(0)).cloned().expect("exists");
+        occ0.occupy(iv(3, 7)).unwrap();
+
+        let mut occ2 = term.berth(bi(2)).cloned().expect("exists");
+        occ2.occupy(iv(40, 50)).unwrap();
+
+        let delta = crate::state::terminal::delta::TerminalDelta::from_updates(vec![
+            (bi(0), occ0),
+            (bi(2), occ2),
+        ]);
+        term.apply_delta(delta).expect("apply_delta must succeed");
+
+        // Verify idx 0 changed as expected
+        let v0: Vec<_> = term
+            .iter_free_intervals_for_berths_in([bi(0)], iv(-100, 100))
+            .map(|fb| fb.interval())
+            .collect();
+        assert_eq!(v0, vec![iv(0, 3), iv(7, 10), iv(20, 30)]);
+
+        // Verify idx 1 unchanged
+        let v1: Vec<_> = term
+            .iter_free_intervals_for_berths_in([bi(1)], iv(-100, 100))
+            .map(|fb| fb.interval())
+            .collect();
+        assert_eq!(v1, vec![iv(5, 15)]);
+
+        // Verify idx 2 changed as expected
+        let v2: Vec<_> = term
+            .iter_free_intervals_for_berths_in([bi(2)], iv(-100, 100))
+            .map(|fb| fb.interval())
+            .collect();
+        assert_eq!(v2, vec![iv(-10, -5)]);
+    }
+
+    #[test]
+    fn test_apply_delta_mismatched_ids_errors_and_does_not_mutate() {
+        let base = mk_berths();
+        let mut term = TerminalOccupancy::new(&base);
+
+        // Create an occupancy with a different berth id than index 0 (which is id:1)
+        let wrong_berth = Berth::from_windows(bid(999), vec![iv(0, 10), iv(20, 30)]);
+        let occ_wrong = BerthOccupancy::new(&wrong_berth);
+
+        let delta =
+            crate::state::terminal::delta::TerminalDelta::from_updates(vec![(bi(0), occ_wrong)]);
+        let err = term.apply_delta(delta).unwrap_err();
+        match err {
+            BerthApplyError::MismatchedBerthIds(_) => {}
+            _ => panic!("expected MismatchedBerthIds error, got: {err:?}"),
+        }
+
+        // Verify berth index 0 remains unchanged
+        let v0: Vec<_> = term
+            .iter_free_intervals_for_berths_in([bi(0)], iv(-100, 100))
+            .map(|fb| fb.interval())
+            .collect();
+        assert_eq!(v0, vec![iv(0, 10), iv(20, 30)]);
+    }
+
+    #[test]
+    fn test_berth_mut_allows_direct_mutation() {
+        let base = mk_berths();
+        let mut term = TerminalOccupancy::new(&base);
+
+        // Mutate berth at index 1 (id:2) directly
+        let b1 = term.berth_mut(bi(1)).expect("exists");
+        b1.occupy(iv(5, 10)).unwrap();
+
+        // Now free on index 1 should be [10,15)
+        let v1: Vec<_> = term
+            .iter_free_intervals_for_berths_in([bi(1)], iv(-100, 100))
+            .map(|fb| fb.interval())
+            .collect();
+        assert_eq!(v1, vec![iv(10, 15)]);
+    }
+
+    #[test]
+    fn test_iter_free_for_slice_skips_unknown_indices_and_keeps_order() {
+        let base = mk_berths();
+        let term = TerminalOccupancy::new(&base);
+
+        let idxs = [bi(0), BerthIndex::new(999), bi(2)];
+        let v: Vec<_> = term
+            .iter_free_intervals_for_berths_in_slice(&idxs, iv(-100, 100))
+            .map(|fb| (fb.berth_index(), fb.interval()))
+            .collect();
+
+        // Unknown index is skipped; order is preserved for known indices.
+        assert_eq!(
+            v,
+            vec![
+                (bi(0), iv(0, 10)),
+                (bi(0), iv(20, 30)),
+                (bi(2), iv(-10, -5)),
+                (bi(2), iv(40, 50)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_berths_len_and_berth_none_for_out_of_range() {
+        let base = mk_berths();
+        let term = TerminalOccupancy::new(&base);
+
+        assert_eq!(term.berths_len(), base.len());
+        assert!(term.berth(BerthIndex::new(999)).is_none());
     }
 }

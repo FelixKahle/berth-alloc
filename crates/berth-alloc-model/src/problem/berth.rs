@@ -141,7 +141,7 @@ impl<T: Ord + Copy> Berth<T> {
 }
 
 #[repr(transparent)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BerthContainer<T: Copy + Ord>(HashMap<BerthIdentifier, Berth<T>>);
 
 impl<T: Copy + Ord> Default for BerthContainer<T> {

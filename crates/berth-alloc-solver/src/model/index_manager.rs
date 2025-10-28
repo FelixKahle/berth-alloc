@@ -27,7 +27,7 @@ use berth_alloc_model::{
 use num_traits::{CheckedAdd, CheckedSub};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolverIndexManager {
     berth_to_index: HashMap<BerthIdentifier, BerthIndex>,
     request_to_index: HashMap<RequestIdentifier, RequestIndex>,

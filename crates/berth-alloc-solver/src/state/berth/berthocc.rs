@@ -19,9 +19,11 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+#[cfg(debug_assertions)]
+use crate::state::berth::err::FreeOutsideAvailabilityError;
 use crate::state::berth::err::{
-    BerthApplyError, BerthUpdateError, FreeOutsideAvailabilityError, MismatchedBerthIdsError,
-    NotFreeError, OutsideAvailabilityError,
+    BerthApplyError, BerthUpdateError, MismatchedBerthIdsError, NotFreeError,
+    OutsideAvailabilityError,
 };
 use berth_alloc_core::prelude::*;
 use berth_alloc_model::prelude::*;
@@ -51,6 +53,7 @@ pub trait BerthWrite<'b, T: Copy + Ord>: BerthRead<'b, T> {
     fn occupy(&mut self, interval: TimeInterval<T>) -> Result<(), BerthUpdateError<T>>;
     fn release(&mut self, interval: TimeInterval<T>) -> Result<(), BerthUpdateError<T>>;
     fn apply(&mut self, other: Self) -> Result<(), BerthApplyError<T>>;
+    fn clear(&mut self);
     fn replace(&mut self, other: Self) -> Result<Self, BerthApplyError<T>>
     where
         Self: Sized;
@@ -142,6 +145,11 @@ impl<'b, T: Copy + Ord> BerthWrite<'b, T> for BerthOccupancy<'b, T> {
     }
 
     #[inline]
+    fn clear(&mut self) {
+        self.free.clear();
+    }
+
+    #[inline]
     fn apply(&mut self, other: Self) -> Result<(), BerthApplyError<T>> {
         if self.berth.id() != other.berth.id() {
             return Err(BerthApplyError::MismatchedBerthIds(
@@ -181,12 +189,15 @@ impl<'b, T: Copy + Ord> BerthWrite<'b, T> for BerthOccupancy<'b, T> {
             ));
         }
 
-        for seg in other.free.iter() {
-            let iv = TimeInterval::new(seg.start, seg.end);
-            if !self.berth.covers(iv) {
-                return Err(BerthApplyError::FreeOutsideAvailability(
-                    FreeOutsideAvailabilityError::new(self.berth.id(), iv),
-                ));
+        #[cfg(debug_assertions)]
+        {
+            for seg in other.free.iter() {
+                let iv = TimeInterval::new(seg.start, seg.end);
+                if !self.berth.covers(iv) {
+                    return Err(BerthApplyError::FreeOutsideAvailability(
+                        FreeOutsideAvailabilityError::new(self.berth.id(), iv),
+                    ));
+                }
             }
         }
 
@@ -326,6 +337,26 @@ mod tests {
 
         // Should be OK: both are subsets of availability, even though c is not ⊆ a.free.
         a.apply(c).unwrap();
+    }
+
+    #[test]
+    fn test_clear_removes_all_free_and_release_rebuilds() {
+        let b = Berth::from_windows(bid(10), vec![iv(0, 10), iv(20, 30)]);
+        let mut occ = BerthOccupancy::new(&b);
+
+        // Clear should remove all free intervals.
+        occ.clear();
+        assert!(occ.iter_free_intervals_in(iv(0, 100)).next().is_none());
+
+        // Nothing should be free after clear (except empty).
+        assert!(!occ.is_free(iv(0, 1)));
+        assert!(!occ.is_free(iv(25, 26)));
+
+        // Releasing inside availability should rebuild free segments.
+        occ.release(iv(0, 5)).unwrap();
+        occ.release(iv(22, 28)).unwrap();
+        let v: Vec<_> = occ.iter_free_intervals_in(iv(0, 100)).collect();
+        assert_eq!(v, vec![iv(0, 5), iv(22, 28)]);
     }
 }
 

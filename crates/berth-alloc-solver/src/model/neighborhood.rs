@@ -47,13 +47,19 @@ impl ProximityMapConfig {
     }
 }
 
+impl std::fmt::Display for ProximityMapConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ProximityMapConfig(topk_ratio={})", self.topk_ratio)
+    }
+}
+
 impl Default for ProximityMapConfig {
     fn default() -> Self {
         Self { topk_ratio: 1.0 }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProximityMap {
     /// Symmetric, cheap surrogate across all pairs (e.g., index distance).
     generic: NeighborView,
@@ -72,6 +78,7 @@ pub struct ProximityMap {
 }
 
 impl ProximityMap {
+    #[tracing::instrument(level = "debug", skip(feasible_intervals, allowed_berth_indices, berths_len, params), fields(config = ?params))]
     pub fn from_lists<T: Copy + Ord + CheckedAdd + CheckedSub>(
         feasible_intervals: &[TimeInterval<T>],    // len = R
         allowed_berth_indices: &[Vec<BerthIndex>], // len = R, each sorted asc
@@ -81,7 +88,6 @@ impl ProximityMap {
         let n = feasible_intervals.len();
         let ratio = params.topk_ratio();
 
-        // Helpers that only touch the lists (no model needed)
         #[inline]
         fn allowed_on(allowed: &[Vec<BerthIndex>], r: usize, b: BerthIndex) -> bool {
             allowed[r].binary_search_by_key(&b.0, |x| x.0).is_ok()
@@ -137,7 +143,6 @@ impl ProximityMap {
         let direct_competitors =
             NeighborView::new(direct_competitors_lists, direct_competitors_mask);
 
-        // Logical OR for general neighbors
         let any_mask = generic.mask().or(same_berth.mask()).or(overlap_tw.mask());
         let any_lists = fuse_orders_with_mask(
             n,
@@ -184,7 +189,7 @@ impl ProximityMap {
     }
 
     #[inline]
-    pub fn overlap_tw(&self) -> &NeighborView {
+    pub fn overlap_time_window(&self) -> &NeighborView {
         &self.overlap_tw
     }
 
@@ -552,20 +557,20 @@ mod tests {
         assert_eq!(sb2, vec![1]);
 
         // ---- OVERLAP TW view:
-        let ov0 = proximity.overlap_tw().lists().outgoing()[0]
+        let ov0 = proximity.overlap_time_window().lists().outgoing()[0]
             .iter()
             .map(|x| x.get())
             .collect::<Vec<_>>();
         assert_eq!(ov0, vec![1]);
 
-        let mut ov1 = proximity.overlap_tw().lists().outgoing()[1]
+        let mut ov1 = proximity.overlap_time_window().lists().outgoing()[1]
             .iter()
             .map(|x| x.get())
             .collect::<Vec<_>>();
         ov1.sort();
         assert_eq!(ov1, vec![0, 2]);
 
-        let ov2 = proximity.overlap_tw().lists().outgoing()[2]
+        let ov2 = proximity.overlap_time_window().lists().outgoing()[2]
             .iter()
             .map(|x| x.get())
             .collect::<Vec<_>>();

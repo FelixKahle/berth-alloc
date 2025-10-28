@@ -75,7 +75,7 @@ pub trait SolverStateView<'p, T: Copy + Ord> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolverState<'p, T: Copy + Ord> {
     decision_variables: DecisionVarVec<T>,
     terminal_occupancy: TerminalOccupancy<'p, T>,
@@ -120,16 +120,13 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cos
         #[cfg(debug_assertions)]
         let prev_unassigned = self.fitness.unassigned_requests;
 
-        // Apply DV patches and terminal delta first
         self.apply_decision_var_patches(plan.decision_var_patches);
         let res = self.terminal_occupancy.apply_delta(plan.terminal_delta);
         debug_assert!(res.is_ok(), "Failed to apply terminal delta: {:?}", res);
 
-        // Apply fitness deltas to keep the state consistent with the plan
         self.fitness.cost += plan.delta_cost;
 
         if plan.delta_unassigned != 0 {
-            // Use checked_add_signed to handle +/- deltas safely
             let new_unassigned = self
                 .fitness
                 .unassigned_requests
@@ -138,7 +135,6 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cos
             self.fitness.unassigned_requests = new_unassigned;
         }
 
-        // Increment version
         self.version.increment();
 
         #[cfg(debug_assertions)]
@@ -180,8 +176,6 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cos
     where
         T: std::fmt::Display + std::fmt::Debug,
     {
-        tracing::info!("Cost of solution: {}", self.fitness.cost);
-
         let flexible_assignments = self.make_flexible_assignments(solver_model);
         let fixed_assignments = solver_model
             .problem()
@@ -857,5 +851,76 @@ mod tests {
             v_before, v_after,
             "read-only operations must not change the version"
         );
+    }
+
+    #[test]
+    fn test_is_feasible_when_no_unassigned() {
+        let base = vec![berth(1, 0, 100)];
+        let term = TerminalOccupancy::new(&base);
+        let dv = DecisionVarVec::from(vec![DecisionVar::unassigned()]);
+        let st = SolverState::new(dv, term, Fitness::new(5, 0));
+        assert!(st.is_feasible(), "no unassigned requests ⇒ feasible");
+    }
+
+    #[test]
+    fn test_apply_plan_delta_unassigned_negative_on_assign() {
+        // Start with one Unassigned → unassigned=1
+        let base = vec![berth(1, 0, 100)];
+        let term = TerminalOccupancy::new(&base);
+        let dv = DecisionVarVec::from(vec![DecisionVar::unassigned()]);
+        let mut st = SolverState::new(dv, term, Fitness::new(10, 1));
+
+        // Plan: assign request 0 to berth index 0 at t=0
+        let patches = vec![DecisionVarPatch::new(
+            ri(0),
+            DecisionVar::assigned(bi(0), tp(0)),
+        )];
+        // No terminal delta, but cost goes up by 3; unassigned decreases by 1
+        let delta = crate::state::terminal::delta::TerminalDelta::empty();
+        let plan = Plan::new_delta(patches, delta, 3, -1);
+
+        let v0 = st.version();
+        st.apply_plan(plan);
+
+        assert!(
+            st.decision_variables()[0].is_assigned(),
+            "DV must be assigned"
+        );
+        assert_eq!(
+            st.fitness().unassigned_requests,
+            0,
+            "unassigned must decrement by 1"
+        );
+        assert_eq!(st.fitness().cost, 13, "cost must increase by delta_cost");
+        assert!(st.version() > v0, "version must increment");
+    }
+
+    #[test]
+    fn test_apply_plan_delta_unassigned_positive_on_unassign() {
+        // Start with one Assigned → unassigned=0
+        let base = vec![berth(1, 0, 100)];
+        let term = TerminalOccupancy::new(&base);
+        let dv = DecisionVarVec::from(vec![DecisionVar::assigned(BerthIndex::new(0), tp(5))]);
+        let mut st = SolverState::new(dv, term, Fitness::new(7, 0));
+
+        // Plan: unassign request 0; delta_unassigned = +1; delta_cost = 0
+        let patches = vec![DecisionVarPatch::new(ri(0), DecisionVar::unassigned())];
+        let delta = crate::state::terminal::delta::TerminalDelta::empty();
+        let plan = Plan::new_delta(patches, delta, 0, 1);
+
+        let v0 = st.version();
+        st.apply_plan(plan);
+
+        assert!(
+            !st.decision_variables()[0].is_assigned(),
+            "DV must be unassigned"
+        );
+        assert_eq!(
+            st.fitness().unassigned_requests,
+            1,
+            "unassigned must increment by 1"
+        );
+        assert_eq!(st.fitness().cost, 7, "cost unchanged");
+        assert!(st.version() > v0, "version must increment");
     }
 }
