@@ -197,7 +197,7 @@ where
 
     #[inline]
     fn apply_delta(&mut self, delta: TerminalDelta<'b, T>) -> Result<(), BerthApplyError<T>> {
-        for (berth_index, free) in delta.into_iter() {
+        for (berth_index, free) in delta {
             let index = berth_index.get();
             debug_assert!(index < self.berths.len());
 
@@ -206,6 +206,7 @@ where
         Ok(())
     }
 
+    #[inline]
     fn berth_mut(&mut self, index: BerthIndex) -> Option<&mut BerthOccupancy<'b, T>> {
         self.berths.get_mut(index.get())
     }

@@ -110,65 +110,81 @@ where
     }
 }
 
+/// Local search operator interface for the berth-alloc solver.
+///
+/// An operator defines a neighborhood over the current solution by
+/// proposing small, incremental changes. Each proposal is returned as a
+/// `Plan`, which encapsulates:
+/// - decision variable patches (assignment edits),
+/// - a `TerminalDelta` with occupancy updates,
+/// - and the incremental fitness deltas.
+///
+/// Lifecycle:
+/// - Create or obtain an `OperatorContext` from the search loop. The context
+///   grants read access to the `SolverState`, the `SolverModel`, the
+///   `CostEvaluator`, a fast RNG, and a scratch buffer for decision variables.
+/// - Call `make_next_neighbor()` repeatedly to iterate candidate moves. Each
+///   call may return `Some(Plan)` or `None` when the operator has exhausted
+///   its neighborhood for the current synchronization point.
+/// - The search loop applies/accepts plans as it sees fit. The operator can be
+///   reset via `reset()` when the global state changes substantially, so it can
+///   restart its neighborhood enumeration.
+///
+/// Notes:
+/// - Operators typically build plans through `OperatorContext::builder()` or
+///   `with_builder()`. This yields a fresh `PlanBuilder` seeded from the current
+///   state and using a writable scratch buffer, avoiding allocations.
+/// - `PlanBuilder` provides a `TerminalSandbox` internally, so occupancy edits
+///   are isolated and emitted as a minimal `TerminalDelta`.
+/// - `has_fragments()` can be overridden to signal that an operator yields
+///   dependent fragments (useful for composite or chained neighborhoods).
 pub trait LocalSearchOperator<T, C, R>
 where
     T: Copy + Ord,
     C: CostEvaluator<T>,
     R: rand::Rng,
 {
+    /// Returns a human-readable, stable name for this operator.
+    ///
+    /// This is used in logs, metrics, and benchmarks to identify the
+    /// neighborhood strategy (e.g., "SwapAdjacent", "ReassignGreedy").
     fn name(&self) -> &str;
+
+    /// Resets the operator's internal iteration state.
+    ///
+    /// Call this when the global solver state changes in a way that invalidates
+    /// the current neighborhood enumeration (e.g., after applying a plan).
+    /// Implementations must not mutate the global solver state; they should
+    /// only clear internal cursors/caches so that the next call to
+    /// `make_next_neighbor()` starts enumerating from the current `SolverState`.
     fn reset(&mut self);
-    fn has_fragments(&self) -> bool {
-        false
-    }
+
+    /// Indicates whether the operator yields related "fragments" of a move.
+    ///
+    /// Return `true` if successive calls to `make_next_neighbor()` are expected
+    /// to produce a sequence of logically related neighbors (e.g., a chained or
+    /// composite neighborhood), which can help the search orchestration decide
+    /// how to consume candidates. Return `false` for independent neighbors.
+    fn has_fragments(&self) -> bool;
+
+    /// Produces the next neighbor as a `Plan`, or `None` if the neighborhood
+    /// is exhausted for the current synchronization point.
+    ///
+    /// Semantics:
+    /// - Must not mutate the global solver state; instead, build and return a
+    ///   `Plan` using `ctx.builder()`/`with_builder()`. The search loop decides
+    ///   whether to apply it.
+    /// - May use `ctx.rng()` for randomized exploration.
+    /// - On the first call after `reset()`, begin (re)enumerating neighbors.
+    ///   Subsequent calls should continue enumeration until `None`.
+    ///
+    /// The returned `Plan` encapsulates decision-variable patches and a
+    /// `TerminalDelta` describing occupancy changes; its fitness deltas are
+    /// computed by the builder/evaluator.
     fn make_next_neighbor<'b, 'r, 'c, 's, 'm, 'p>(
         &mut self,
         ctx: &mut OperatorContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
     ) -> Option<Plan<'p, T>>;
-}
-
-pub struct NeighborOperatorSession<'o, 'ctx, 'b, 'r, 'c, 's, 'm, 'p, T, C, R>
-where
-    T: Copy + Ord,
-    C: CostEvaluator<T>,
-    R: rand::Rng,
-{
-    context: &'ctx mut OperatorContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
-    operator: &'o mut dyn LocalSearchOperator<T, C, R>,
-}
-
-impl<'o, 'ctx, 'b, 'r, 'c, 's, 'm, 'p, T, C, R>
-    NeighborOperatorSession<'o, 'ctx, 'b, 'r, 'c, 's, 'm, 'p, T, C, R>
-where
-    T: Copy + Ord,
-    C: CostEvaluator<T>,
-    R: rand::Rng,
-{
-    pub fn new(
-        context: &'ctx mut OperatorContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
-        operator: &'o mut dyn LocalSearchOperator<T, C, R>,
-    ) -> Self {
-        operator.reset();
-        Self { context, operator }
-    }
-
-    pub fn make_next_neighbor(&mut self) -> Option<Plan<'p, T>> {
-        self.operator.make_next_neighbor(self.context)
-    }
-}
-
-impl<'o, 'ctx, 'b, 'r, 'c, 's, 'm, 'p, T, C, R> Iterator
-    for NeighborOperatorSession<'o, 'ctx, 'b, 'r, 'c, 's, 'm, 'p, T, C, R>
-where
-    T: Copy + Ord,
-    C: CostEvaluator<T>,
-    R: rand::Rng,
-{
-    type Item = Plan<'p, T>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.make_next_neighbor()
-    }
 }
 
 #[cfg(test)]
@@ -273,6 +289,10 @@ mod tests {
     impl LocalSearchOperator<i64, DefaultCostEvaluator, ChaCha8Rng> for TestAssignOp {
         fn name(&self) -> &str {
             "TestAssignOp"
+        }
+
+        fn has_fragments(&self) -> bool {
+            false
         }
 
         fn reset(&mut self) {
@@ -393,38 +413,5 @@ mod tests {
             occ.is_occupied(iv_assigned),
             "expected occupied interval after apply"
         );
-    }
-
-    #[test]
-    fn test_neighbor_operator_session_iterates_once() {
-        // Arrange problem/model/state
-        let problem = problem_one_berth_one_flex();
-        let model = SolverModel::try_from(&problem).expect("model ok");
-
-        let mut rng = ChaCha8Rng::seed_from_u64(7);
-        let evaluator = DefaultCostEvaluator;
-
-        let base = TerminalOccupancy::new(problem.berths().iter());
-        let dvars = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let fit0 = evaluator.eval_fitness(&model, &dvars);
-        let state = SolverState::new(dvars.into(), base, fit0);
-
-        let mut work = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let mut ctx = OperatorContext {
-            model: &model,
-            state: &state,
-            evaluator: &evaluator,
-            rng: &mut rng,
-            buffer: work.as_mut_slice(),
-        };
-
-        let mut op = TestAssignOp::new();
-        let mut sess = NeighborOperatorSession::new(&mut ctx, &mut op);
-
-        let first = sess.next();
-        let second = sess.next();
-
-        assert!(first.is_some(), "first neighbor should exist");
-        assert!(second.is_none(), "operator should yield exactly once");
     }
 }

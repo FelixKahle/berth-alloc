@@ -38,10 +38,10 @@ use std::time::{Duration, Instant};
 const N_BERTHS: usize = 20;
 const PER_BERTH: usize = 25; // 25 assigned requests per berth
 const TOTAL_REQUESTS: usize = N_BERTHS * PER_BERTH;
-const PT: i64 = 10; // processing time
+const PT: i64 = 100; // processing time
 const GAP: i64 = 10; // free gap between assignments on a berth
 const HORIZON_START: i64 = 0;
-const HORIZON_END: i64 = 100_000; // roomy enough horizon
+const HORIZON_END: i64 = 3000; // roomy enough horizon
 
 #[inline]
 fn tp(v: i64) -> TimePoint<i64> {

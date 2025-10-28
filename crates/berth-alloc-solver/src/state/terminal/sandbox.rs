@@ -24,7 +24,7 @@ use crate::{
     state::{
         berth::{
             berthocc::{BerthOccupancy, BerthRead, BerthWrite},
-            err::BerthUpdateError,
+            err::{BerthApplyError, BerthUpdateError},
         },
         terminal::{
             delta::TerminalDelta,
@@ -33,7 +33,7 @@ use crate::{
     },
 };
 use berth_alloc_core::prelude::TimeInterval;
-use fx_hash::FxHashMap;
+use fx_hash::{FxBuildHasher, FxHashMap};
 
 #[derive(Debug, Clone)]
 pub struct TerminalSandbox<'t, 'p, T: Copy + Ord> {
@@ -44,9 +44,13 @@ pub struct TerminalSandbox<'t, 'p, T: Copy + Ord> {
 impl<'t, 'p, T: Copy + Ord> TerminalSandbox<'t, 'p, T> {
     #[inline]
     pub fn new(base: &'t TerminalOccupancy<'p, T>) -> Self {
+        // Little optimization: preallocate overrides map with capacity
+        // The individual berths are only added on first mutation, we cannot
+        // avoid allocation there.
+        let num_berths = base.berths_len();
         Self {
             base,
-            overrides: FxHashMap::default(),
+            overrides: FxHashMap::with_capacity_and_hasher(num_berths, FxBuildHasher),
         }
     }
 
@@ -179,10 +183,7 @@ impl<'t, 'p, T: Copy + Ord> TerminalWrite<'p, T> for TerminalSandbox<'t, 'p, T> 
     }
 
     #[inline]
-    fn apply_delta(
-        &mut self,
-        delta: TerminalDelta<'p, T>,
-    ) -> Result<(), crate::state::berth::err::BerthApplyError<T>> {
+    fn apply_delta(&mut self, delta: TerminalDelta<'p, T>) -> Result<(), BerthApplyError<T>> {
         for (bi, occ) in delta.updates() {
             self.overrides.insert(bi.get(), occ.clone());
         }

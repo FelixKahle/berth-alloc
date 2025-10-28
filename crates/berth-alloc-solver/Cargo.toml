@@ -54,3 +54,8 @@ criterion = "0.7.0"
 name = "planner_benches"
 path = "benches/search/planner_benches.rs"
 harness = false
+
+[[bench]]
+name = "terminalocc_benches"
+path = "benches/state/terminal/terminalocc_benches.rs"
+harness = false

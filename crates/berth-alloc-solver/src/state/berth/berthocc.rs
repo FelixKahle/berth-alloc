@@ -149,15 +149,23 @@ impl<'b, T: Copy + Ord> BerthWrite<'b, T> for BerthOccupancy<'b, T> {
             ));
         }
 
-        for seg in other.free.iter() {
-            let iv = TimeInterval::new(seg.start, seg.end);
-            if !self.berth.covers(iv) {
-                return Err(BerthApplyError::FreeOutsideAvailability(
-                    FreeOutsideAvailabilityError::new(self.berth.id(), iv),
-                ));
+        #[cfg(debug_assertions)]
+        {
+            for seg in other.free.iter() {
+                let iv = TimeInterval::new(seg.start, seg.end);
+                if !self.berth.covers(iv) {
+                    return Err(BerthApplyError::FreeOutsideAvailability(
+                        FreeOutsideAvailabilityError::new(self.berth.id(), iv),
+                    ));
+                }
             }
         }
 
+        // This is just a pointer replacement, so it's efficient.
+        // We do pay O(n) for dropping the old RangeSet, but that's unavoidable.
+        // We may want to test a system where we only store the differences instead,
+        // but that might be less efficient because we need to drop the temporary
+        // terminal/berth structures anyway.
         self.free = other.free;
         Ok(())
     }
