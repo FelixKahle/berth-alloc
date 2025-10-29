@@ -20,7 +20,7 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::search::eval::CostEvaluator;
-use crate::state::fitness::Fitness;
+use crate::state::fitness::{Fitness, FitnessDelta};
 use crate::state::terminal::terminalocc::TerminalWrite;
 use crate::{
     model::{
@@ -49,16 +49,15 @@ use std::ops::Mul;
 pub struct Savepoint {
     undo_len: usize,
     patches_len: usize,
-    saved_delta_cost: Cost,
-    saved_delta_unassigned: i32,
+    saved_fitness_delta: FitnessDelta,
 }
 
 impl std::fmt::Display for Savepoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Savepoint(undo_len={}, patches_len={}, saved_delta_cost={}, saved_delta_unassigned={})",
-            self.undo_len, self.patches_len, self.saved_delta_cost, self.saved_delta_unassigned
+            "Savepoint(undo_len={}, patches_len={}, saved_fitness_delta={})",
+            self.undo_len, self.patches_len, self.saved_fitness_delta
         )
     }
 }
@@ -232,8 +231,7 @@ pub struct PlanBuilder<'b, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> {
     sandbox: TerminalSandbox<'t, 'p, T>,
     patches: Vec<DecisionVarPatch<T>>,
     cost_evaluator: &'c C,
-    delta_cost: Cost,
-    delta_unassigned: i32,
+    fitness_delta: FitnessDelta,
     undo: Vec<UndoAction<T>>,
 }
 
@@ -254,8 +252,7 @@ where
             decision_vars,
             sandbox: TerminalSandbox::new(base_terminal),
             cost_evaluator,
-            delta_cost: Cost::zero(),
-            delta_unassigned: 0,
+            fitness_delta: FitnessDelta::zero(),
             patches: Vec::with_capacity(32),
             undo: Vec::with_capacity(64),
         }
@@ -263,12 +260,17 @@ where
 
     #[inline]
     pub fn delta_cost(&self) -> Cost {
-        self.delta_cost
+        self.fitness_delta.delta_cost
     }
 
     #[inline]
     pub fn delta_unassigned(&self) -> i32 {
-        self.delta_unassigned
+        self.fitness_delta.delta_unassigned
+    }
+
+    #[inline]
+    pub fn fitness_delta(&self) -> FitnessDelta {
+        self.fitness_delta
     }
 
     #[inline]
@@ -281,8 +283,7 @@ where
         Savepoint {
             undo_len: self.undo.len(),
             patches_len: self.patches.len(),
-            saved_delta_cost: self.delta_cost,
-            saved_delta_unassigned: self.delta_unassigned,
+            saved_fitness_delta: self.fitness_delta,
         }
     }
 
@@ -310,8 +311,7 @@ where
             }
         }
         self.patches.truncate(sp.patches_len);
-        self.delta_cost = sp.saved_delta_cost;
-        self.delta_unassigned = sp.saved_delta_unassigned;
+        self.fitness_delta = sp.saved_fitness_delta;
     }
 
     #[inline]
@@ -350,13 +350,17 @@ where
             self.sandbox
                 .release(old.berth_index, old_iv)
                 .map_err(ProposeAssignmentError::from)?;
-
             self.undo
                 .push(UndoAction::Terminal(TerminalUndoAction::Occupy(
                     old.berth_index,
                     old_iv,
                 )));
-            self.delta_cost -= old_cost;
+
+            self.fitness_delta.delta_cost = self
+                .fitness_delta
+                .delta_cost
+                .checked_sub(old_cost)
+                .expect("Cost subtraction overflowed");
         }
 
         let cost = self
@@ -396,17 +400,24 @@ where
         self.sandbox
             .occupy(free_berth.berth_index(), asg_iv)
             .map_err(ProposeAssignmentError::from)?;
-
         self.undo
             .push(UndoAction::Terminal(TerminalUndoAction::Release(
                 free_berth.berth_index(),
                 asg_iv,
             )));
 
-        self.delta_cost += cost;
+        self.fitness_delta.delta_cost = self
+            .fitness_delta
+            .delta_cost
+            .checked_add(cost)
+            .expect("Cost addition overflowed");
 
         if !matches!(prev_dv, DecisionVar::Assigned(_)) {
-            self.delta_unassigned -= 1;
+            self.fitness_delta.delta_unassigned = self
+                .fitness_delta
+                .delta_unassigned
+                .checked_sub(1)
+                .expect("Unassigned requests addition overflowed");
         }
 
         self.undo.push(UndoAction::Decision(DecisionVarUndoAction {
@@ -443,17 +454,15 @@ where
             DecisionVar::Assigned(decision) => decision,
         };
 
-        let iv = match self
+        let iv = self
             .solver_model
             .interval(request, dv.berth_index, dv.start_time)
-        {
-            Some(interval) => interval,
-            None => {
-                return Err(ProposeUnassignmentError::NotAllowedOnBerth(
-                    NotAllowedOnBerthError::new(request, dv.berth_index),
-                ));
-            }
-        };
+            .ok_or_else(|| {
+                ProposeUnassignmentError::NotAllowedOnBerth(NotAllowedOnBerthError::new(
+                    request,
+                    dv.berth_index,
+                ))
+            })?;
 
         let cost = self
             .cost_evaluator
@@ -468,15 +477,22 @@ where
         self.sandbox
             .release(dv.berth_index, iv)
             .map_err(ProposeUnassignmentError::from)?;
-
         self.undo
             .push(UndoAction::Terminal(TerminalUndoAction::Occupy(
                 dv.berth_index,
                 iv,
             )));
 
-        self.delta_cost -= cost;
-        self.delta_unassigned += 1;
+        self.fitness_delta.delta_cost = self
+            .fitness_delta
+            .delta_cost
+            .checked_sub(cost)
+            .expect("Cost subtraction overflowed");
+        self.fitness_delta.delta_unassigned = self
+            .fitness_delta
+            .delta_unassigned
+            .checked_add(1)
+            .expect("Unassigned requests addition overflowed");
 
         self.undo.push(UndoAction::Decision(DecisionVarUndoAction {
             request_index: request,
@@ -565,12 +581,7 @@ where
 
     #[inline]
     pub fn finalize(self) -> Plan<'p, T> {
-        Plan::new_delta(
-            self.patches,
-            self.sandbox.delta(),
-            self.delta_cost,
-            self.delta_unassigned,
-        )
+        Plan::new_delta(self.patches, self.sandbox.delta(), self.fitness_delta)
     }
 }
 
@@ -677,8 +688,8 @@ mod tests {
         assert_eq!(pb.delta_unassigned(), -1);
 
         let plan = pb.finalize();
-        assert!(plan.delta_cost > 0);
-        assert_eq!(plan.delta_unassigned, -1);
+        assert!(plan.fitness_delta.delta_cost > 0);
+        assert_eq!(plan.fitness_delta.delta_unassigned, -1);
         assert!(!plan.terminal_delta.is_empty());
         assert_eq!(plan.decision_var_patches.len(), 1);
     }
@@ -1222,8 +1233,8 @@ mod tests {
         assert_eq!(delta_unassigned_now, -1);
 
         let plan = pb.finalize();
-        assert_eq!(plan.delta_cost, delta_cost_now);
-        assert_eq!(plan.delta_unassigned, delta_unassigned_now);
+        assert_eq!(plan.fitness_delta.delta_cost, delta_cost_now);
+        assert_eq!(plan.fitness_delta.delta_unassigned, delta_unassigned_now);
         assert_eq!(plan.decision_var_patches.len(), 1);
         assert!(!plan.terminal_delta.is_empty());
     }
@@ -1460,8 +1471,8 @@ mod tests {
         );
 
         let plan = pb.finalize();
-        assert_eq!(plan.delta_cost, 0);
-        assert_eq!(plan.delta_unassigned, 0);
+        assert_eq!(plan.fitness_delta.delta_cost, 0);
+        assert_eq!(plan.fitness_delta.delta_unassigned, 0);
         assert!(plan.decision_var_patches.is_empty());
         assert!(plan.terminal_delta.is_empty());
     }

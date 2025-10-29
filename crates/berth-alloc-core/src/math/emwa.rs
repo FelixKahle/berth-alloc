@@ -35,7 +35,7 @@ pub struct Ewma<F, T> {
 }
 
 /// Error type for an invalid alpha value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvalidAlphaError<F> {
     value: F,
 }
@@ -67,6 +67,7 @@ where
     T: Copy + Add<Output = T> + Mul<F, Output = F> + Zero, // T * F -> F
 {
     /// Creates a new EWMA with a given smoothing factor `alpha`.
+    #[inline]
     pub fn new(alpha: F) -> Result<Self, InvalidAlphaError<F>> {
         if !alpha.is_finite() || alpha <= F::zero() || alpha > F::one() {
             return Err(InvalidAlphaError::new(alpha));
@@ -74,16 +75,24 @@ where
         Ok(Self { alpha, value: None })
     }
 
+    #[inline]
     pub fn from_half_life(half_life_steps: F) -> Result<Self, InvalidAlphaError<F>> {
-        assert!(half_life_steps.is_finite() && half_life_steps > F::zero());
+        if !half_life_steps.is_finite() || half_life_steps <= F::zero() {
+            return Err(InvalidAlphaError::new(F::nan()));
+        }
+
         let half = F::from(0.5).unwrap();
         let one = F::one();
         let alpha = one - half.powf(one / half_life_steps);
         Self::new(alpha)
     }
 
+    #[inline]
     pub fn from_time_constant(tau_steps: F) -> Result<Self, InvalidAlphaError<F>> {
-        assert!(tau_steps.is_finite() && tau_steps > F::zero());
+        if !tau_steps.is_finite() || tau_steps <= F::zero() {
+            return Err(InvalidAlphaError::new(F::nan()));
+        }
+
         let one = F::one();
         let alpha = one - (-one / tau_steps).exp();
         Self::new(alpha)
@@ -94,6 +103,7 @@ where
         self.alpha
     }
 
+    #[inline]
     pub fn set_alpha(&mut self, alpha: F) -> Result<(), InvalidAlphaError<F>> {
         if !alpha.is_finite() || alpha <= F::zero() || alpha > F::one() {
             return Err(InvalidAlphaError::new(alpha));
@@ -280,5 +290,21 @@ mod tests {
         let result = ew.observe_n(100.0, 3);
         assert_eq!(result, 100.0);
         assert_eq!(ew.value(), Some(100.0));
+    }
+
+    #[test]
+    fn test_half_life_invalid_params_rejected() {
+        assert!(TestEwma::from_half_life(0.0).is_err());
+        assert!(TestEwma::from_half_life(f64::NAN).is_err());
+        assert!(TestEwma::from_half_life(f64::NEG_INFINITY).is_err());
+        assert!(TestEwma::from_half_life(-1.0).is_err());
+    }
+
+    #[test]
+    fn test_time_constant_invalid_params_rejected() {
+        assert!(TestEwma::from_time_constant(0.0).is_err());
+        assert!(TestEwma::from_time_constant(f64::NAN).is_err());
+        assert!(TestEwma::from_time_constant(f64::INFINITY).is_err());
+        assert!(TestEwma::from_time_constant(-1.0).is_err());
     }
 }

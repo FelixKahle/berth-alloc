@@ -52,6 +52,11 @@ impl SolverStateVersion {
     pub fn increment(&mut self) {
         self.0 = self.0.checked_add(1).expect("SolverStateVersion overflow");
     }
+
+    #[inline]
+    pub fn value(&self) -> u64 {
+        self.0
+    }
 }
 
 impl std::fmt::Display for SolverStateVersion {
@@ -116,47 +121,31 @@ impl<'p, T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost> + Mul<Output = Cos
         T: std::fmt::Debug,
     {
         #[cfg(debug_assertions)]
-        let prev_cost = self.fitness.cost;
-        #[cfg(debug_assertions)]
-        let prev_unassigned = self.fitness.unassigned_requests;
+        let prev_fitness = self.fitness;
 
         self.apply_decision_var_patches(plan.decision_var_patches);
         let res = self.terminal_occupancy.apply_delta(plan.terminal_delta);
         debug_assert!(res.is_ok(), "Failed to apply terminal delta: {:?}", res);
 
-        self.fitness.cost += plan.delta_cost;
-
-        if plan.delta_unassigned != 0 {
-            let new_unassigned = self
-                .fitness
-                .unassigned_requests
-                .checked_add_signed(isize::try_from(plan.delta_unassigned).unwrap())
-                .expect("unassigned delta overflow");
-            self.fitness.unassigned_requests = new_unassigned;
-        }
+        self.fitness = self.fitness.apply_delta(&plan.fitness_delta);
 
         self.version.increment();
 
         #[cfg(debug_assertions)]
         {
-            debug_assert!(
-                self.fitness.cost == prev_cost + plan.delta_cost,
-                "fitness.cost did not match delta: prev={prev_cost}, delta={}, new={}",
-                plan.delta_cost,
-                self.fitness.cost
+            let expected = prev_fitness.apply_delta(&plan.fitness_delta);
+
+            debug_assert_eq!(
+                self.fitness.cost, expected.cost,
+                "fitness.cost did not match applied delta"
             );
             debug_assert!(
                 self.fitness.cost.is_positive(),
                 "fitness.cost became negative"
             );
-
-            let expected_unassigned = prev_unassigned
-                .checked_add_signed(isize::try_from(plan.delta_unassigned).unwrap())
-                .unwrap();
-
             debug_assert_eq!(
-                self.fitness.unassigned_requests, expected_unassigned,
-                "fitness.unassigned_requests did not match delta"
+                self.fitness.unassigned_requests, expected.unassigned_requests,
+                "fitness.unassigned_requests did not match applied delta"
             );
 
             let dv_unassigned = self.count_unassigned_requests();
@@ -309,6 +298,7 @@ mod tests {
         state::{
             berth::berthocc::{BerthRead, BerthWrite},
             decisionvar::{DecisionVar, DecisionVarVec},
+            fitness::FitnessDelta,
             plan::{DecisionVarPatch, Plan},
             terminal::{
                 delta::TerminalDelta,
@@ -473,7 +463,7 @@ mod tests {
             DecisionVarPatch::new(ri(1), DecisionVar::assigned(bi(0), tp(10))),
         ];
 
-        let plan = Plan::new_delta(patches, delta, 0, 0);
+        let plan = Plan::new_delta(patches, delta, FitnessDelta::zero());
         st.apply_plan(plan);
 
         // Decision variables swapped
@@ -738,7 +728,7 @@ mod tests {
         )];
         let delta = crate::state::terminal::delta::TerminalDelta::empty();
 
-        let plan = Plan::new_delta(patches, delta, 0, 0); // incorrect delta_unassigned
+        let plan = Plan::new_delta(patches, delta, FitnessDelta::zero()); // incorrect delta_unassigned
         st.apply_plan(plan);
     }
 
@@ -754,7 +744,7 @@ mod tests {
         let patches = vec![DecisionVarPatch::new(ri(0), DecisionVar::unassigned())]; // no-op
         let delta = crate::state::terminal::delta::TerminalDelta::empty();
 
-        let plan = Plan::new_delta(patches, delta, 7, 0);
+        let plan = Plan::new_delta(patches, delta, FitnessDelta::new(7, 0));
         st.apply_plan(plan);
 
         // With apply_plan now applying fitness deltas, cost must update and unassigned remain unchanged
@@ -785,7 +775,7 @@ mod tests {
         let delta =
             crate::state::terminal::delta::TerminalDelta::from_updates(vec![(BerthIndex(1), occ)]);
 
-        let plan = Plan::new_delta(Vec::new(), delta, 0, 0);
+        let plan = Plan::new_delta(Vec::new(), delta, FitnessDelta::zero());
         st.apply_plan(plan); // debug_assert!(res.is_ok()) panics
     }
 
@@ -817,7 +807,7 @@ mod tests {
         // No-op plan (keeps DV same, empty terminal delta, zero fitness deltas)
         let patches = vec![DecisionVarPatch::new(ri(0), DecisionVar::unassigned())];
         let delta = crate::state::terminal::delta::TerminalDelta::empty();
-        let plan = Plan::new_delta(patches, delta, 0, 0);
+        let plan = Plan::new_delta(patches, delta, FitnessDelta::zero());
 
         st.apply_plan(plan);
         let v1 = st.version();
@@ -826,7 +816,7 @@ mod tests {
         // Apply another no-op plan and verify monotonic increment
         let patches2 = vec![DecisionVarPatch::new(ri(0), DecisionVar::unassigned())];
         let delta2 = crate::state::terminal::delta::TerminalDelta::empty();
-        let plan2 = Plan::new_delta(patches2, delta2, 0, 0);
+        let plan2 = Plan::new_delta(patches2, delta2, FitnessDelta::zero());
 
         st.apply_plan(plan2);
         let v2 = st.version();
@@ -877,7 +867,7 @@ mod tests {
         )];
         // No terminal delta, but cost goes up by 3; unassigned decreases by 1
         let delta = crate::state::terminal::delta::TerminalDelta::empty();
-        let plan = Plan::new_delta(patches, delta, 3, -1);
+        let plan = Plan::new_delta(patches, delta, FitnessDelta::new(3, -1));
 
         let v0 = st.version();
         st.apply_plan(plan);
@@ -906,7 +896,7 @@ mod tests {
         // Plan: unassign request 0; delta_unassigned = +1; delta_cost = 0
         let patches = vec![DecisionVarPatch::new(ri(0), DecisionVar::unassigned())];
         let delta = crate::state::terminal::delta::TerminalDelta::empty();
-        let plan = Plan::new_delta(patches, delta, 0, 1);
+        let plan = Plan::new_delta(patches, delta, FitnessDelta::new(0, 1));
 
         let v0 = st.version();
         st.apply_plan(plan);

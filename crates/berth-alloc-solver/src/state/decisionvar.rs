@@ -38,6 +38,21 @@ impl<T> Decision<T> {
     }
 }
 
+impl Ord for Decision<i64> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match self.berth_index.cmp(&other.berth_index) {
+            std::cmp::Ordering::Equal => self.start_time.cmp(&other.start_time),
+            ord => ord,
+        }
+    }
+}
+
+impl PartialOrd for Decision<i64> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl<T: std::fmt::Display> std::fmt::Display for Decision<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -239,6 +254,7 @@ mod tests {
     use super::*;
     use crate::model::index::BerthIndex;
     use berth_alloc_core::prelude::TimePoint;
+    use std::cmp::Ordering;
 
     #[inline]
     fn tp(v: i64) -> TimePoint<i64> {
@@ -455,6 +471,58 @@ mod tests {
         let s: &[DecisionVar<i64>] = &dvv;
         assert_eq!(s.len(), 2);
         assert!(s[1].is_assigned());
+    }
+
+    #[test]
+    fn test_decision_ord_lex_by_berth_then_start() {
+        let d11 = Decision::new(BerthIndex::new(1), tp(10));
+        let d12 = Decision::new(BerthIndex::new(1), tp(20));
+        let d01 = Decision::new(BerthIndex::new(0), tp(100));
+        let d20 = Decision::new(BerthIndex::new(2), tp(0));
+
+        // Same berth, compare by start_time
+        assert!(d11 < d12);
+        assert_eq!(d11.cmp(&d12), Ordering::Less);
+        assert_eq!(d12.cmp(&d11), Ordering::Greater);
+
+        // Different berths: berth decides regardless of start_time
+        assert!(d01 < d12);
+        assert_eq!(d01.cmp(&d12), Ordering::Less);
+        assert!(d20 > d12);
+        assert_eq!(d20.cmp(&d12), Ordering::Greater);
+
+        // Equality
+        let d11_dup = Decision::new(BerthIndex::new(1), tp(10));
+        assert_eq!(d11, d11_dup);
+        assert_eq!(d11.cmp(&d11_dup), Ordering::Equal);
+
+        // Sorting is stable and lexicographic
+        let mut v = vec![d12, d01, d20, d11];
+        v.sort(); // uses Ord
+        assert_eq!(v, vec![d01, d11, d12, d20]);
+    }
+
+    #[test]
+    fn test_decision_partial_ord_matches_total_ord() {
+        let cases = [
+            (
+                Decision::new(BerthIndex::new(1), tp(10)),
+                Decision::new(BerthIndex::new(1), tp(20)),
+            ),
+            (
+                Decision::new(BerthIndex::new(0), tp(100)),
+                Decision::new(BerthIndex::new(1), tp(0)),
+            ),
+            (
+                Decision::new(BerthIndex::new(2), tp(0)),
+                Decision::new(BerthIndex::new(2), tp(0)),
+            ),
+        ];
+
+        for (a, b) in cases {
+            assert_eq!(a.partial_cmp(&b), Some(a.cmp(&b)));
+            assert_eq!(b.partial_cmp(&a), Some(b.cmp(&a)));
+        }
     }
 }
 

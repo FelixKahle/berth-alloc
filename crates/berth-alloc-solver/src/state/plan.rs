@@ -21,9 +21,8 @@
 
 use crate::{
     model::index::RequestIndex,
-    state::{decisionvar::DecisionVar, terminal::delta::TerminalDelta},
+    state::{decisionvar::DecisionVar, fitness::FitnessDelta, terminal::delta::TerminalDelta},
 };
-use berth_alloc_core::prelude::Cost;
 
 #[derive(Debug, Clone)]
 pub struct DecisionVarPatch<T> {
@@ -33,7 +32,7 @@ pub struct DecisionVarPatch<T> {
 
 impl<T: Copy + Ord> DecisionVarPatch<T> {
     #[inline]
-    pub fn new(index: RequestIndex, patch: DecisionVar<T>) -> Self {
+    pub const fn new(index: RequestIndex, patch: DecisionVar<T>) -> Self {
         Self { index, patch }
     }
 }
@@ -52,8 +51,7 @@ impl<T: Copy + Ord + std::fmt::Display> std::fmt::Display for DecisionVarPatch<T
 pub struct Plan<'p, T: Copy + Ord> {
     pub decision_var_patches: Vec<DecisionVarPatch<T>>,
     pub terminal_delta: TerminalDelta<'p, T>,
-    pub delta_cost: Cost,
-    pub delta_unassigned: i32,
+    pub fitness_delta: FitnessDelta,
 }
 
 impl<'p, T: Copy + Ord> Plan<'p, T> {
@@ -61,14 +59,12 @@ impl<'p, T: Copy + Ord> Plan<'p, T> {
     pub fn new_delta(
         decision_var_patches: Vec<DecisionVarPatch<T>>,
         terminal_delta: TerminalDelta<'p, T>,
-        delta_cost: Cost,
-        delta_unassigned: i32,
+        fitness_delta: FitnessDelta,
     ) -> Self {
         Self {
             decision_var_patches,
             terminal_delta,
-            delta_cost,
-            delta_unassigned,
+            fitness_delta,
         }
     }
 }

@@ -19,10 +19,6 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use berth_alloc_core::prelude::Cost;
-use num_traits::{CheckedAdd, CheckedSub};
-use std::ops::Mul;
-
 use crate::{
     model::solver_model::SolverModel,
     search::{eval::CostEvaluator, planner::PlanBuilder},
@@ -32,6 +28,31 @@ use crate::{
         solver_state::{SolverState, SolverStateView},
     },
 };
+use berth_alloc_core::prelude::Cost;
+use num_traits::{CheckedAdd, CheckedSub};
+use std::ops::Mul;
+
+#[repr(transparent)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
+pub struct OperatorStateVersion(u64);
+
+impl OperatorStateVersion {
+    #[inline]
+    pub const fn new(v: u64) -> Self {
+        Self(v)
+    }
+
+    #[inline]
+    pub const fn value(&self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for OperatorStateVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OperatorStateVersion({})", self.0)
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub struct OperatorContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>
@@ -157,6 +178,13 @@ where
     /// only clear internal cursors/caches so that the next call to
     /// `make_next_neighbor()` starts enumerating from the current `SolverState`.
     fn reset(&mut self);
+
+    /// Returns the current operator state version.
+    ///
+    /// This will be incremented whenever the operator is advanced and reset
+    /// when the operator is reset. It can be used to track changes in the
+    /// operator's internal state.
+    fn state_version(&self) -> OperatorStateVersion;
 
     /// Indicates whether the operator yields related "fragments" of a move.
     ///
@@ -312,6 +340,14 @@ mod tests {
             "TestAssignOp"
         }
 
+        fn state_version(&self) -> OperatorStateVersion {
+            if self.yielded {
+                OperatorStateVersion::new(1)
+            } else {
+                OperatorStateVersion::new(0)
+            }
+        }
+
         fn has_fragments(&self) -> bool {
             false
         }
@@ -407,8 +443,14 @@ mod tests {
             .expect("operator should yield a plan");
 
         // Assert plan shape
-        assert!(plan.delta_cost > 0, "plan must add positive cost");
-        assert_eq!(plan.delta_unassigned, -1, "one request assigned");
+        assert!(
+            plan.fitness_delta.delta_cost > 0,
+            "plan must add positive cost"
+        );
+        assert_eq!(
+            plan.fitness_delta.delta_unassigned, -1,
+            "one request assigned"
+        );
         assert_eq!(plan.decision_var_patches.len(), 1, "exactly one DV patch");
         assert!(
             !plan.terminal_delta.is_empty(),
