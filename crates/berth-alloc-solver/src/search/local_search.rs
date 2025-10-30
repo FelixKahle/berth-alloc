@@ -137,6 +137,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct MetaheuristicLocalSearch<T, C, M, R>
 where
     T: Copy + Ord,
@@ -248,23 +249,21 @@ mod tests {
         prelude::{Berth, BerthIdentifier, Problem, RequestIdentifier},
         problem::{asg::Assignment, req::Request},
     };
+    use rand::RngCore;
     use rand::{SeedableRng, rngs::StdRng};
-    use std::cell::Cell;
     use std::collections::BTreeMap;
-
-    type T = i64;
 
     // Helpers to build a tiny problem/state similar to lns.rs tests
     #[inline]
-    fn tp(v: i64) -> TimePoint<T> {
+    fn tp(v: i64) -> TimePoint<i64> {
         TimePoint::new(v)
     }
     #[inline]
-    fn iv(a: i64, b: i64) -> TimeInterval<T> {
+    fn iv(a: i64, b: i64) -> TimeInterval<i64> {
         TimeInterval::new(tp(a), tp(b))
     }
     #[inline]
-    fn td(v: i64) -> TimeDelta<T> {
+    fn td(v: i64) -> TimeDelta<i64> {
         TimeDelta::new(v)
     }
     #[inline]
@@ -276,25 +275,30 @@ mod tests {
         RequestIdentifier::new(n)
     }
 
-    fn problem_one_berth_two_flex() -> Problem<T> {
+    fn problem_one_berth_two_flex() -> Problem<i64> {
         // One berth with broad window
         let b1 = Berth::from_windows(bid(1), [iv(0, 1000)]);
         // Two flexible requests, both allowed on berth 1
         let mut pt1 = BTreeMap::new();
         pt1.insert(bid(1), td(10));
-        let r1 = Request::<FlexibleKind, T>::new(rid(1), iv(0, 200), 1, pt1).unwrap();
+        let r1 = Request::<FlexibleKind, i64>::new(rid(1), iv(0, 200), 1, pt1).unwrap();
 
         let mut pt2 = BTreeMap::new();
         pt2.insert(bid(1), td(5));
-        let r2 = Request::<FlexibleKind, T>::new(rid(2), iv(0, 200), 1, pt2).unwrap();
+        let r2 = Request::<FlexibleKind, i64>::new(rid(2), iv(0, 200), 1, pt2).unwrap();
 
         let mut berths = berth_alloc_model::problem::berth::BerthContainer::new();
         berths.insert(b1);
 
-        let fixed =
-            berth_alloc_model::problem::asg::AssignmentContainer::<_, T, Assignment<_, T>>::new();
-        let mut flex =
-            berth_alloc_model::problem::req::RequestContainer::<T, Request<FlexibleKind, T>>::new();
+        let fixed = berth_alloc_model::problem::asg::AssignmentContainer::<
+            _,
+            i64,
+            Assignment<_, i64>,
+        >::new();
+        let mut flex = berth_alloc_model::problem::req::RequestContainer::<
+            i64,
+            Request<FlexibleKind, i64>,
+        >::new();
         flex.insert(r1);
         flex.insert(r2);
 
@@ -302,8 +306,12 @@ mod tests {
     }
 
     fn make_state(
-        problem: &Problem<T>,
-    ) -> (SolverModel<'_, T>, SolverState<'_, T>, DefaultCostEvaluator) {
+        problem: &Problem<i64>,
+    ) -> (
+        SolverModel<'_, i64>,
+        SolverState<'_, i64>,
+        DefaultCostEvaluator,
+    ) {
         let model = SolverModel::try_from(problem).expect("model ok");
         let term = TerminalOccupancy::new(problem.berths().iter());
         let dvars = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
@@ -317,20 +325,20 @@ mod tests {
 
     // Returns false immediately; next() must return None without touching operator.
     struct AlwaysStopMH;
-    impl Metaheuristic<T, DefaultCostEvaluator> for AlwaysStopMH {
+    impl Metaheuristic<i64, DefaultCostEvaluator> for AlwaysStopMH {
         fn name(&self) -> &str {
             "AlwaysStopMH"
         }
         fn local_optimum_reached(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, T, DefaultCostEvaluator>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
         ) -> bool {
             false
         }
         fn accept_plan(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, T, DefaultCostEvaluator>,
-            _plan: &Plan<'_, T>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _plan: &Plan<'_, i64>,
         ) -> bool {
             false
         }
@@ -338,32 +346,30 @@ mod tests {
 
     // Allows search to proceed and accepts the first plan it sees.
     struct AcceptFirstMH {
-        accepted: Cell<bool>,
+        accepted: bool,
     }
     impl AcceptFirstMH {
         fn new() -> Self {
-            Self {
-                accepted: Cell::new(false),
-            }
+            Self { accepted: false }
         }
     }
-    impl Metaheuristic<T, DefaultCostEvaluator> for AcceptFirstMH {
+    impl Metaheuristic<i64, DefaultCostEvaluator> for AcceptFirstMH {
         fn name(&self) -> &str {
             "AcceptFirstMH"
         }
         fn local_optimum_reached(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, T, DefaultCostEvaluator>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
         ) -> bool {
             true
         }
         fn accept_plan(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, T, DefaultCostEvaluator>,
-            _plan: &Plan<'_, T>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _plan: &Plan<'_, i64>,
         ) -> bool {
-            if !self.accepted.get() {
-                self.accepted.set(true);
+            if !self.accepted {
+                self.accepted = true;
                 true
             } else {
                 false
@@ -371,38 +377,96 @@ mod tests {
         }
     }
 
+    // Accept the second plan encountered (reject the first).
+    struct AcceptSecondMH {
+        seen: usize,
+    }
+    impl AcceptSecondMH {
+        fn new() -> Self {
+            Self { seen: 0 }
+        }
+    }
+    impl Metaheuristic<i64, DefaultCostEvaluator> for AcceptSecondMH {
+        fn name(&self) -> &str {
+            "AcceptSecondMH"
+        }
+        fn local_optimum_reached(
+            &mut self,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+        ) -> bool {
+            true
+        }
+        fn accept_plan(
+            &mut self,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _plan: &Plan<'_, i64>,
+        ) -> bool {
+            self.seen += 1;
+            self.seen == 2
+        }
+    }
+
     // Allows two rounds (initial gate + one continuation); accepts any plan.
     struct ContinueOnceAcceptAlwaysMH {
-        budget: Cell<usize>,
+        budget: usize,
     }
     impl ContinueOnceAcceptAlwaysMH {
         fn new() -> Self {
-            Self {
-                budget: Cell::new(2),
-            }
-        } // initial + one continue
+            Self { budget: 2 } // initial + one continue
+        }
     }
-    impl Metaheuristic<T, DefaultCostEvaluator> for ContinueOnceAcceptAlwaysMH {
+    impl Metaheuristic<i64, DefaultCostEvaluator> for ContinueOnceAcceptAlwaysMH {
         fn name(&self) -> &str {
             "ContinueOnceAcceptAlwaysMH"
         }
         fn local_optimum_reached(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, T, DefaultCostEvaluator>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
         ) -> bool {
-            let b = self.budget.get();
-            if b == 0 {
+            if self.budget == 0 {
                 return false;
             }
-            self.budget.set(b - 1);
+            self.budget -= 1;
             true
         }
         fn accept_plan(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, T, DefaultCostEvaluator>,
-            _plan: &Plan<'_, T>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _plan: &Plan<'_, i64>,
         ) -> bool {
             true
+        }
+    }
+
+    // General continuation budget that never accepts.
+    struct ContinueWithBudgetMH {
+        budget: usize,
+    }
+    impl ContinueWithBudgetMH {
+        fn new(budget: usize) -> Self {
+            Self { budget }
+        }
+    }
+    impl Metaheuristic<i64, DefaultCostEvaluator> for ContinueWithBudgetMH {
+        fn name(&self) -> &str {
+            "ContinueWithBudgetMH"
+        }
+        fn local_optimum_reached(
+            &mut self,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+        ) -> bool {
+            if self.budget == 0 {
+                return false;
+            }
+            self.budget -= 1;
+            true
+        }
+        fn accept_plan(
+            &mut self,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _plan: &Plan<'_, i64>,
+        ) -> bool {
+            false
         }
     }
 
@@ -414,9 +478,9 @@ mod tests {
         round: usize,
         yielded_in_round: usize,
         advance_round_on_sync: bool,
-        pub sync_calls: Cell<usize>,
-        pub reset_calls: Cell<usize>,
-        pub make_calls: Cell<usize>,
+        sync_calls: usize,
+        reset_calls: usize,
+        make_calls: usize,
     }
 
     impl CountingOperator {
@@ -426,9 +490,9 @@ mod tests {
                 round: usize::MAX, // sentinel so first synchronize sets round = 0
                 yielded_in_round: 0,
                 advance_round_on_sync: false,
-                sync_calls: Cell::new(0),
-                reset_calls: Cell::new(0),
-                make_calls: Cell::new(0),
+                sync_calls: 0,
+                reset_calls: 0,
+                make_calls: 0,
             }
         }
         fn current_quota(&self) -> usize {
@@ -436,7 +500,7 @@ mod tests {
         }
     }
 
-    impl LocalSearchOperator<T, DefaultCostEvaluator, StdRng> for CountingOperator {
+    impl LocalSearchOperator<i64, DefaultCostEvaluator, StdRng> for CountingOperator {
         fn name(&self) -> &str {
             "CountingOperator"
         }
@@ -450,15 +514,15 @@ mod tests {
         }
 
         fn reset(&mut self) {
-            self.reset_calls.set(self.reset_calls.get() + 1);
+            self.reset_calls += 1;
             self.advance_round_on_sync = true;
         }
 
         fn synchronize<'b, 'r, 'c, 's, 'm, 'p>(
             &mut self,
-            _ctx: &mut OperatorContext<'b, 'r, 'c, 's, 'm, 'p, T, DefaultCostEvaluator, StdRng>,
+            _ctx: &mut OperatorContext<'b, 'r, 'c, 's, 'm, 'p, i64, DefaultCostEvaluator, StdRng>,
         ) {
-            self.sync_calls.set(self.sync_calls.get() + 1);
+            self.sync_calls += 1;
             // First synchronize establishes round 0; subsequent ones advance after a reset.
             if self.round == usize::MAX {
                 self.round = 0;
@@ -472,9 +536,9 @@ mod tests {
 
         fn make_next_neighbor<'b, 'r, 'c, 's, 'm, 'p>(
             &mut self,
-            _ctx: &mut OperatorContext<'b, 'r, 'c, 's, 'm, 'p, T, DefaultCostEvaluator, StdRng>,
-        ) -> Option<Plan<'p, T>> {
-            self.make_calls.set(self.make_calls.get() + 1);
+            _ctx: &mut OperatorContext<'b, 'r, 'c, 's, 'm, 'p, i64, DefaultCostEvaluator, StdRng>,
+        ) -> Option<Plan<'p, i64>> {
+            self.make_calls += 1;
             if self.yielded_in_round < self.current_quota() {
                 self.yielded_in_round += 1;
                 return Some(Plan::empty());
@@ -484,7 +548,7 @@ mod tests {
     }
 
     // NeighborhoodFilterStack is used only via accept(). Default stack should accept all.
-    fn default_filter_stack() -> NeighborhoodFilterStack<T> {
+    fn default_filter_stack() -> NeighborhoodFilterStack<i64> {
         NeighborhoodFilterStack::default()
     }
 
@@ -545,6 +609,36 @@ mod tests {
     }
 
     #[test]
+    fn test_next_accepts_second_neighbor() {
+        let problem = problem_one_berth_two_flex();
+        let (model, state, eval) = make_state(&problem);
+        let mut rng = StdRng::seed_from_u64(11);
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let current_fitness = *state.fitness();
+
+        let mut ctx = LocalSearchContext::new(
+            &model,
+            &state,
+            &eval,
+            &mut rng,
+            &mut work_buf,
+            current_fitness,
+        );
+
+        let op = Box::new(CountingOperator::new(vec![3]));
+        let filter_stack = default_filter_stack();
+        let mh = AcceptSecondMH::new();
+
+        let mut search = MetaheuristicLocalSearch::new(op, filter_stack, mh);
+
+        let res = search.next(&mut ctx);
+        assert!(
+            res.is_some(),
+            "expected Some(plan) when second neighbor is accepted"
+        );
+    }
+
+    #[test]
     fn test_next_retries_after_reset_when_first_round_has_no_neighbors() {
         let problem = problem_one_berth_two_flex();
         let (model, state, eval) = make_state(&problem);
@@ -572,38 +666,33 @@ mod tests {
         assert!(res.is_some(), "expected Some(plan) on second round");
     }
 
-    use rand::RngCore;
-
     // Metaheuristic that allows exactly one round and rejects every plan.
     struct RejectAllMH {
-        budget: Cell<usize>,
+        budget: usize,
     }
     impl RejectAllMH {
         fn new() -> Self {
-            Self {
-                budget: Cell::new(1),
-            } // allow initial gate, then stop
+            Self { budget: 1 } // allow initial gate, then stop
         }
     }
-    impl Metaheuristic<T, DefaultCostEvaluator> for RejectAllMH {
+    impl Metaheuristic<i64, DefaultCostEvaluator> for RejectAllMH {
         fn name(&self) -> &str {
             "RejectAllMH"
         }
         fn local_optimum_reached(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, T, DefaultCostEvaluator>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
         ) -> bool {
-            let b = self.budget.get();
-            if b == 0 {
+            if self.budget == 0 {
                 return false;
             }
-            self.budget.set(b - 1);
+            self.budget -= 1;
             true
         }
         fn accept_plan(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, T, DefaultCostEvaluator>,
-            _plan: &Plan<'_, T>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _plan: &Plan<'_, i64>,
         ) -> bool {
             false
         }
@@ -634,6 +723,36 @@ mod tests {
         let mut search = MetaheuristicLocalSearch::new(op, filter_stack, mh);
         let res = search.next(&mut ctx);
         assert!(res.is_none(), "expected None when MH rejects all neighbors");
+    }
+
+    #[test]
+    fn test_next_multiple_empty_rounds_then_none() {
+        let problem = problem_one_berth_two_flex();
+        let (model, state, eval) = make_state(&problem);
+        let mut rng = StdRng::seed_from_u64(12);
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let current_fitness = *state.fitness();
+
+        let mut ctx = LocalSearchContext::new(
+            &model,
+            &state,
+            &eval,
+            &mut rng,
+            &mut work_buf,
+            current_fitness,
+        );
+
+        // Three rounds, all with zero neighbors; MH allows exactly three rounds.
+        let op = Box::new(CountingOperator::new(vec![0, 0, 0]));
+        let filter_stack = default_filter_stack();
+        let mh = ContinueWithBudgetMH::new(3);
+
+        let mut search = MetaheuristicLocalSearch::new(op, filter_stack, mh);
+        let res = search.next(&mut ctx);
+        assert!(
+            res.is_none(),
+            "expected None when all rounds yield no neighbors"
+        );
     }
 
     #[test]
@@ -691,7 +810,7 @@ mod tests {
         let mh = AcceptFirstMH::new();
 
         let search = MetaheuristicLocalSearch::new(op, filter_stack, mh);
-        let ls: &dyn LocalSearch<T, DefaultCostEvaluator, StdRng> = &search;
+        let ls: &dyn LocalSearch<i64, DefaultCostEvaluator, StdRng> = &search;
 
         assert_eq!(format!("{:?}", ls), "LocalSearch(MetaheuristicLocalSearch)");
         assert_eq!(format!("{}", ls), "LocalSearch(MetaheuristicLocalSearch)");
