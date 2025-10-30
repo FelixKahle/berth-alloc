@@ -20,6 +20,7 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::search::eval::CostEvaluator;
+use crate::state::berth::err::BerthApplyError;
 use crate::state::fitness::{Fitness, FitnessDelta};
 use crate::state::terminal::terminalocc::TerminalWrite;
 use crate::{
@@ -258,6 +259,45 @@ where
         }
     }
 
+    pub fn from_plan(
+        solver_model: &'m SolverModel<'p, T>,
+        base_plan: Plan<'p, T>,
+        base_terminal: &'t TerminalOccupancy<'p, T>,
+        cost_evaluator: &'c C,
+        decision_vars: &'b mut [DecisionVar<T>],
+    ) -> Result<Self, BerthApplyError<T>> {
+        let mut pb = Self {
+            solver_model,
+            decision_vars,
+            sandbox: TerminalSandbox::new(base_terminal),
+            cost_evaluator,
+            fitness_delta: base_plan.fitness_delta,
+            patches: Vec::with_capacity(32),
+            undo: Vec::with_capacity(64),
+        };
+
+        pb.prime_from_plan(base_plan)?;
+        Ok(pb)
+    }
+
+    #[inline]
+    pub fn prime_from_plan(&mut self, baseline: Plan<'p, T>) -> Result<(), BerthApplyError<T>> {
+        self.sandbox.apply_delta(baseline.terminal_delta)?;
+        for p in &baseline.decision_var_patches {
+            self.decision_vars[p.index.get()] = p.patch;
+        }
+
+        self.patches.clear();
+        self.fitness_delta = FitnessDelta::zero();
+        self.undo.clear();
+
+        debug_assert!(!self.has_changes());
+        debug_assert_eq!(self.delta_cost(), 0);
+        debug_assert_eq!(self.delta_unassigned(), 0);
+
+        Ok(())
+    }
+
     #[inline]
     pub fn delta_cost(&self) -> Cost {
         self.fitness_delta.delta_cost
@@ -326,6 +366,40 @@ where
     {
         let prev_dv = self.decision_vars[request.get()];
 
+        let new_cost = self
+            .cost_evaluator
+            .eval_request(
+                self.solver_model,
+                request,
+                start_time,
+                free_berth.berth_index(),
+            )
+            .ok_or_else(|| {
+                ProposeAssignmentError::NotAllowedOnBerth(NotAllowedOnBerthError::new(
+                    request,
+                    free_berth.berth_index(),
+                ))
+            })?;
+
+        let processing_time = self
+            .solver_model
+            .processing_time(request, free_berth.berth_index())
+            .ok_or_else(|| {
+                ProposeAssignmentError::NotAllowedOnBerth(NotAllowedOnBerthError::new(
+                    request,
+                    free_berth.berth_index(),
+                ))
+            })?;
+
+        let end_time = start_time + processing_time;
+        let asg_iv = TimeInterval::new(start_time, end_time);
+
+        if !free_berth.interval().contains_interval(&asg_iv) {
+            return Err(ProposeAssignmentError::BerthNotFree(
+                BerthNotFreeError::new(free_berth.berth_index(), asg_iv, free_berth.interval()),
+            ));
+        }
+
         if let DecisionVar::Assigned(old) = prev_dv {
             let old_iv = self
                 .solver_model
@@ -363,40 +437,6 @@ where
                 .expect("Cost subtraction overflowed");
         }
 
-        let cost = self
-            .cost_evaluator
-            .eval_request(
-                self.solver_model,
-                request,
-                start_time,
-                free_berth.berth_index(),
-            )
-            .ok_or_else(|| {
-                ProposeAssignmentError::NotAllowedOnBerth(NotAllowedOnBerthError::new(
-                    request,
-                    free_berth.berth_index(),
-                ))
-            })?;
-
-        let processing_time = self
-            .solver_model
-            .processing_time(request, free_berth.berth_index())
-            .ok_or_else(|| {
-                ProposeAssignmentError::NotAllowedOnBerth(NotAllowedOnBerthError::new(
-                    request,
-                    free_berth.berth_index(),
-                ))
-            })?;
-
-        let end_time = start_time + processing_time;
-        let asg_iv = TimeInterval::new(start_time, end_time);
-
-        if !free_berth.interval().contains_interval(&asg_iv) {
-            return Err(ProposeAssignmentError::BerthNotFree(
-                BerthNotFreeError::new(free_berth.berth_index(), asg_iv, free_berth.interval()),
-            ));
-        }
-
         self.sandbox
             .occupy(free_berth.berth_index(), asg_iv)
             .map_err(ProposeAssignmentError::from)?;
@@ -409,7 +449,7 @@ where
         self.fitness_delta.delta_cost = self
             .fitness_delta
             .delta_cost
-            .checked_add(cost)
+            .checked_add(new_cost)
             .expect("Cost addition overflowed");
 
         if !matches!(prev_dv, DecisionVar::Assigned(_)) {
@@ -417,7 +457,7 @@ where
                 .fitness_delta
                 .delta_unassigned
                 .checked_sub(1)
-                .expect("Unassigned requests addition overflowed");
+                .expect("Unassigned requests subtraction overflowed");
         }
 
         self.undo.push(UndoAction::Decision(DecisionVarUndoAction {
@@ -591,7 +631,11 @@ mod tests {
     use crate::{
         model::solver_model::SolverModel,
         search::eval::DefaultCostEvaluator,
-        state::{berth::berthocc::BerthRead, decisionvar::DecisionVar},
+        state::{
+            berth::berthocc::{BerthRead, BerthWrite},
+            decisionvar::DecisionVar,
+            terminal::delta::TerminalDelta,
+        },
     };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
     use berth_alloc_model::prelude::*;
@@ -1493,5 +1537,205 @@ mod tests {
 
         // Just ensure it compiles and is a no-op
         pb.discard();
+    }
+
+    #[test]
+    fn test_prime_from_plan_applies_terminal_and_patches_and_resets_state() {
+        // Arrange problem/model/builder
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        let r_ix = model.index_manager().request_index(rid(1)).unwrap();
+        let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
+
+        // Build a baseline terminal delta: occupy the interval of assigning r_ix at time 0
+        let pt = model.processing_time(r_ix, b_ix).expect("pt exists");
+        let asg_iv = iv(0, pt.value());
+
+        // Start from base occupancy, mutate a clone to represent "baseline"
+        let mut occ_b0 = term.berth(b_ix).cloned().expect("base berth exists");
+        occ_b0.occupy(asg_iv).expect("baseline occupy must succeed");
+        let occ_b0_clone = occ_b0.clone(); // for equality check later
+
+        let baseline_delta = TerminalDelta::from_updates(vec![(b_ix, occ_b0)]);
+        // Baseline patches: set r_ix assigned to b_ix@0
+        let baseline_patches = vec![DecisionVarPatch::new(
+            r_ix,
+            DecisionVar::assigned(b_ix, tp(0)),
+        )];
+
+        // FitnessDelta in baseline is ignored/resets in prime_from_plan
+        let baseline =
+            Plan::new_delta(baseline_patches, baseline_delta, FitnessDelta::new(123, -1));
+
+        // Act
+        pb.prime_from_plan(baseline).expect("prime should succeed");
+
+        // Assert: terminal occupancy matches the baseline override
+        let eff_occ = pb.sandbox().berth(b_ix).expect("effective berth exists");
+        assert_eq!(
+            eff_occ, &occ_b0_clone,
+            "sandbox effective occupancy should equal staged baseline occupancy"
+        );
+        // That interval is no longer free
+        assert!(!eff_occ.is_free(asg_iv));
+
+        // Assert: decision var applied
+        assert!(matches!(
+            pb.decision_vars[r_ix.get()],
+            DecisionVar::Assigned(dec) if dec.berth_index == b_ix && dec.start_time == tp(0)
+        ));
+
+        // Ledger reset
+        assert!(!pb.has_changes(), "patches must be cleared after priming");
+        assert_eq!(pb.delta_cost(), 0);
+        assert_eq!(pb.delta_unassigned(), 0);
+
+        // Undo stack cleared implies we can take a savepoint and undo to it with no effect
+        let sp = pb.savepoint();
+        pb.undo_to(sp);
+        let eff_occ2 = pb.sandbox().berth(b_ix).expect("still present");
+        assert_eq!(eff_occ2, &occ_b0_clone);
+        assert!(matches!(
+            pb.decision_vars[r_ix.get()],
+            DecisionVar::Assigned(dec) if dec.berth_index == b_ix && dec.start_time == tp(0)
+        ));
+    }
+
+    #[test]
+    fn test_prime_from_plan_is_idempotent_for_same_baseline() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        let r_ix = model.index_manager().request_index(rid(2)).unwrap();
+        let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
+        let pt = model.processing_time(r_ix, b_ix).unwrap();
+        let asg_iv = iv(0, pt.value());
+
+        let mut occ = term.berth(b_ix).cloned().unwrap();
+        occ.occupy(asg_iv).unwrap();
+        let occ_clone = occ.clone();
+
+        let baseline = Plan::new_delta(
+            vec![DecisionVarPatch::new(
+                r_ix,
+                DecisionVar::assigned(b_ix, tp(0)),
+            )],
+            TerminalDelta::from_updates(vec![(b_ix, occ)]),
+            FitnessDelta::new(999, 42), // ignored
+        );
+
+        pb.prime_from_plan(baseline.clone()).expect("prime 1 ok");
+        let eff1 = pb.sandbox().berth(b_ix).unwrap().clone();
+
+        // Re-prime with the same baseline
+        pb.prime_from_plan(baseline).expect("prime 2 ok");
+        let eff2 = pb.sandbox().berth(b_ix).unwrap().clone();
+
+        assert_eq!(eff1, eff2);
+        assert_eq!(eff2, occ_clone);
+
+        // DV still the same
+        assert!(matches!(
+            pb.decision_vars[r_ix.get()],
+            DecisionVar::Assigned(dec) if dec.berth_index == b_ix && dec.start_time == tp(0)
+        ));
+        assert_eq!(pb.delta_cost(), 0);
+        assert_eq!(pb.delta_unassigned(), 0);
+        assert!(!pb.has_changes());
+    }
+
+    #[test]
+    fn test_reassign_invalid_is_transactional() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        let r_ix = model.index_manager().request_index(rid(1)).unwrap();
+        let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
+
+        // First, assign r1 at t=0 (valid).
+        let free_initial = pb
+            .sandbox()
+            .inner()
+            .iter_free_intervals_for_berths_in([b_ix], model.feasible_interval(r_ix))
+            .next()
+            .unwrap();
+        pb.propose_assignment(r_ix, tp(0), &free_initial)
+            .expect("assign ok");
+
+        // Capture state after the valid assignment.
+        let pt = model.processing_time(r_ix, b_ix).unwrap();
+        let asg_iv_old = iv(0, pt.value());
+        let occ_before = pb.sandbox().inner().berth(b_ix).unwrap().clone();
+        let delta_cost_before = pb.delta_cost();
+        let delta_unassigned_before = pb.delta_unassigned();
+        let dv_before = pb.decision_vars[r_ix.get()];
+
+        // Now craft a too-narrow "free" interval and attempt to reassign into it.
+        // This interval cannot contain the processing time, so it must fail with BerthNotFree.
+        let narrow = FreeBerth::new(iv(1, 2), b_ix);
+        let err = pb
+            .propose_assignment(r_ix, narrow.interval().start(), &narrow)
+            .unwrap_err();
+
+        match err {
+            ProposeAssignmentError::BerthNotFree(_) => {}
+            other => panic!("expected BerthNotFree, got: {other:?}"),
+        }
+
+        // Verify: nothing changed.
+        let occ_after = pb.sandbox().inner().berth(b_ix).unwrap().clone();
+        assert_eq!(
+            occ_after, occ_before,
+            "occupancy must remain identical after failed reassign"
+        );
+        assert!(
+            !occ_after.is_free(asg_iv_old),
+            "old interval must remain occupied"
+        );
+
+        assert_eq!(
+            pb.delta_cost(),
+            delta_cost_before,
+            "delta_cost must be unchanged after failed reassign"
+        );
+        assert_eq!(
+            pb.delta_unassigned(),
+            delta_unassigned_before,
+            "delta_unassigned must be unchanged after failed reassign"
+        );
+
+        assert_eq!(
+            pb.decision_vars[r_ix.get()],
+            dv_before,
+            "decision var must remain at the old assignment"
+        );
     }
 }

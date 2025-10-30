@@ -35,7 +35,7 @@ use crate::{
     },
 };
 
-pub trait CostEvaluator<T: Copy + Ord> {
+pub trait CostEvaluator<T: Copy + Ord>: Send {
     fn name(&self) -> &str;
     fn eval_request<'m>(
         &self,

@@ -19,12 +19,9 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub mod err;
-pub mod eval;
-pub mod filter;
-pub mod lns;
-pub mod metaheuristic;
-pub mod operator;
-pub mod operator_library;
-pub mod planner;
-pub mod sa;
+#[macro_export]
+macro_rules! no_op {
+    () => {
+        ()
+    };
+}

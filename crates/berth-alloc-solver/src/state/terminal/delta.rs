@@ -21,7 +21,7 @@
 
 use crate::{model::index::BerthIndex, state::berth::berthocc::BerthOccupancy};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalDelta<'b, T: Copy + Ord> {
     updates: Vec<(BerthIndex, BerthOccupancy<'b, T>)>,
 }

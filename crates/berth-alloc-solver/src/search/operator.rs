@@ -20,7 +20,7 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    model::solver_model::SolverModel,
+    model::{index::RequestIndex, solver_model::SolverModel},
     search::{eval::CostEvaluator, planner::PlanBuilder},
     state::{
         decisionvar::DecisionVar,
@@ -28,9 +28,17 @@ use crate::{
         solver_state::{SolverState, SolverStateView},
     },
 };
-use berth_alloc_core::prelude::Cost;
+use berth_alloc_core::{no_op, prelude::Cost};
 use num_traits::{CheckedAdd, CheckedSub};
 use std::ops::Mul;
+
+pub type NeighborFnVec = dyn Fn(RequestIndex) -> Vec<RequestIndex> + Send + Sync;
+pub type NeighborFnSlice<'a> = dyn Fn(RequestIndex) -> &'a [RequestIndex] + Send + Sync;
+
+pub enum NeighborFn<'a> {
+    Vec(Box<NeighborFnVec>),
+    Slice(Box<NeighborFnSlice<'a>>),
+}
 
 #[repr(transparent)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
@@ -43,8 +51,23 @@ impl OperatorStateVersion {
     }
 
     #[inline]
+    pub fn zero() -> Self {
+        Self(0)
+    }
+
+    #[inline]
     pub const fn value(&self) -> u64 {
         self.0
+    }
+
+    #[inline]
+    pub fn increment(&self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+
+    #[inline]
+    pub fn reset() -> Self {
+        Self(0)
     }
 }
 
@@ -75,6 +98,23 @@ where
     C: CostEvaluator<T>,
     R: rand::Rng,
 {
+    #[inline]
+    pub fn new(
+        model: &'m SolverModel<'p, T>,
+        state: &'s SolverState<'p, T>,
+        evaluator: &'c C,
+        rng: &'r mut R,
+        buffer: &'b mut [DecisionVar<T>],
+    ) -> Self {
+        Self {
+            model,
+            state,
+            evaluator,
+            rng,
+            buffer,
+        }
+    }
+
     #[inline]
     pub fn state(&self) -> &'s SolverState<'p, T> {
         self.state
@@ -179,6 +219,16 @@ where
     /// `make_next_neighbor()` starts enumerating from the current `SolverState`.
     fn reset(&mut self);
 
+    /// Synchronize the operator's internal state with the current search context.
+    ///
+    /// Default implementation is a no-op.
+    fn synchronize<'b, 'r, 'c, 's, 'm, 'p>(
+        &mut self,
+        _ctx: &mut OperatorContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
+    ) {
+        no_op!()
+    }
+
     /// Returns the current operator state version.
     ///
     /// This will be incremented whenever the operator is advanced and reset
@@ -196,14 +246,6 @@ where
 
     /// Produces the next neighbor as a `Plan`, or `None` if the neighborhood
     /// is exhausted for the current synchronization point.
-    ///
-    /// Semantics:
-    /// - Must not mutate the global solver state; instead, build and return a
-    ///   `Plan` using `ctx.builder()`/`with_builder()`. The search loop decides
-    ///   whether to apply it.
-    /// - May use `ctx.rng()` for randomized exploration.
-    /// - On the first call after `reset()`, begin (re)enumerating neighbors.
-    ///   Subsequent calls should continue enumeration until `None`.
     ///
     /// The returned `Plan` encapsulates decision-variable patches and a
     /// `TerminalDelta` describing occupancy changes; its fitness deltas are
