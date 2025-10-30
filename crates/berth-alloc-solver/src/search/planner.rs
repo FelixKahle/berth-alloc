@@ -366,6 +366,11 @@ where
     {
         let prev_dv = self.decision_vars[request.get()];
 
+        if let DecisionVar::Assigned(old) = prev_dv
+            && old.berth_index == free_berth.berth_index() && old.start_time == start_time {
+                return Ok(());
+            }
+
         let new_cost = self
             .cost_evaluator
             .eval_request(

@@ -57,6 +57,15 @@ pub struct Plan<'p, T: Copy + Ord> {
 
 impl<'p, T: Copy + Ord> Plan<'p, T> {
     #[inline]
+    pub fn empty() -> Self {
+        Self {
+            decision_var_patches: Vec::new(),
+            terminal_delta: TerminalDelta::empty(),
+            fitness_delta: FitnessDelta::zero(),
+        }
+    }
+
+    #[inline]
     pub fn new_delta(
         decision_var_patches: Vec<DecisionVarPatch<T>>,
         terminal_delta: TerminalDelta<'p, T>,

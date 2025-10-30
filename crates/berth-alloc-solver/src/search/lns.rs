@@ -316,6 +316,65 @@ where
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub struct PerturbationProcedureContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>
+where
+    T: Copy + Ord,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+{
+    model: &'m SolverModel<'p, T>,
+    state: &'s SolverState<'p, T>,
+    evaluator: &'c C,
+
+    rng: &'r mut R,
+    buffer: &'b mut [DecisionVar<T>],
+}
+
+impl<'b, 'r, 'c, 's, 'm, 'p, T, C, R> PerturbationProcedureContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>
+where
+    T: Copy + Ord + std::fmt::Debug,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+{
+    #[inline]
+    pub fn new(
+        model: &'m SolverModel<'p, T>,
+        state: &'s SolverState<'p, T>,
+        evaluator: &'c C,
+        rng: &'r mut R,
+        buffer: &'b mut [DecisionVar<T>],
+    ) -> Self {
+        Self {
+            model,
+            state,
+            evaluator,
+            rng,
+            buffer,
+        }
+    }
+
+    #[inline]
+    pub fn state(&self) -> &'s SolverState<'p, T> {
+        self.state
+    }
+
+    #[inline]
+    pub fn model(&self) -> &'m SolverModel<'p, T> {
+        self.model
+    }
+
+    #[inline]
+    pub fn cost_evaluator(&self) -> &'c C {
+        self.evaluator
+    }
+
+    #[inline]
+    pub fn rng(&mut self) -> &mut R {
+        self.rng
+    }
+}
+
 pub trait PerturbationProcedure<T, C, R>
 where
     T: Copy + Ord + std::fmt::Debug,
@@ -326,7 +385,7 @@ where
 
     fn perturb<'b, 'r, 'c, 's, 'm, 'p>(
         &mut self,
-        context: &mut RuinProcedureContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
+        context: &mut PerturbationProcedureContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
     ) -> Plan<'p, T>;
 }
 
@@ -349,6 +408,86 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "PerturbationProcedure({})", self.name())
+    }
+}
+
+pub struct RandomRuinRepairPerturbPair<T, C, R>
+where
+    T: Copy + Ord + std::fmt::Debug,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+{
+    ruin: Vec<Box<dyn RuinProcedure<T, C, R>>>,
+    repair: Vec<Box<dyn RepairProcedure<T, C, R>>>,
+}
+
+impl<T, C, R> RandomRuinRepairPerturbPair<T, C, R>
+where
+    T: Copy + Ord + std::fmt::Debug,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+{
+    #[inline]
+    pub fn new(
+        ruin: Vec<Box<dyn RuinProcedure<T, C, R>>>,
+        repair: Vec<Box<dyn RepairProcedure<T, C, R>>>,
+    ) -> Self {
+        Self { ruin, repair }
+    }
+
+    #[inline]
+    pub fn random_ruin<'b, 'r, 'c, 's, 'm, 'p>(
+        &mut self,
+        context: &mut RuinProcedureContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
+    ) -> RuinOutcome<'p, T> {
+        let idx = context.rng().random_range(0..self.ruin.len());
+        self.ruin[idx].ruin(context)
+    }
+
+    #[inline]
+    pub fn random_repair<'b, 'r, 'c, 's, 'm, 'p>(
+        &mut self,
+        context: &mut RepairProcedureContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
+        ruined_outcome: RuinOutcome<'p, T>,
+    ) -> Plan<'p, T> {
+        let idx = context.rng().random_range(0..self.repair.len());
+        self.repair[idx].repair(context, ruined_outcome)
+    }
+}
+
+impl<T, C, R> PerturbationProcedure<T, C, R> for RandomRuinRepairPerturbPair<T, C, R>
+where
+    T: Copy + Ord + std::fmt::Debug + CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+{
+    fn name(&self) -> &str {
+        "RandomRuinRepairPerturbPair"
+    }
+
+    fn perturb<'b, 'r, 'c, 's, 'm, 'p>(
+        &mut self,
+        context: &mut PerturbationProcedureContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
+    ) -> Plan<'p, T> {
+        let ruined_outcome = {
+            let mut ruin_ctx = RuinProcedureContext::new(
+                context.model,
+                context.state,
+                context.evaluator,
+                context.rng,
+                context.buffer,
+            );
+            self.random_ruin(&mut ruin_ctx)
+        };
+
+        let mut repair_ctx = RepairProcedureContext::new(
+            context.model,
+            context.state,
+            context.evaluator,
+            context.rng,
+            context.buffer,
+        );
+        self.random_repair(&mut repair_ctx, ruined_outcome)
     }
 }
 
@@ -495,13 +634,11 @@ mod tests {
         }
         fn perturb<'b, 'r, 'c, 's, 'm, 'p>(
             &mut self,
-            ctx: &mut RuinProcedureContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
+            _ctx: &mut PerturbationProcedureContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
         ) -> Plan<'p, T> {
-            ctx.with_builder(|_pb| { /* no-op */ })
+            Plan::empty()
         }
     }
-
-    // --- Tests ----------------------------------------------------------------------
 
     #[test]
     fn test_ruin_context_with_builder_produces_plan_and_keeps_state_immutable() {
@@ -675,5 +812,190 @@ mod tests {
         assert!(std::ptr::eq(repair_ctx.state(), &state));
         assert!(std::ptr::eq(repair_ctx.cost_evaluator(), &eval));
         let _sample2 = repair_ctx.rng().next_u32();
+    }
+
+    // Additional tests for RandomRuinRepairPerturbPair
+
+    struct CountingRuin {
+        calls: usize,
+    }
+    impl CountingRuin {
+        fn new() -> Self {
+            Self { calls: 0 }
+        }
+    }
+    impl<T, C, R> RuinProcedure<T, C, R> for CountingRuin
+    where
+        T: Copy + Ord + std::fmt::Debug + CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
+        C: CostEvaluator<T>,
+        R: rand::Rng,
+    {
+        fn name(&self) -> &str {
+            "CountingRuin"
+        }
+
+        fn ruin<'b, 'r, 'c, 's, 'm, 'p>(
+            &mut self,
+            ctx: &mut RuinProcedureContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
+        ) -> RuinOutcome<'p, T> {
+            self.calls += 1;
+
+            // Build a baseline ruin plan that assigns r1 at t=0 (if available).
+            let r1 = ctx
+                .model()
+                .index_manager()
+                .request_index(rid(1))
+                .expect("r1 index");
+            let b1 = ctx
+                .model()
+                .index_manager()
+                .berth_index(bid(1))
+                .expect("b1 index");
+
+            let free_r1 = ctx
+                .state()
+                .terminal_occupancy()
+                .iter_free_intervals_for_berths_in([b1], ctx.model().feasible_interval(r1))
+                .next()
+                .expect("free interval for r1 exists");
+
+            let ruined_plan = ctx.with_builder(|pb| {
+                let start = free_r1.interval().start();
+                pb.propose_assignment(r1, start, &free_r1)
+                    .expect("assign r1 in ruin");
+            });
+
+            RuinOutcome::new(ruined_plan, Vec::new())
+        }
+    }
+
+    struct CountingRepair {
+        calls: usize,
+    }
+    impl CountingRepair {
+        fn new() -> Self {
+            Self { calls: 0 }
+        }
+    }
+    impl<T, C, R> RepairProcedure<T, C, R> for CountingRepair
+    where
+        T: Copy + Ord + std::fmt::Debug,
+        C: CostEvaluator<T>,
+        R: rand::Rng,
+    {
+        fn name(&self) -> &str {
+            "CountingRepair"
+        }
+
+        fn repair<'b, 'r, 'c, 's, 'm, 'p>(
+            &mut self,
+            _ctx: &mut RepairProcedureContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
+            ruined_outcome: RuinOutcome<'p, T>,
+        ) -> Plan<'p, T> {
+            self.calls += 1;
+            // Return the baseline ruined plan unchanged
+            ruined_outcome.ruined_plan
+        }
+    }
+
+    #[test]
+    fn test_random_ruin_with_singleton_calls_ruin_and_returns_plan() {
+        let problem = problem_one_berth_two_flex();
+        let (model, state, eval) = make_state(&problem);
+        let mut rng = StdRng::seed_from_u64(1234);
+        let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+
+        let mut pair: RandomRuinRepairPerturbPair<T, DefaultCostEvaluator, StdRng> = {
+            let ruin: Box<dyn RuinProcedure<T, _, _>> = Box::new(CountingRuin::new());
+            let repair: Box<dyn RepairProcedure<T, _, _>> = Box::new(CountingRepair::new());
+            RandomRuinRepairPerturbPair::new(vec![ruin], vec![repair])
+        };
+
+        let mut ruin_ctx = RuinProcedureContext::new(&model, &state, &eval, &mut rng, &mut buffer);
+        let outcome = pair.random_ruin(&mut ruin_ctx);
+
+        // Expect a non-empty plan (one assignment patch), and empty ruined list.
+        assert_eq!(outcome.ruined.len(), 0);
+        assert_eq!(outcome.ruined_plan.decision_var_patches.len(), 1);
+        assert!(!outcome.ruined_plan.terminal_delta.is_empty());
+        assert_eq!(outcome.ruined_plan.fitness_delta.delta_unassigned, -1);
+    }
+
+    #[test]
+    fn test_random_repair_with_singleton_calls_repair_and_returns_input_baseline() {
+        let problem = problem_one_berth_two_flex();
+        let (model, state, eval) = make_state(&problem);
+        let mut rng = StdRng::seed_from_u64(5678);
+        let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+
+        // Build a baseline plan (assign r2 at earliest feasible time).
+        let r2 = model.index_manager().request_index(rid(2)).unwrap();
+        let b1 = model.index_manager().berth_index(bid(1)).unwrap();
+        let free_r2 = state
+            .terminal_occupancy()
+            .iter_free_intervals_for_berths_in([b1], model.feasible_interval(r2))
+            .next()
+            .unwrap();
+
+        let mut priming_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut priming_ctx =
+            RuinProcedureContext::new(&model, &state, &eval, &mut rng, &mut priming_buf);
+        let baseline = priming_ctx.with_builder(|pb| {
+            pb.propose_assignment(r2, tp(0), &free_r2)
+                .expect("assign r2 ok");
+        });
+
+        let mut pair: RandomRuinRepairPerturbPair<T, DefaultCostEvaluator, StdRng> = {
+            let ruin: Box<dyn RuinProcedure<T, _, _>> = Box::new(CountingRuin::new());
+            let repair: Box<dyn RepairProcedure<T, _, _>> = Box::new(CountingRepair::new());
+            RandomRuinRepairPerturbPair::new(vec![ruin], vec![repair])
+        };
+
+        let mut repair_ctx =
+            RepairProcedureContext::new(&model, &state, &eval, &mut rng, &mut buffer);
+        let plan = pair.random_repair(
+            &mut repair_ctx,
+            RuinOutcome::new(baseline.clone(), Vec::new()),
+        );
+
+        // CountingRepair returns the baseline unchanged.
+        assert_eq!(plan, baseline);
+    }
+
+    #[test]
+    fn test_perturb_singleton_invokes_both_and_returns_repair_result() {
+        let problem = problem_one_berth_two_flex();
+        let (model, state, eval) = make_state(&problem);
+        let mut rng = StdRng::seed_from_u64(9999);
+        let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+
+        // Singleton ruin + repair
+        let mut pair: RandomRuinRepairPerturbPair<T, DefaultCostEvaluator, StdRng> = {
+            let ruin: Box<dyn RuinProcedure<T, _, _>> = Box::new(CountingRuin::new());
+            let repair: Box<dyn RepairProcedure<T, _, _>> = Box::new(CountingRepair::new());
+            RandomRuinRepairPerturbPair::new(vec![ruin], vec![repair])
+        };
+
+        let mut ctx =
+            PerturbationProcedureContext::new(&model, &state, &eval, &mut rng, &mut buffer);
+        let plan = pair.perturb(&mut ctx);
+
+        // Because repair returns the ruined plan unchanged, expect a plan with exactly one patch.
+        assert_eq!(plan.decision_var_patches.len(), 1);
+        assert!(!plan.terminal_delta.is_empty());
+        assert!(plan.fitness_delta.delta_cost > 0);
+        assert_eq!(plan.fitness_delta.delta_unassigned, -1);
+    }
+
+    #[test]
+    fn test_pair_name() {
+        let pair: RandomRuinRepairPerturbPair<T, DefaultCostEvaluator, StdRng> =
+            RandomRuinRepairPerturbPair::new(
+                vec![Box::new(CountingRuin::new())],
+                vec![Box::new(CountingRepair::new())],
+            );
+
+        let pp: &dyn PerturbationProcedure<T, DefaultCostEvaluator, StdRng> = &pair;
+        assert_eq!(pp.name(), "RandomRuinRepairPerturbPair");
     }
 }
