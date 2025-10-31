@@ -29,8 +29,8 @@ pub struct FilterContext<'s, 'm, 'p, T>
 where
     T: Copy + Ord,
 {
-    model: &'m SolverModel<'p, T>,
-    solver_state: &'s SolverState<'p, T>,
+    pub model: &'m SolverModel<'p, T>,
+    pub solver_state: &'s SolverState<'p, T>,
 }
 
 impl<'s, 'm, 'p, T> FilterContext<'s, 'm, 'p, T>

@@ -22,5 +22,6 @@
 pub mod core;
 pub mod engine;
 pub mod model;
+pub mod monitor;
 pub mod search;
 pub mod state;

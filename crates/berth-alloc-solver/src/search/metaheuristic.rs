@@ -30,9 +30,9 @@ where
     T: Copy + Ord,
     C: CostEvaluator<T>,
 {
-    model: &'m SolverModel<'p, T>,
-    solver_state: &'s SolverState<'p, T>,
-    evaluator: &'e C,
+    pub model: &'m SolverModel<'p, T>,
+    pub solver_state: &'s SolverState<'p, T>,
+    pub evaluator: &'e C,
 }
 
 impl<'e, 's, 'm, 'p, T, C> MetaheuristicContext<'e, 's, 'm, 'p, T, C>

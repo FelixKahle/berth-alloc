@@ -20,122 +20,15 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    model::solver_model::SolverModel,
     search::{
+        decision_builder::{DecisionBuilder, SearchContext},
         eval::CostEvaluator,
         filter::{FilterContext, NeighborhoodFilterStack},
         metaheuristic::{Metaheuristic, MetaheuristicContext},
         operator::{LocalSearchOperator, OperatorContext},
     },
-    state::{decisionvar::DecisionVar, fitness::Fitness, plan::Plan, solver_state::SolverState},
+    state::{decisionvar::DecisionVar, plan::Plan},
 };
-
-#[derive(Debug)]
-pub struct LocalSearchContext<'b, 'c, 's, 'm, 'p, T, C, R>
-where
-    T: Copy + Ord,
-    C: CostEvaluator<T>,
-    R: rand::Rng,
-{
-    model: &'m SolverModel<'p, T>,
-    state: &'s SolverState<'p, T>,
-    evaluator: &'c C,
-    rng: &'b mut R,
-    work_buf: &'b mut [DecisionVar<T>],
-    current_fitness: Fitness,
-}
-
-impl<'b, 'c, 's, 'm, 'p, T, C, R> LocalSearchContext<'b, 'c, 's, 'm, 'p, T, C, R>
-where
-    T: Copy + Ord,
-    C: CostEvaluator<T>,
-    R: rand::Rng,
-{
-    #[inline]
-    pub fn new(
-        model: &'m SolverModel<'p, T>,
-        state: &'s SolverState<'p, T>,
-        evaluator: &'c C,
-        rng: &'b mut R,
-        work_buf: &'b mut [DecisionVar<T>],
-        current_fitness: Fitness,
-    ) -> LocalSearchContext<'b, 'c, 's, 'm, 'p, T, C, R> {
-        LocalSearchContext {
-            model,
-            state,
-            evaluator,
-            rng,
-            work_buf,
-            current_fitness,
-        }
-    }
-
-    #[inline]
-    pub fn model(&self) -> &'m SolverModel<'p, T> {
-        self.model
-    }
-
-    #[inline]
-    pub fn state(&self) -> &'s SolverState<'p, T> {
-        self.state
-    }
-
-    #[inline]
-    pub fn evaluator(&self) -> &'c C {
-        self.evaluator
-    }
-
-    #[inline]
-    pub fn rng(&mut self) -> &mut R {
-        self.rng
-    }
-
-    #[inline]
-    pub fn work_buf(&mut self) -> &mut [DecisionVar<T>] {
-        self.work_buf
-    }
-
-    #[inline]
-    pub fn current_fitness(&self) -> Fitness {
-        self.current_fitness
-    }
-}
-
-pub trait LocalSearch<T, C, R>
-where
-    T: Copy + Ord,
-    C: CostEvaluator<T>,
-    R: rand::Rng,
-{
-    fn name(&self) -> &str;
-
-    fn next<'b, 'c, 's, 'm, 'p>(
-        &mut self,
-        context: &mut LocalSearchContext<'b, 'c, 's, 'm, 'p, T, C, R>,
-    ) -> Option<Plan<'p, T>>;
-}
-
-impl<T, C, R> std::fmt::Debug for dyn LocalSearch<T, C, R>
-where
-    T: Copy + Ord,
-    C: CostEvaluator<T>,
-    R: rand::Rng,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LocalSearch({})", self.name())
-    }
-}
-
-impl<T, C, R> std::fmt::Display for dyn LocalSearch<T, C, R>
-where
-    T: Copy + Ord,
-    C: CostEvaluator<T>,
-    R: rand::Rng,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LocalSearch({})", self.name())
-    }
-}
 
 #[derive(Debug)]
 pub struct MetaheuristicLocalSearch<T, C, M, R>
@@ -170,7 +63,7 @@ where
     }
 }
 
-impl<T, C, M, R> LocalSearch<T, C, R> for MetaheuristicLocalSearch<T, C, M, R>
+impl<T, C, M, R> DecisionBuilder<T, C, R> for MetaheuristicLocalSearch<T, C, M, R>
 where
     T: Copy + Ord + std::fmt::Debug,
     C: CostEvaluator<T>,
@@ -181,9 +74,9 @@ where
         "MetaheuristicLocalSearch"
     }
 
-    fn next<'b, 'c, 's, 'm, 'p>(
+    fn next<'b, 't, 'c, 's, 'm, 'p>(
         &mut self,
-        context: &mut LocalSearchContext<'b, 'c, 's, 'm, 'p, T, C, R>,
+        context: &mut SearchContext<'b, 't, 'c, 's, 'm, 'p, T, C, R>,
     ) -> Option<Plan<'p, T>> {
         let model = context.model;
         let state = context.state;
@@ -205,12 +98,17 @@ where
 
         loop {
             while let Some(plan) = self.local_search_operator.make_next_neighbor(&mut op_ctx) {
+                if context.term.tick_neighbor() {
+                    return None;
+                }
+
                 if !self
                     .filter_stack
                     .accept(FilterContext::new(model, state), &plan)
                 {
                     continue;
                 }
+
                 let mh_ctx = MetaheuristicContext::new(model, state, evaluator);
                 if self.metaheuristic.accept_plan(mh_ctx, &plan) {
                     return Some(plan);
@@ -235,10 +133,15 @@ mod tests {
     use super::*;
     use crate::{
         model::solver_model::SolverModel,
+        monitor::{
+            controller::{GlobalController, SearchLimits},
+            termination::Termination,
+        },
         search::eval::DefaultCostEvaluator,
         state::{
             decisionvar::{DecisionVar, DecisionVarVec},
             fitness::Fitness,
+            plan::Plan,
             solver_state::SolverState,
             terminal::terminalocc::TerminalOccupancy,
         },
@@ -556,13 +459,17 @@ mod tests {
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
 
-        let mut ctx = LocalSearchContext::new(
+        let ctrl = GlobalController::new(SearchLimits::default_fast());
+        let mut term = Termination::from_controller(ctrl);
+
+        let mut ctx = SearchContext::new(
             &model,
             &state,
             &eval,
             &mut rng,
             &mut work_buf,
             current_fitness,
+            &mut term,
         );
 
         let op = Box::new(CountingOperator::new(vec![3])); // would yield neighbors, but shouldn't be called
@@ -583,13 +490,17 @@ mod tests {
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
 
-        let mut ctx = LocalSearchContext::new(
+        let ctrl = GlobalController::new(SearchLimits::default_fast());
+        let mut term = Termination::from_controller(ctrl);
+
+        let mut ctx = SearchContext::new(
             &model,
             &state,
             &eval,
             &mut rng,
             &mut work_buf,
             current_fitness,
+            &mut term,
         );
 
         // One round with 2 neighbors; MH accepts first.
@@ -612,13 +523,17 @@ mod tests {
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
 
-        let mut ctx = LocalSearchContext::new(
+        let ctrl = GlobalController::new(SearchLimits::default_fast());
+        let mut term = Termination::from_controller(ctrl);
+
+        let mut ctx = SearchContext::new(
             &model,
             &state,
             &eval,
             &mut rng,
             &mut work_buf,
             current_fitness,
+            &mut term,
         );
 
         let op = Box::new(CountingOperator::new(vec![3]));
@@ -642,13 +557,17 @@ mod tests {
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
 
-        let mut ctx = LocalSearchContext::new(
+        let ctrl = GlobalController::new(SearchLimits::default_fast());
+        let mut term = Termination::from_controller(ctrl);
+
+        let mut ctx = SearchContext::new(
             &model,
             &state,
             &eval,
             &mut rng,
             &mut work_buf,
             current_fitness,
+            &mut term,
         );
 
         // Round 0: 0 neighbors; Round 1: 1 neighbor (accepted).
@@ -702,13 +621,17 @@ mod tests {
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
 
-        let mut ctx = LocalSearchContext::new(
+        let ctrl = GlobalController::new(SearchLimits::default_fast());
+        let mut term = Termination::from_controller(ctrl);
+
+        let mut ctx = SearchContext::new(
             &model,
             &state,
             &eval,
             &mut rng,
             &mut work_buf,
             current_fitness,
+            &mut term,
         );
 
         // Operator yields two neighbors in the only round; MH rejects all and then stops.
@@ -729,13 +652,17 @@ mod tests {
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
 
-        let mut ctx = LocalSearchContext::new(
+        let ctrl = GlobalController::new(SearchLimits::default_fast());
+        let mut term = Termination::from_controller(ctrl);
+
+        let mut ctx = SearchContext::new(
             &model,
             &state,
             &eval,
             &mut rng,
             &mut work_buf,
             current_fitness,
+            &mut term,
         );
 
         // Three rounds, all with zero neighbors; MH allows exactly three rounds.
@@ -757,15 +684,19 @@ mod tests {
         let (model, state, eval) = make_state(&problem);
         let mut rng = StdRng::seed_from_u64(4);
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-
         let current_fitness = Fitness::new(123, 456);
-        let mut ctx = LocalSearchContext::new(
+
+        let ctrl = GlobalController::new(SearchLimits::default_fast());
+        let mut term = Termination::from_controller(ctrl);
+
+        let mut ctx = SearchContext::new(
             &model,
             &state,
             &eval,
             &mut rng,
             &mut work_buf,
             current_fitness,
+            &mut term,
         );
 
         // Accessors return the same references
@@ -782,33 +713,27 @@ mod tests {
 
         // Current fitness is what we passed in
         assert_eq!(ctx.current_fitness(), current_fitness);
+
+        // Termination fast-path should be false initially
+        assert!(!ctx.term.should_stop_fast());
     }
 
     #[test]
     fn test_trait_debug_and_display_for_local_search() {
-        let problem = problem_one_berth_two_flex();
-        let (model, state, eval) = make_state(&problem);
-        let mut rng = StdRng::seed_from_u64(5);
-        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let current_fitness = *state.fitness();
-
-        let mut _ctx = LocalSearchContext::new(
-            &model,
-            &state,
-            &eval,
-            &mut rng,
-            &mut work_buf,
-            current_fitness,
-        );
-
         let op = Box::new(CountingOperator::new(vec![1]));
         let filter_stack = default_filter_stack();
         let mh = AcceptFirstMH::new();
 
         let search = MetaheuristicLocalSearch::new(op, filter_stack, mh);
-        let ls: &dyn LocalSearch<i64, DefaultCostEvaluator, StdRng> = &search;
+        let ls: &dyn DecisionBuilder<i64, DefaultCostEvaluator, StdRng> = &search;
 
-        assert_eq!(format!("{:?}", ls), "LocalSearch(MetaheuristicLocalSearch)");
-        assert_eq!(format!("{}", ls), "LocalSearch(MetaheuristicLocalSearch)");
+        assert_eq!(
+            format!("{:?}", ls),
+            "DecisionBuilder(MetaheuristicLocalSearch)"
+        );
+        assert_eq!(
+            format!("{}", ls),
+            "DecisionBuilder(MetaheuristicLocalSearch)"
+        );
     }
 }
