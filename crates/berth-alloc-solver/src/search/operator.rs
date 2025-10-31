@@ -30,14 +30,14 @@ use crate::{
 };
 use berth_alloc_core::{no_op, prelude::Cost};
 use num_traits::{CheckedAdd, CheckedSub};
-use std::ops::Mul;
+use std::{ops::Mul, sync::Arc};
 
 pub type NeighborFnVec = dyn Fn(RequestIndex) -> Vec<RequestIndex> + Send + Sync;
-pub type NeighborFnSlice<'a> = dyn Fn(RequestIndex) -> &'a [RequestIndex] + Send + Sync;
+pub type NeighborFnSlice<'a> = dyn Fn(RequestIndex) -> &'a [RequestIndex] + Send + Sync + 'a;
 
 pub enum NeighborFn<'a> {
-    Vec(Box<NeighborFnVec>),
-    Slice(Box<NeighborFnSlice<'a>>),
+    Vec(Arc<NeighborFnVec>),
+    Slice(Arc<NeighborFnSlice<'a>>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -161,7 +161,7 @@ where
 ///   are isolated and emitted as a minimal `TerminalDelta`.
 /// - `has_fragments()` can be overridden to signal that an operator yields
 ///   dependent fragments (useful for composite or chained neighborhoods).
-pub trait LocalSearchOperator<T, C, R>
+pub trait LocalSearchOperator<T, C, R>: Send
 where
     T: Copy + Ord,
     C: CostEvaluator<T>,

@@ -56,7 +56,7 @@ where
     }
 }
 
-pub trait NeighborhoodFilter<T> {
+pub trait NeighborhoodFilter<T>: Send {
     fn name(&self) -> &str;
 
     fn accept<'s, 'm, 'p>(
@@ -80,10 +80,24 @@ impl<T> std::fmt::Debug for dyn NeighborhoodFilter<T> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NeighborhoodFilterStatistic {
     called: u64,
     accepted: u64,
     total_runtime_ns: u64,
+}
+
+impl std::fmt::Display for NeighborhoodFilterStatistic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "NeighborhoodFilterStatistic{{ called: {}, accepted: {}, rejected: {}, total_runtime_ns: {} }}",
+            self.called,
+            self.accepted,
+            self.rejected(),
+            self.total_runtime_ns
+        )
+    }
 }
 
 impl Default for NeighborhoodFilterStatistic {
@@ -236,6 +250,10 @@ impl<T> NeighborhoodFilterStack<T> {
     where
         T: Copy + Ord,
     {
+        if self.filters.is_empty() {
+            return true;
+        }
+
         let mut order: Vec<usize> = (0..self.filters.len()).collect();
         order.sort_by(|&a, &b| {
             let aa = self

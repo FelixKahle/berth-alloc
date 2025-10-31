@@ -220,6 +220,7 @@ where
         let n = dvars.len();
 
         while self.i < n {
+            // Initialize candidate list for r1 if needed
             if matches!(self.current, CurrentList::None) {
                 let r1 = RequestIndex::new(self.i);
                 self.current = CurrentList::from_optional_neighbors(r1, &self.neighbor_function, n);
@@ -227,6 +228,7 @@ where
 
             let r1 = RequestIndex::new(self.i);
 
+            // r1 must be assigned to consider a swap
             let (b1, s1) = match dvars.get(r1.get()).copied() {
                 Some(DecisionVar::Assigned(Decision {
                     berth_index,
@@ -253,7 +255,7 @@ where
                     _ => continue,
                 };
 
-                // if identical slots, skip
+                // identical slots -> skip
                 if b1 == b2 && s1 == s2 {
                     continue;
                 }
@@ -265,7 +267,7 @@ where
                     continue;
                 }
 
-                // processing times on target berths
+                // processing times on destination berths
                 let pt1_on_b2 = match model.processing_time(r1, b2) {
                     Some(pt) => pt,
                     None => continue,
@@ -275,57 +277,94 @@ where
                     None => continue,
                 };
 
-                // current occupied intervals
-                let iv1_curr = match model.interval(r1, b1, s1) {
-                    Some(iv) => iv,
-                    None => continue,
-                };
-                let iv2_curr = match model.interval(r2, b2, s2) {
-                    Some(iv) => iv,
-                    None => continue,
-                };
-
-                // window + length checks for swapped placements
+                // window checks for the *exact* swap starts (s2 for r1, s1 for r2)
                 let w1 = model.feasible_interval(r1);
                 let w2 = model.feasible_interval(r2);
-                let end1_on_b2 = s2 + pt1_on_b2;
-                let end2_on_b1 = s1 + pt2_on_b1;
-                if s2 < w1.start() || end1_on_b2 > w1.end() {
+                let end1_needed = s2 + pt1_on_b2;
+                let end2_needed = s1 + pt2_on_b1;
+                if s2 < w1.start() || end1_needed > w1.end() {
                     continue;
                 }
-                if s1 < w2.start() || end2_on_b1 > w2.end() {
-                    continue;
-                }
-                if end1_on_b2 > iv2_curr.end() {
-                    continue;
-                }
-                if end2_on_b1 > iv1_curr.end() {
+                if s1 < w2.start() || end2_needed > w2.end() {
                     continue;
                 }
 
-                // build plan (unassign both, then assign swapped)
+                // Additional pruning: the swapped job must fit within the other job's current slot length
+                // Compute current slot ends based on existing assignments (not after unassignment).
+                let pt1_on_b1 = match model.processing_time(r1, b1) {
+                    Some(pt) => pt,
+                    None => continue,
+                };
+                let pt2_on_b2 = match model.processing_time(r2, b2) {
+                    Some(pt) => pt,
+                    None => continue,
+                };
+                let iv1_curr_end = s1 + pt1_on_b1; // end of r1's current slot on b1
+                let iv2_curr_end = s2 + pt2_on_b2; // end of r2's current slot on b2
+
+                if end1_needed > iv2_curr_end {
+                    // r1 wouldn't fit in r2's current slot length at s2
+                    continue;
+                }
+                if end2_needed > iv1_curr_end {
+                    // r2 wouldn't fit in r1's current slot length at s1
+                    continue;
+                }
+
+                // Build plan atomically with rollback on failure.
                 let mut pb = ctx.builder();
+                let sp = pb.savepoint();
 
-                let fb1 = match pb.propose_unassignment(r1) {
-                    Ok(fb) => fb,
-                    Err(_) => continue,
-                };
-                let fb2 = match pb.propose_unassignment(r2) {
-                    Ok(fb) => fb,
-                    Err(_) => continue,
-                };
-
-                if pb.propose_assignment(r1, s2, &fb2).is_err() {
+                // Make the two holes first; the explorer will then "see" them.
+                if pb.propose_unassignment(r1).is_err() {
+                    pb.undo_to(sp);
                     continue;
                 }
-                if pb.propose_assignment(r2, s1, &fb1).is_err() {
+                if pb.propose_unassignment(r2).is_err() {
+                    pb.undo_to(sp);
                     continue;
                 }
 
+                // Use the explorer to find free-berth intervals that contain the exact swap placements.
+                let g1_opt = pb.with_explorer(|ex| {
+                    ex.iter_free_for(r1).find(|fb| {
+                        fb.berth_index() == b2
+                            && fb.interval().start() <= s2
+                            && fb.interval().end() >= end1_needed
+                    })
+                });
+
+                let g2_opt = pb.with_explorer(|ex| {
+                    ex.iter_free_for(r2).find(|fb| {
+                        fb.berth_index() == b1
+                            && fb.interval().start() <= s1
+                            && fb.interval().end() >= end2_needed
+                    })
+                });
+
+                let (g1, g2) = match (g1_opt, g2_opt) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => {
+                        pb.undo_to(sp);
+                        continue;
+                    }
+                };
+
+                // Commit the two assignments at the exact swapped starts.
+                if pb.propose_assignment(r1, s2, &g1).is_err() {
+                    pb.undo_to(sp);
+                    continue;
+                }
+                if pb.propose_assignment(r2, s1, &g2).is_err() {
+                    pb.undo_to(sp);
+                    continue;
+                }
+
+                // Yield a single neighbor
                 return Some(pb.finalize());
             }
 
-            // exhausted candidates for this i
+            // exhausted r2 candidates for this r1
             self.i += 1;
             self.current.reset();
         }
@@ -354,7 +393,7 @@ mod tests {
     use berth_alloc_model::{prelude::*, problem::builder::ProblemBuilder};
     use rand::{SeedableRng, rngs::StdRng};
     use rand_chacha::ChaCha8Rng;
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, sync::Arc};
 
     type T = i64;
 
@@ -538,7 +577,7 @@ mod tests {
         let state = build_state_with_assignments(&model, &evaluator, 10, 20);
 
         // Only consider neighbor r2 for r1; for r2, empty vec (no further neighbors)
-        let neigh = NeighborFn::Vec(Box::new(|i| {
+        let neigh = NeighborFn::Vec(Arc::new(|i| {
             if i.get() == 0 {
                 vec![RequestIndex::new(1)]
             } else {
@@ -662,7 +701,7 @@ mod tests {
         let slice1: &'static [RequestIndex] =
             Box::leak(Vec::<RequestIndex>::new().into_boxed_slice());
 
-        let neigh = crate::search::operator::NeighborFn::Slice(Box::new(move |i| {
+        let neigh = crate::search::operator::NeighborFn::Slice(Arc::new(move |i| {
             if i.get() == 0 { slice0 } else { slice1 }
         }));
 

@@ -19,9 +19,4 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub struct SolverConfig {
-    pub num_workers: usize,
-    pub duration_limit: Option<std::time::Duration>,
-    pub iteration_limit: Option<usize>,
-    pub no_improvment_iteration_limit: Option<usize>,
-}
+pub mod ruin;

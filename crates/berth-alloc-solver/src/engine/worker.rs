@@ -44,10 +44,8 @@ where
     model: &'m SolverModel<'p, T>,
     evaluator: &'e C,
     shared_incumbent: &'e SharedIncumbent<'p, T>,
-
     state: SolverState<'p, T>,
-    db: Box<dyn DecisionBuilder<T, C, R> + Send>,
-
+    decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send>,
     rng: R,
     ctrl: Arc<GlobalController>,
     observer: Obs,
@@ -55,8 +53,8 @@ where
 impl<'e, 'm, 'p, T, C, R, Obs> SearchWorker<'e, 'm, 'p, T, C, R, Obs>
 where
     T: SolveNumeric,
-    C: CostEvaluator<T> + Send + Sync + 'static,
-    R: rand::Rng + Send + 'static,
+    C: CostEvaluator<T> + Send + Sync,
+    R: rand::Rng + Send,
     Obs: SearchObserver,
 {
     #[allow(clippy::too_many_arguments)]
@@ -79,7 +77,7 @@ where
             evaluator,
             shared_incumbent,
             state: initial_state,
-            db,
+            decision_builder: db,
             rng,
             ctrl,
             observer,
@@ -115,7 +113,7 @@ where
                 &mut term,
             );
 
-            match self.db.next(&mut ctx) {
+            match self.decision_builder.next(&mut ctx) {
                 Some(plan) => {
                     let old_cost = self.state.fitness().cost;
                     self.state.apply_plan(plan);
@@ -153,9 +151,9 @@ where
 impl<'e, 'm, 'p, T, C, R, Obs> SearchPool<'e, 'm, 'p, T, C, R, Obs>
 where
     T: SolveNumeric,
-    C: CostEvaluator<T> + Send + Sync + 'static,
-    R: rand::Rng + Send + 'static,
-    Obs: SearchObserver + Send + 'static,
+    C: CostEvaluator<T> + Send + Sync,
+    R: rand::Rng + Send,
+    Obs: SearchObserver + Send,
 {
     #[inline]
     pub fn new(workers: Vec<SearchWorker<'e, 'm, 'p, T, C, R, Obs>>) -> Self {
