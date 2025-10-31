@@ -40,43 +40,6 @@ pub enum NeighborFn<'a> {
     Slice(Box<NeighborFnSlice<'a>>),
 }
 
-#[repr(transparent)]
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
-pub struct OperatorStateVersion(u64);
-
-impl OperatorStateVersion {
-    #[inline]
-    pub const fn new(v: u64) -> Self {
-        Self(v)
-    }
-
-    #[inline]
-    pub fn zero() -> Self {
-        Self(0)
-    }
-
-    #[inline]
-    pub const fn value(&self) -> u64 {
-        self.0
-    }
-
-    #[inline]
-    pub fn increment(&self) -> Self {
-        Self(self.0.wrapping_add(1))
-    }
-
-    #[inline]
-    pub fn reset() -> Self {
-        Self(0)
-    }
-}
-
-impl std::fmt::Display for OperatorStateVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "OperatorStateVersion({})", self.0)
-    }
-}
-
 #[derive(Debug, PartialEq)]
 pub struct OperatorContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>
 where
@@ -229,13 +192,6 @@ where
         no_op!()
     }
 
-    /// Returns the current operator state version.
-    ///
-    /// This will be incremented whenever the operator is advanced and reset
-    /// when the operator is reset. It can be used to track changes in the
-    /// operator's internal state.
-    fn state_version(&self) -> OperatorStateVersion;
-
     /// Indicates whether the operator yields related "fragments" of a move.
     ///
     /// Return `true` if successive calls to `make_next_neighbor()` are expected
@@ -380,14 +336,6 @@ mod tests {
     impl LocalSearchOperator<i64, DefaultCostEvaluator, ChaCha8Rng> for TestAssignOp {
         fn name(&self) -> &str {
             "TestAssignOp"
-        }
-
-        fn state_version(&self) -> OperatorStateVersion {
-            if self.yielded {
-                OperatorStateVersion::new(1)
-            } else {
-                OperatorStateVersion::new(0)
-            }
         }
 
         fn has_fragments(&self) -> bool {

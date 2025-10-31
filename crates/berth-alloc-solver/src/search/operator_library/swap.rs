@@ -23,7 +23,7 @@ use crate::{
     model::index::RequestIndex,
     search::{
         eval::CostEvaluator,
-        operator::{LocalSearchOperator, NeighborFn, OperatorContext, OperatorStateVersion},
+        operator::{LocalSearchOperator, NeighborFn, OperatorContext},
     },
     state::{
         decisionvar::{Decision, DecisionVar},
@@ -143,9 +143,27 @@ impl<'n> Iterator for CurrentList<'n> {
 
 pub struct SwapSlotOp<'n> {
     i: usize,
-    cur: CurrentList<'n>,
-    neigh: Option<NeighborFn<'n>>,
-    ver: OperatorStateVersion,
+    current: CurrentList<'n>,
+    neighbor_function: Option<NeighborFn<'n>>,
+}
+
+impl<'n> std::fmt::Debug for SwapSlotOp<'n> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SwapSlotOp")
+            .field("i", &self.i)
+            .field("current", &self.current)
+            .field(
+                "neighbor_function",
+                &self.neighbor_function.as_ref().map(|_| "Some(...)"),
+            )
+            .finish()
+    }
+}
+
+impl<'n> std::fmt::Display for SwapSlotOp<'n> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SwapSlotOp(i: {}, current: {})", self.i, self.current)
+    }
 }
 
 impl<'n> Default for SwapSlotOp<'n> {
@@ -159,9 +177,8 @@ impl<'n> SwapSlotOp<'n> {
     pub fn new() -> Self {
         Self {
             i: 0,
-            cur: CurrentList::None,
-            neigh: None,
-            ver: OperatorStateVersion::zero(),
+            current: CurrentList::None,
+            neighbor_function: None,
         }
     }
 
@@ -169,15 +186,9 @@ impl<'n> SwapSlotOp<'n> {
     pub fn with_neighbors(neigh: NeighborFn<'n>) -> Self {
         Self {
             i: 0,
-            cur: CurrentList::None,
-            neigh: Some(neigh),
-            ver: OperatorStateVersion::zero(),
+            current: CurrentList::None,
+            neighbor_function: Some(neigh),
         }
-    }
-
-    #[inline]
-    fn bump_version(&mut self) {
-        self.ver.increment();
     }
 }
 
@@ -193,12 +204,7 @@ where
 
     fn reset(&mut self) {
         self.i = 0;
-        self.cur.reset();
-        self.bump_version();
-    }
-
-    fn state_version(&self) -> OperatorStateVersion {
-        self.ver
+        self.current.reset();
     }
 
     fn has_fragments(&self) -> bool {
@@ -214,9 +220,9 @@ where
         let n = dvars.len();
 
         while self.i < n {
-            if matches!(self.cur, CurrentList::None) {
+            if matches!(self.current, CurrentList::None) {
                 let r1 = RequestIndex::new(self.i);
-                self.cur = CurrentList::from_optional_neighbors(r1, &self.neigh, n);
+                self.current = CurrentList::from_optional_neighbors(r1, &self.neighbor_function, n);
             }
 
             let r1 = RequestIndex::new(self.i);
@@ -228,12 +234,12 @@ where
                 })) => (berth_index, start_time),
                 _ => {
                     self.i += 1;
-                    self.cur.reset();
+                    self.current.reset();
                     continue;
                 }
             };
 
-            for r2 in self.cur.by_ref() {
+            for r2 in self.current.by_ref() {
                 if r2.get() >= n || r2 == r1 {
                     continue;
                 }
@@ -321,7 +327,7 @@ where
 
             // exhausted candidates for this i
             self.i += 1;
-            self.cur.reset();
+            self.current.reset();
         }
 
         None

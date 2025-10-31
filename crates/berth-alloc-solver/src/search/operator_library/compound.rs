@@ -19,18 +19,17 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+use crate::{
+    search::{
+        eval::CostEvaluator,
+        operator::{LocalSearchOperator, OperatorContext},
+    },
+    state::plan::Plan,
+};
 use berth_alloc_core::prelude::Cost;
 use num_traits::{CheckedAdd, CheckedSub};
 use rand::seq::SliceRandom;
 use std::ops::Mul;
-
-use crate::{
-    search::{
-        eval::CostEvaluator,
-        operator::{LocalSearchOperator, OperatorContext, OperatorStateVersion},
-    },
-    state::plan::Plan,
-};
 
 pub type OrderEvalFn = dyn Fn(usize, usize) -> i64 + Send + Sync;
 
@@ -49,7 +48,6 @@ pub struct CompoundOperator<'n, T, C, R> {
     order: Vec<usize>,
     started: Vec<bool>,
     idx: usize,
-    version: OperatorStateVersion,
     has_fragments: bool,
     evaluator: Box<OrderEvalFn>,
     last_yielded_child: Option<usize>,
@@ -74,7 +72,6 @@ where
             started: vec![false; n],
             order: (0..n).collect(),
             idx: 0,
-            version: OperatorStateVersion::zero(),
             has_fragments,
             evaluator,
             ops,
@@ -119,7 +116,6 @@ where
         self.order
             .sort_by(|&a, &b| keys[a].cmp(&keys[b]).then(a.cmp(&b)));
         self.idx = 0;
-        self.version = self.version.increment();
     }
 }
 
@@ -150,14 +146,8 @@ where
         for op in &mut self.ops {
             op.reset();
         }
-        self.version = self.version.increment();
         self.last_yielded_child = None;
     }
-
-    fn state_version(&self) -> OperatorStateVersion {
-        self.version
-    }
-
     fn has_fragments(&self) -> bool {
         self.has_fragments
     }
@@ -202,7 +192,6 @@ pub struct RandomCompoundOperator<'n, T, C, R> {
     name: String,
     ops: Vec<Box<dyn LocalSearchOperator<T, C, R> + 'n>>,
     has_fragments: bool,
-    version: OperatorStateVersion,
 }
 
 impl<'n, T, C, R> RandomCompoundOperator<'n, T, C, R>
@@ -220,7 +209,6 @@ where
             name: name.into(),
             ops,
             has_fragments,
-            version: OperatorStateVersion::zero(),
         }
     }
 }
@@ -248,11 +236,6 @@ where
         for op in &mut self.ops {
             op.reset();
         }
-        self.version = self.version.increment();
-    }
-
-    fn state_version(&self) -> OperatorStateVersion {
-        self.version
     }
 
     fn has_fragments(&self) -> bool {
@@ -288,7 +271,6 @@ pub struct MultiArmedBanditCompoundOperator<'n, T, C, R> {
     started: Vec<bool>,
     idx: usize,
     has_fragments: bool,
-    version: OperatorStateVersion,
 
     last_objective: Cost,
     avg_improvement: Vec<f64>,
@@ -323,7 +305,6 @@ where
             order: (0..n).collect(),
             idx: 0,
             has_fragments,
-            version: OperatorStateVersion::zero(),
             last_objective: i64::MAX,
             avg_improvement: vec![0.0; n],
             num_neighbors: 0,
@@ -365,7 +346,6 @@ where
                 .then(a.cmp(&b))
         });
         self.idx = 0;
-        self.version = self.version.increment();
     }
 }
 
@@ -421,11 +401,6 @@ where
         self.pulls_per_op.fill(0.0);
         self.num_neighbors = 0;
         self.last_objective = i64::MAX;
-        self.version = self.version.increment();
-    }
-
-    fn state_version(&self) -> OperatorStateVersion {
-        self.version
     }
 
     fn has_fragments(&self) -> bool {
@@ -478,7 +453,7 @@ mod tests {
         model::solver_model::SolverModel,
         search::{
             eval::{CostEvaluator, DefaultCostEvaluator},
-            operator::{LocalSearchOperator, OperatorContext, OperatorStateVersion},
+            operator::{LocalSearchOperator, OperatorContext},
         },
         state::{
             decisionvar::{DecisionVar, DecisionVarVec},
@@ -599,7 +574,6 @@ mod tests {
         has_frags: bool,
         yields_remaining: usize,
         log: DummyOpLog,
-        ver: OperatorStateVersion,
     }
 
     impl DummyOp {
@@ -610,7 +584,6 @@ mod tests {
                 has_frags,
                 yields_remaining: yields,
                 log,
-                ver: OperatorStateVersion::zero(),
             }
         }
     }
@@ -622,7 +595,6 @@ mod tests {
 
         fn reset(&mut self) {
             self.log.push(self.id, "reset");
-            self.ver = self.ver.increment();
         }
 
         fn synchronize<'b, 'r, 'c, 's, 'm, 'p>(
@@ -640,10 +612,6 @@ mod tests {
             >,
         ) {
             self.log.push(self.id, "sync");
-        }
-
-        fn state_version(&self) -> OperatorStateVersion {
-            self.ver
         }
 
         fn has_fragments(&self) -> bool {
@@ -751,13 +719,8 @@ mod tests {
             Box::new(DummyOp::new(1, 0, false, log.clone())),
         ];
         let mut comp = CompoundOperator::<_, _, ChaCha8Rng>::concatenate_restart("comp", ops);
-
-        let v0 = comp.state_version().value();
-
-        // Reset forwards to children and bumps version
+        // Reset forwards to children.
         comp.reset();
-        let v1 = comp.state_version().value();
-        assert_ne!(v0, v1, "version must change after reset");
 
         // Children received resets
         let events = log.snapshot();
@@ -849,16 +812,6 @@ mod tests {
 
         // Calling synchronize again with the same cost should be a no-op; ensure it doesn't crash
         mab.synchronize(&mut ctx2);
-        // We cannot directly inspect private stats, but we can ensure state_version is a valid value.
-        let _v = mab.state_version().value();
-    }
-
-    #[test]
-    fn test_state_version_display_and_increment_semantics() {
-        let v0 = OperatorStateVersion::zero();
-        assert_eq!(format!("{}", v0), "OperatorStateVersion(0)");
-        let v1 = v0.increment();
-        assert_eq!(v1.value(), v0.value().wrapping_add(1));
     }
 
     #[test]

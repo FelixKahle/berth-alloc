@@ -235,7 +235,7 @@ mod tests {
     use super::*;
     use crate::{
         model::solver_model::SolverModel,
-        search::{eval::DefaultCostEvaluator, operator::OperatorStateVersion},
+        search::eval::DefaultCostEvaluator,
         state::{
             decisionvar::{DecisionVar, DecisionVarVec},
             fitness::Fitness,
@@ -503,10 +503,6 @@ mod tests {
     impl LocalSearchOperator<i64, DefaultCostEvaluator, StdRng> for CountingOperator {
         fn name(&self) -> &str {
             "CountingOperator"
-        }
-
-        fn state_version(&self) -> OperatorStateVersion {
-            OperatorStateVersion::new(self.round as u64)
         }
 
         fn has_fragments(&self) -> bool {
