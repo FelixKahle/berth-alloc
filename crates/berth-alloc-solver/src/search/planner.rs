@@ -113,118 +113,6 @@ impl<T: Copy + Ord + std::fmt::Display> std::fmt::Display for UndoAction<T> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PlanExplorer<'pb, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> {
-    solver_model: &'m SolverModel<'p, T>,
-    decision_vars: &'pb [DecisionVar<T>],
-    cost_evaluator: &'c C,
-    sandbox: &'pb TerminalSandbox<'t, 'p, T>,
-}
-
-impl<'pb, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>>
-    PlanExplorer<'pb, 'c, 't, 'm, 'p, T, C>
-{
-    #[inline]
-    pub fn new(
-        solver_model: &'m SolverModel<'p, T>,
-        decision_vars: &'pb [DecisionVar<T>],
-        cost_evaluator: &'c C,
-        sandbox: &'pb TerminalSandbox<'t, 'p, T>,
-    ) -> Self {
-        Self {
-            solver_model,
-            decision_vars,
-            cost_evaluator,
-            sandbox,
-        }
-    }
-
-    #[inline]
-    pub fn model(&self) -> &'m SolverModel<'p, T> {
-        self.solver_model
-    }
-
-    #[inline]
-    pub fn decision_vars(&self) -> &'pb [DecisionVar<T>] {
-        self.decision_vars
-    }
-
-    #[inline]
-    pub fn sandbox(&self) -> &'pb TerminalSandbox<'t, 'p, T> {
-        self.sandbox
-    }
-
-    #[inline]
-    pub fn iter_free_for(
-        &self,
-        request_index: RequestIndex,
-    ) -> impl Iterator<Item = FreeBerth<T>> + 'pb
-    where
-        T: CheckedAdd + CheckedSub,
-        'm: 'pb, // 'm lives at least as long as 'pb; the model will outlive the builder
-    {
-        let window = self.solver_model.feasible_interval(request_index);
-        let allowed = self.solver_model.allowed_berth_indices(request_index);
-
-        self.sandbox
-            .inner()
-            .iter_free_intervals_for_berths_in_slice(allowed, window)
-    }
-
-    #[inline]
-    pub fn iter_unassigned(&self) -> impl Iterator<Item = RequestIndex>
-    where
-        T: CheckedAdd + CheckedSub,
-    {
-        self.decision_vars()
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, dv)| {
-                if !dv.is_assigned() {
-                    Some(RequestIndex::new(idx))
-                } else {
-                    None
-                }
-            })
-    }
-
-    #[inline]
-    pub fn iter_assigned_requests(&self) -> impl Iterator<Item = RequestIndex>
-    where
-        T: CheckedAdd + CheckedSub,
-    {
-        self.decision_vars()
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, dv)| {
-                if dv.is_assigned() {
-                    Some(RequestIndex::new(idx))
-                } else {
-                    None
-                }
-            })
-    }
-
-    #[inline]
-    pub fn iter_assignments(&self) -> impl Iterator<Item = &DecisionVar<T>> {
-        self.decision_vars().iter().filter(|dv| dv.is_assigned())
-    }
-
-    #[inline]
-    pub fn peek_cost(
-        &self,
-        request: RequestIndex,
-        start_time: TimePoint<T>,
-        berth_index: BerthIndex,
-    ) -> Option<Cost>
-    where
-        T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
-    {
-        self.cost_evaluator
-            .eval_request(self.model(), request, start_time, berth_index)
-    }
-}
-
 #[derive(Debug)]
 pub struct PlanBuilder<'b, 'c, 't, 'm, 'p, T: Copy + Ord, C: CostEvaluator<T>> {
     solver_model: &'m SolverModel<'p, T>,
@@ -367,9 +255,11 @@ where
         let prev_dv = self.decision_vars[request.get()];
 
         if let DecisionVar::Assigned(old) = prev_dv
-            && old.berth_index == free_berth.berth_index() && old.start_time == start_time {
-                return Ok(());
-            }
+            && old.berth_index == free_berth.berth_index()
+            && old.start_time == start_time
+        {
+            return Ok(());
+        }
 
         let new_cost = self
             .cost_evaluator
@@ -551,21 +441,6 @@ where
         Ok(FreeBerth::new(iv, dv.berth_index))
     }
 
-    #[inline]
-    pub fn with_explorer<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&PlanExplorer<'_, 'c, 't, 'm, 'p, T, C>) -> R,
-        T: CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
-    {
-        let explorer: PlanExplorer<'_, 'c, 't, 'm, 'p, T, C> = PlanExplorer::new(
-            self.solver_model,
-            self.decision_vars,
-            self.cost_evaluator,
-            &self.sandbox,
-        );
-        f(&explorer)
-    }
-
     #[inline(always)]
     pub fn discard(self) {
         // No-op for now, as we do not have external resources to clean up.
@@ -622,6 +497,177 @@ where
     #[inline]
     pub fn has_changes(&self) -> bool {
         !self.patches.is_empty()
+    }
+
+    #[inline]
+    pub fn iter_free_for_in(
+        &self,
+        request_index: RequestIndex,
+        window: TimeInterval<T>,
+    ) -> impl Iterator<Item = FreeBerth<T>> + '_
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        let allowed_window = self.solver_model.feasible_interval(request_index);
+        let allowed = self.solver_model.allowed_berth_indices(request_index);
+
+        allowed_window
+            .intersection(&window)
+            .into_iter()
+            .flat_map(move |combined_window| {
+                self.sandbox
+                    .inner()
+                    .iter_free_intervals_for_berths_in_slice(allowed, combined_window)
+            })
+    }
+
+    #[inline]
+    pub fn iter_free_for(
+        &self,
+        request_index: RequestIndex,
+    ) -> impl Iterator<Item = FreeBerth<T>> + '_
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        let window = self.solver_model.feasible_interval(request_index);
+        let allowed = self.solver_model.allowed_berth_indices(request_index);
+
+        self.sandbox
+            .inner()
+            .iter_free_intervals_for_berths_in_slice(allowed, window)
+    }
+
+    #[inline]
+    pub fn iter_free_for_in_berths<'a, I>(
+        &'a self,
+        berths: I,
+        window: TimeInterval<T>,
+    ) -> impl Iterator<Item = FreeBerth<T>> + 'a
+    where
+        I: IntoIterator<Item = BerthIndex> + 'a,
+    {
+        self.sandbox
+            .inner()
+            .iter_free_intervals_for_berths_in(berths, window)
+    }
+
+    #[inline]
+    pub fn iter_free_for_in_berths_slice<'a>(
+        &'a self,
+        berths: &'a [BerthIndex],
+        window: TimeInterval<T>,
+    ) -> impl Iterator<Item = FreeBerth<T>> + 'a {
+        self.sandbox
+            .inner()
+            .iter_free_intervals_for_berths_in_slice(berths, window)
+    }
+
+    #[inline]
+    pub fn iter_unassigned(&self) -> impl Iterator<Item = RequestIndex>
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        self.decision_vars
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, dv)| {
+                if !dv.is_assigned() {
+                    Some(RequestIndex::new(idx))
+                } else {
+                    None
+                }
+            })
+    }
+
+    #[inline]
+    pub fn iter_assigned_requests(&self) -> impl Iterator<Item = RequestIndex>
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        self.decision_vars
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, dv)| {
+                if dv.is_assigned() {
+                    Some(RequestIndex::new(idx))
+                } else {
+                    None
+                }
+            })
+    }
+
+    #[inline]
+    pub fn iter_free_for_on_berth_in(
+        &self,
+        request_index: RequestIndex,
+        berth: BerthIndex,
+        window: TimeInterval<T>,
+    ) -> impl Iterator<Item = FreeBerth<T>> + '_
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        let feasible = self.solver_model.feasible_interval(request_index);
+
+        feasible
+            .intersection(&window)
+            .into_iter()
+            .flat_map(move |w| {
+                self.sandbox
+                    .inner()
+                    .iter_free_intervals_for_berths_in([berth], w)
+            })
+    }
+
+    #[inline]
+    pub fn iter_free_for_on_berth(
+        &self,
+        request_index: RequestIndex,
+        berth: BerthIndex,
+    ) -> impl Iterator<Item = FreeBerth<T>> + '_
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        let window = self.solver_model.feasible_interval(request_index);
+
+        self.sandbox
+            .inner()
+            .iter_free_intervals_for_berths_in([berth], window)
+    }
+
+    #[inline]
+    pub fn iter_free_for_on_berths<'a, I>(
+        &'a self,
+        request_index: RequestIndex,
+        berths: I,
+    ) -> impl Iterator<Item = FreeBerth<T>> + 'a
+    where
+        T: CheckedAdd + CheckedSub,
+        I: IntoIterator<Item = BerthIndex> + 'a,
+    {
+        let window = self.solver_model.feasible_interval(request_index);
+        self.sandbox
+            .inner()
+            .iter_free_intervals_for_berths_in(berths, window)
+    }
+
+    #[inline]
+    pub fn iter_free_for_on_berths_slice<'a>(
+        &'a self,
+        request_index: RequestIndex,
+        berths: &'a [BerthIndex],
+    ) -> impl Iterator<Item = FreeBerth<T>> + 'a
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        let window = self.solver_model.feasible_interval(request_index);
+        self.sandbox
+            .inner()
+            .iter_free_intervals_for_berths_in_slice(berths, window)
+    }
+
+    #[inline]
+    pub fn iter_assignments(&self) -> impl Iterator<Item = &DecisionVar<T>> {
+        self.decision_vars.iter().filter(|dv| dv.is_assigned())
     }
 
     #[inline]
@@ -796,33 +842,23 @@ mod tests {
             work_buf.as_mut_slice(),
         );
 
-        pb.with_explorer(|ex| {
-            assert_eq!(ex.iter_unassigned().count(), model.flexible_requests_len());
-            assert_eq!(ex.iter_assigned_requests().count(), 0);
-
-            let r_ix = model.index_manager().request_index(rid(1)).unwrap();
-            assert!(ex.iter_free_for(r_ix).next().is_some());
-        });
+        assert_eq!(pb.iter_unassigned().count(), model.flexible_requests_len());
+        assert_eq!(pb.iter_assigned_requests().count(), 0);
 
         let r_ix = model.index_manager().request_index(rid(1)).unwrap();
-        let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
-        let free = pb
-            .sandbox()
-            .inner()
-            .iter_free_intervals_for_berths_in([b_ix], model.feasible_interval(r_ix))
-            .next()
-            .unwrap();
+        assert!(pb.iter_free_for(r_ix).next().is_some());
+
+        let r_ix = model.index_manager().request_index(rid(1)).unwrap();
+        let free = pb.iter_free_for(r_ix).next().unwrap();
         pb.propose_assignment(r_ix, tp(0), &free)
             .expect("assign ok");
 
-        pb.with_explorer(|ex| {
-            assert_eq!(
-                ex.iter_unassigned().count(),
-                model.flexible_requests_len() - 1
-            );
-            assert_eq!(ex.iter_assigned_requests().count(), 1);
-            assert_eq!(ex.iter_assignments().count(), 1);
-        });
+        assert_eq!(
+            pb.iter_unassigned().count(),
+            model.flexible_requests_len() - 1
+        );
+        assert_eq!(pb.iter_assigned_requests().count(), 1);
+        assert_eq!(pb.iter_assignments().count(), 1);
     }
 
     #[test]
@@ -952,10 +988,8 @@ mod tests {
         assert_eq!(pb.delta_unassigned(), 0);
 
         // With explorer: both requests unassigned
-        pb.with_explorer(|ex| {
-            assert_eq!(ex.iter_assigned_requests().count(), 0);
-            assert_eq!(ex.iter_unassigned().count(), model.flexible_requests_len());
-        });
+        assert_eq!(pb.iter_assigned_requests().count(), 0);
+        assert_eq!(pb.iter_unassigned().count(), model.flexible_requests_len());
     }
 
     #[test]
@@ -1005,9 +1039,7 @@ mod tests {
         assert!(pb.delta_cost() > 0);
         assert_eq!(pb.delta_unassigned(), -1);
 
-        pb.with_explorer(|ex| {
-            assert_eq!(ex.iter_assigned_requests().count(), 1);
-        });
+        assert_eq!(pb.iter_assigned_requests().count(), 1);
     }
 
     #[test]
@@ -1137,13 +1169,11 @@ mod tests {
         assert!(!occ2.is_free(r1_iv_0));
         assert!(occ2.is_free(r2_iv));
 
-        pb.with_explorer(|ex| {
-            assert_eq!(ex.iter_assigned_requests().count(), 1);
-            assert_eq!(
-                ex.iter_unassigned().count(),
-                model.flexible_requests_len() - 1
-            );
-        });
+        assert_eq!(pb.iter_assigned_requests().count(), 1);
+        assert_eq!(
+            pb.iter_unassigned().count(),
+            model.flexible_requests_len() - 1
+        );
     }
 
     #[test]
@@ -1164,9 +1194,7 @@ mod tests {
         pb.undo_to(sp0);
         assert_eq!(pb.delta_cost(), 0);
         assert_eq!(pb.delta_unassigned(), 0);
-        pb.with_explorer(|ex| {
-            assert_eq!(ex.iter_assigned_requests().count(), 0);
-        });
+        assert_eq!(pb.iter_assigned_requests().count(), 0);
 
         // Make a change then undo to sp0
         let r1 = model.index_manager().request_index(rid(1)).unwrap();
@@ -1184,10 +1212,8 @@ mod tests {
         pb.undo_to(sp0);
         assert_eq!(pb.delta_cost(), 0);
         assert_eq!(pb.delta_unassigned(), 0);
-        pb.with_explorer(|ex| {
-            assert_eq!(ex.iter_assigned_requests().count(), 0);
-            assert_eq!(ex.iter_unassigned().count(), model.flexible_requests_len());
-        });
+        assert_eq!(pb.iter_assigned_requests().count(), 0);
+        assert_eq!(pb.iter_unassigned().count(), model.flexible_requests_len());
 
         // Undo again to same sp0 -> still no-op
         pb.undo_to(sp0);
@@ -1271,9 +1297,7 @@ mod tests {
 
         // Undo to sp1 -> only r1 is assigned
         pb.undo_to(sp1);
-        pb.with_explorer(|ex| {
-            assert_eq!(ex.iter_assigned_requests().count(), 1);
-        });
+        assert_eq!(pb.iter_assigned_requests().count(), 1);
 
         // Finalize and check deltas > 0 and unassigned decreased by 1
         let delta_cost_now = pb.delta_cost();
@@ -1289,7 +1313,112 @@ mod tests {
     }
 
     #[test]
-    fn test_explorer_peek_cost_matches_model() {
+    fn test_peek_cost_matches_model() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        let r1 = model.index_manager().request_index(rid(1)).unwrap();
+        let b1 = model.index_manager().berth_index(bid(1)).unwrap();
+        let start = tp(0);
+
+        // Find a free berth interval on b1 that covers 'start'
+        let free_b1 = pb
+            .iter_free_for_in_berths([b1], model.feasible_interval(r1))
+            .find(|fb| fb.interval().start() <= start && start < fb.interval().end())
+            .expect("free interval on b1 that includes start");
+
+        let peek = pb
+            .peek_cost(r1, start, &free_b1)
+            .expect("peek must have cost");
+        let expected = model.cost_of_assignment(r1, b1, start).expect("model cost");
+        assert_eq!(peek, expected);
+    }
+
+    #[test]
+    fn test_iter_free_for_in_empty_when_disjoint() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        let r1 = model.index_manager().request_index(rid(1)).unwrap();
+        // Feasible window is [0, 200), choose a disjoint one
+        let disjoint = iv(300, 400);
+        let v: Vec<_> = pb.iter_free_for_in(r1, disjoint).collect();
+        assert!(v.is_empty(), "no free intervals when window is disjoint");
+    }
+
+    #[test]
+    fn test_iter_free_for_in_berths_and_slice_equivalent() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        let r1 = model.index_manager().request_index(rid(1)).unwrap();
+        let b1 = model.index_manager().berth_index(bid(1)).unwrap();
+        let window = model.feasible_interval(r1);
+
+        let via_iter: Vec<_> = pb.iter_free_for_in_berths([b1], window).collect();
+        let via_slice: Vec<_> = pb.iter_free_for_in_berths_slice(&[b1], window).collect();
+        assert_eq!(via_iter, via_slice);
+        assert!(!via_iter.is_empty());
+    }
+
+    #[test]
+    fn test_iter_assignments_reflects_current_state() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        // Initially: no assignments
+        assert_eq!(pb.iter_assignments().count(), 0);
+
+        // Assign one
+        let r1 = model.index_manager().request_index(rid(1)).unwrap();
+        let free1 = pb.iter_free_for(r1).next().unwrap();
+        pb.propose_assignment(r1, tp(0), &free1).unwrap();
+
+        // One assigned decision var must be present and consistent
+        let mut it = pb.iter_assignments();
+        let dv = it.next().expect("one assigned entry");
+        assert!(matches!(dv, DecisionVar::Assigned(_)));
+        assert!(it.next().is_none(), "only one assignment present");
+    }
+
+    #[test]
+    fn test_iter_free_for_on_berth_equivalent_to_slice() {
         let prob = problem_one_berth_two_flex();
         let model = SolverModel::try_from(&prob).expect("model ok");
         let term = mk_occ(prob.berths().iter());
@@ -1305,12 +1434,120 @@ mod tests {
         let r1 = model.index_manager().request_index(rid(1)).unwrap();
         let b1 = model.index_manager().berth_index(bid(1)).unwrap();
 
-        pb.with_explorer(|ex| {
-            let start = tp(0);
-            let peek = ex.peek_cost(r1, start, b1).expect("peek must have cost");
-            let expected = model.cost_of_assignment(r1, b1, start).expect("model cost");
-            assert_eq!(peek, expected);
-        });
+        let via_single: Vec<_> = pb.iter_free_for_on_berth(r1, b1).collect();
+        let via_slice: Vec<_> = pb.iter_free_for_on_berths_slice(r1, &[b1]).collect();
+
+        assert_eq!(via_single, via_slice);
+        assert!(!via_single.is_empty(), "should have free intervals on b1");
+        for fb in via_single {
+            assert_eq!(fb.berth_index(), b1);
+        }
+    }
+
+    #[test]
+    fn test_iter_free_for_on_berth_in_empty_when_disjoint() {
+        let prob = problem_one_berth_two_flex(); // r windows [0,200)
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        let r1 = model.index_manager().request_index(rid(1)).unwrap();
+        let b1 = model.index_manager().berth_index(bid(1)).unwrap();
+
+        // Disjoint window relative to feasible [0,200)
+        let disjoint = iv(300, 400);
+        let got: Vec<_> = pb.iter_free_for_on_berth_in(r1, b1, disjoint).collect();
+        assert!(got.is_empty(), "no free intervals when window is disjoint");
+    }
+
+    #[test]
+    fn test_iter_free_for_on_berth_in_clips_to_window() {
+        let prob = problem_one_berth_two_flex(); // b1 availability [0,1000), feasible [0,200)
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        let r1 = model.index_manager().request_index(rid(1)).unwrap();
+        let b1 = model.index_manager().berth_index(bid(1)).unwrap();
+
+        // A narrow window strictly inside feasible
+        let narrow = iv(50, 60);
+        let v: Vec<_> = pb.iter_free_for_on_berth_in(r1, b1, narrow).collect();
+        assert!(
+            !v.is_empty(),
+            "should find free intervals inside narrow window"
+        );
+        for fb in v {
+            assert_eq!(fb.berth_index(), b1);
+            assert!(narrow.contains_interval(&fb.interval()));
+        }
+    }
+
+    #[test]
+    fn test_iter_free_for_on_berths_equivalent_to_in_berths_with_feasible() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        let r1 = model.index_manager().request_index(rid(1)).unwrap();
+        let b1 = model.index_manager().berth_index(bid(1)).unwrap();
+        let feasible = model.feasible_interval(r1);
+
+        let via_on_berths: Vec<_> = pb.iter_free_for_on_berths(r1, [b1]).collect();
+        let via_in_berths: Vec<_> = pb.iter_free_for_in_berths([b1], feasible).collect();
+
+        assert_eq!(via_on_berths, via_in_berths);
+        assert!(!via_on_berths.is_empty());
+        for fb in via_on_berths {
+            assert_eq!(fb.berth_index(), b1);
+            assert!(feasible.contains_interval(&fb.interval()));
+        }
+    }
+
+    #[test]
+    fn test_iter_free_for_on_berths_slice_equivalent_to_iter_version() {
+        let prob = problem_one_berth_two_flex();
+        let model = SolverModel::try_from(&prob).expect("model ok");
+        let term = mk_occ(prob.berths().iter());
+
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let pb = PlanBuilder::new(
+            &model,
+            &term,
+            &DefaultCostEvaluator,
+            work_buf.as_mut_slice(),
+        );
+
+        let r1 = model.index_manager().request_index(rid(1)).unwrap();
+        let b1 = model.index_manager().berth_index(bid(1)).unwrap();
+
+        let via_iter: Vec<_> = pb.iter_free_for_on_berths(r1, [b1]).collect();
+        let via_slice: Vec<_> = pb.iter_free_for_on_berths_slice(r1, &[b1]).collect();
+
+        assert_eq!(via_iter, via_slice);
+        assert!(!via_iter.is_empty());
     }
 
     #[test]

@@ -123,15 +123,14 @@ impl ProblemLoader {
             let window = TimeInterval::new(a, dmax);
 
             let mut pt = BTreeMap::new();
-            for j in 0..m {
-                let hij = h[i][j];
+
+            for (j, &hij) in h[i].iter().enumerate().take(m) {
                 if hij >= self.forbid_at_least {
                     continue;
                 }
                 pt.insert(BerthIdentifier::new((j as u32) + 1), TimeDelta::new(hij));
             }
 
-            // No weights given in the input format, so we use a uniform weight of 1.
             match Request::<FlexibleKind, i64>::new_flexible(rid, window, 1, pt) {
                 Ok(req) => {
                     builder.add_flexible(req);

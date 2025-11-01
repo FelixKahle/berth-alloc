@@ -93,6 +93,15 @@ where
                 _ => continue,
             };
 
+            // Capture immutable model-derived data BEFORE creating the mutable builder
+            let model = ctx.model();
+            let w = model.feasible_interval(r);
+            let pt = match model.processing_time(r, b) {
+                Some(pt) => pt,
+                None => continue,
+            };
+
+            // Create builder and open up r's current slot
             let mut pb = ctx.builder();
             let sp = pb.savepoint();
 
@@ -101,27 +110,21 @@ where
                 continue;
             }
 
-            let best = pb.with_explorer(|ex| {
-                let w = ex.model().feasible_interval(r);
-                let pt = match ex.model().processing_time(r, b) {
-                    Some(pt) => pt,
-                    None => return None,
-                };
-
-                ex.iter_free_for(r)
-                    .filter(|fb| fb.berth_index() == b)
-                    .filter_map(|fb| {
-                        let iv = fb.interval();
-                        let candidate_start = iv.start().max(w.start());
-                        let candidate_end = candidate_start.checked_add(pt)?;
-                        if candidate_start < s && candidate_end <= iv.end() {
-                            Some((candidate_start, iv))
-                        } else {
-                            None
-                        }
-                    })
-                    .min_by_key(|(start, _iv)| *start)
-            });
+            // Use the new single-berth + window iterator to find the earliest feasible start < s
+            let best = pb
+                .iter_free_for_on_berth_in(r, b, w)
+                .filter_map(|fb| {
+                    let iv = fb.interval();
+                    // intervals are already clamped to feasible window 'w'
+                    let candidate_start = iv.start();
+                    let candidate_end = candidate_start.checked_add(pt)?;
+                    if candidate_start < s && candidate_end <= iv.end() {
+                        Some((candidate_start, iv))
+                    } else {
+                        None
+                    }
+                })
+                .min_by_key(|(start, _)| *start);
 
             if let Some((new_start, new_iv)) = best {
                 if new_start == s {

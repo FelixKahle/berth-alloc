@@ -371,27 +371,18 @@ mod tests {
             let mut pb: PlanBuilder<'_, 'c, 's, 'm, 'p, i64, DefaultCostEvaluator> = ctx.builder();
 
             // Use the explorer only; do not access ctx while pb is alive
-            let some = pb.with_explorer(|ex| {
-                let r_ix = ex.iter_unassigned().next()?;
-
-                let allowed = ex.model().allowed_berth_indices(r_ix).to_vec();
-                let window = ex.model().feasible_interval(r_ix);
-
-                let free = ex
-                    .sandbox()
-                    .inner()
-                    .iter_free_intervals_for_berths_in_slice(&allowed, window)
-                    .next()?;
-
-                let start = free.interval().start();
-                Some((r_ix, free, start))
-            });
-
-            let (r_ix, free, start) = match some {
-                Some(v) => v,
+            let r_ix = match pb.iter_unassigned().next() {
+                Some(ix) => ix,
                 None => return None,
             };
 
+            // Find the first free slot respecting feasible window and allowed berths
+            let free = match pb.iter_free_for(r_ix).next() {
+                Some(fb) => fb,
+                None => return None,
+            };
+
+            let start = free.interval().start();
             pb.propose_assignment(r_ix, start, &free)
                 .expect("assign ok");
 

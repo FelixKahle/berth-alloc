@@ -325,22 +325,22 @@ where
                     continue;
                 }
 
-                // Use the explorer to find free-berth intervals that contain the exact swap placements.
-                let g1_opt = pb.with_explorer(|ex| {
-                    ex.iter_free_for(r1).find(|fb| {
-                        fb.berth_index() == b2
-                            && fb.interval().start() <= s2
-                            && fb.interval().end() >= end1_needed
-                    })
-                });
+                // Find free-berth intervals that exactly cover the swap placements using the new API
+                let g1_opt = pb
+                    .iter_free_for_on_berth_in(
+                        r1,
+                        b2,
+                        berth_alloc_core::prelude::TimeInterval::new(s2, end1_needed),
+                    )
+                    .next();
 
-                let g2_opt = pb.with_explorer(|ex| {
-                    ex.iter_free_for(r2).find(|fb| {
-                        fb.berth_index() == b1
-                            && fb.interval().start() <= s1
-                            && fb.interval().end() >= end2_needed
-                    })
-                });
+                let g2_opt = pb
+                    .iter_free_for_on_berth_in(
+                        r2,
+                        b1,
+                        berth_alloc_core::prelude::TimeInterval::new(s1, end2_needed),
+                    )
+                    .next();
 
                 let (g1, g2) = match (g1_opt, g2_opt) {
                     (Some(a), Some(b)) => (a, b),
