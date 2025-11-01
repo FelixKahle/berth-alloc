@@ -20,5 +20,6 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 pub mod compound;
+pub mod relocate;
 pub mod slide;
 pub mod swap;
