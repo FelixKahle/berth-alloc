@@ -27,6 +27,7 @@ use crate::{
     },
     state::{
         decisionvar::{Decision, DecisionVar},
+        plan::Plan,
         solver_state::SolverStateView,
     },
 };
@@ -79,7 +80,7 @@ where
     fn make_next_neighbor<'b, 'r, 'c, 's, 'm, 'p>(
         &mut self,
         ctx: &mut OperatorContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
-    ) -> Option<crate::state::plan::Plan<'p, T>> {
+    ) -> Option<Plan<'p, T>> {
         let dvars = ctx.state().decision_variables();
         let n = dvars.len();
 

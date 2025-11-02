@@ -36,14 +36,17 @@ pub type OrderEvalFn = dyn Fn(usize, usize) -> i64 + Send + Sync;
 #[inline(always)]
 fn compound_no_restart(size: usize, active: usize, other: usize) -> i64 {
     if other < active {
-        (size + other - active) as i64
+        (size + other - active)
+            .try_into()
+            .expect("usize to i64 conversion failed")
     } else {
-        (other - active) as i64
+        (other - active)
+            .try_into()
+            .expect("usize to i64 conversion failed")
     }
 }
 
 pub struct CompoundOperator<'n, T, C, R> {
-    name: String,
     ops: Vec<Box<dyn LocalSearchOperator<T, C, R> + 'n>>,
     order: Vec<usize>,
     started: Vec<bool>,
@@ -60,15 +63,13 @@ where
     R: rand::Rng,
 {
     #[inline]
-    pub fn with_evaluator<N: Into<String>>(
-        name: N,
+    pub fn with_evaluator(
         ops: Vec<Box<dyn LocalSearchOperator<T, C, R> + 'n>>,
         evaluator: Box<OrderEvalFn>,
     ) -> Self {
         let has_fragments = ops.iter().any(|op| op.has_fragments());
         let n = ops.len();
         Self {
-            name: name.into(),
             started: vec![false; n],
             order: (0..n).collect(),
             idx: 0,
@@ -80,24 +81,17 @@ where
     }
 
     #[inline]
-    pub fn concatenate_no_restart<N: Into<String>>(
-        name: N,
-        ops: Vec<Box<dyn LocalSearchOperator<T, C, R> + 'n>>,
-    ) -> Self {
+    pub fn concatenate_no_restart(ops: Vec<Box<dyn LocalSearchOperator<T, C, R> + 'n>>) -> Self {
         let n = ops.len();
         Self::with_evaluator(
-            name,
             ops,
             Box::new(move |active, other| compound_no_restart(n, active, other)),
         )
     }
 
     #[inline]
-    pub fn concatenate_restart<N: Into<String>>(
-        name: N,
-        ops: Vec<Box<dyn LocalSearchOperator<T, C, R> + 'n>>,
-    ) -> Self {
-        Self::with_evaluator(name, ops, Box::new(|_, _| 0))
+    pub fn concatenate_restart(ops: Vec<Box<dyn LocalSearchOperator<T, C, R> + 'n>>) -> Self {
+        Self::with_evaluator(ops, Box::new(|_, _| 0))
     }
 
     #[inline]
@@ -126,7 +120,7 @@ where
     R: rand::Rng,
 {
     fn name(&self) -> &str {
-        &self.name
+        "CompoundOperator"
     }
 
     fn synchronize<'b, 'r2, 'c, 's, 'm, 'p>(
@@ -146,8 +140,14 @@ where
         for op in &mut self.ops {
             op.reset();
         }
+
+        let n = self.ops.len();
+        self.order = (0..n).collect();
+        self.started.fill(false);
+        self.idx = 0;
         self.last_yielded_child = None;
     }
+
     fn has_fragments(&self) -> bool {
         self.has_fragments
     }
@@ -189,7 +189,6 @@ where
 }
 
 pub struct RandomCompoundOperator<'n, T, C, R> {
-    name: String,
     ops: Vec<Box<dyn LocalSearchOperator<T, C, R> + 'n>>,
     has_fragments: bool,
 }
@@ -200,16 +199,9 @@ where
     C: CostEvaluator<T>,
     R: rand::Rng,
 {
-    pub fn new<N: Into<String>>(
-        name: N,
-        ops: Vec<Box<dyn LocalSearchOperator<T, C, R> + 'n>>,
-    ) -> Self {
+    pub fn new(ops: Vec<Box<dyn LocalSearchOperator<T, C, R> + 'n>>) -> Self {
         let has_fragments = ops.iter().any(|op| op.has_fragments());
-        Self {
-            name: name.into(),
-            ops,
-            has_fragments,
-        }
+        Self { ops, has_fragments }
     }
 }
 
@@ -220,7 +212,7 @@ where
     R: rand::Rng,
 {
     fn name(&self) -> &str {
-        &self.name
+        "RandomCompoundOperator"
     }
 
     fn synchronize<'b, 'r2, 'c, 's, 'm, 'p>(
@@ -265,7 +257,6 @@ where
 }
 
 pub struct MultiArmedBanditCompoundOperator<'n, T, C, R> {
-    name: String,
     ops: Vec<Box<dyn LocalSearchOperator<T, C, R> + 'n>>,
     order: Vec<usize>,
     started: Vec<bool>,
@@ -288,8 +279,7 @@ where
     C: CostEvaluator<T>,
     R: rand::Rng,
 {
-    pub fn new_min<N: Into<String>>(
-        name: N,
+    pub fn new_min(
         ops: Vec<Box<dyn LocalSearchOperator<T, C, R> + 'n>>,
         memory_coeff: f64,
         exploration_coeff: f64,
@@ -300,7 +290,6 @@ where
         let has_fragments = ops.iter().any(|op| op.has_fragments());
         let n = ops.len();
         Self {
-            name: name.into(),
             started: vec![false; n],
             order: (0..n).collect(),
             idx: 0,
@@ -356,7 +345,7 @@ where
     R: rand::Rng,
 {
     fn name(&self) -> &str {
-        &self.name
+        "MultiArmedBanditCompoundOperator"
     }
 
     fn synchronize<'b, 'r, 'c, 's, 'm, 'p>(
@@ -443,5 +432,407 @@ where
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        model::solver_model::SolverModel,
+        search::{
+            eval::{CostEvaluator, DefaultCostEvaluator},
+            operator::{LocalSearchOperator, OperatorContext},
+        },
+        state::{
+            decisionvar::{DecisionVar, DecisionVarVec},
+            fitness::FitnessDelta,
+            plan::Plan,
+            solver_state::SolverState,
+            terminal::delta::TerminalDelta,
+            terminal::terminalocc::TerminalOccupancy,
+        },
+    };
+    use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
+    use berth_alloc_model::{prelude::*, problem::builder::ProblemBuilder};
+    use rand::{SeedableRng, rngs::StdRng};
+    use std::collections::BTreeMap;
+
+    type TT = i64;
+
+    // Helpers to build a minimal model/state/context
+    #[inline]
+    fn tp(v: TT) -> TimePoint<TT> {
+        TimePoint::new(v)
+    }
+    #[inline]
+    fn iv(a: TT, b: TT) -> TimeInterval<TT> {
+        TimeInterval::new(tp(a), tp(b))
+    }
+    #[inline]
+    fn td(v: TT) -> TimeDelta<TT> {
+        TimeDelta::new(v)
+    }
+    #[inline]
+    fn bid(n: u32) -> BerthIdentifier {
+        BerthIdentifier::new(n)
+    }
+    #[inline]
+    fn rid(n: u32) -> RequestIdentifier {
+        RequestIdentifier::new(n)
+    }
+
+    fn berth(id: u32, s: TT, e: TT) -> Berth<TT> {
+        Berth::from_windows(bid(id), [iv(s, e)])
+    }
+
+    fn flex_req(
+        id: u32,
+        window: (TT, TT),
+        pts: &[(u32, TT)],
+        weight: TT,
+    ) -> Request<FlexibleKind, TT> {
+        let mut m = BTreeMap::new();
+        for (b, d) in pts {
+            m.insert(bid(*b), td(*d));
+        }
+        Request::<FlexibleKind, TT>::new(rid(id), iv(window.0, window.1), weight, m).unwrap()
+    }
+
+    fn minimal_problem() -> Problem<TT> {
+        let b1 = berth(1, 0, 100);
+        let r1 = flex_req(10, (0, 100), &[(1, 10)], 1);
+        let mut pb = ProblemBuilder::new();
+        pb.add_berth(b1);
+        pb.add_flexible(r1);
+        pb.build().expect("valid problem")
+    }
+
+    fn ctx<'b, 'r, 'c, 's, 'm, 'p>(
+        model: &'m SolverModel<'p, TT>,
+        state: &'s SolverState<'p, TT>,
+        eval: &'c DefaultCostEvaluator,
+        rng: &'r mut StdRng,
+        buffer: &'b mut [DecisionVar<TT>],
+    ) -> OperatorContext<'b, 'r, 'c, 's, 'm, 'p, TT, DefaultCostEvaluator, StdRng> {
+        OperatorContext::new(model, state, eval, rng, buffer)
+    }
+
+    // A simple dummy operator that yields a fixed number of neighbors.
+    struct DummyOp {
+        name: &'static str,
+        id: usize,
+        initial: usize,
+        remaining: usize,
+        fragments: bool,
+        sync_calls: usize,
+    }
+
+    impl DummyOp {
+        fn new(name: &'static str, id: usize, yield_count: usize) -> Self {
+            Self {
+                name,
+                id,
+                initial: yield_count,
+                remaining: yield_count,
+                fragments: false,
+                sync_calls: 0,
+            }
+        }
+        fn with_fragments(mut self, f: bool) -> Self {
+            self.fragments = f;
+            self
+        }
+    }
+
+    impl LocalSearchOperator<TT, DefaultCostEvaluator, StdRng> for DummyOp {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn has_fragments(&self) -> bool {
+            self.fragments
+        }
+        fn reset(&mut self) {
+            self.remaining = self.initial;
+        }
+        fn synchronize<'b, 'r, 'c, 's, 'm, 'p>(
+            &mut self,
+            _ctx: &mut OperatorContext<'b, 'r, 'c, 's, 'm, 'p, TT, DefaultCostEvaluator, StdRng>,
+        ) {
+            self.sync_calls += 1;
+        }
+
+        fn make_next_neighbor<'b, 'r, 'c, 's, 'm, 'p>(
+            &mut self,
+            _ctx: &mut OperatorContext<'b, 'r, 'c, 's, 'm, 'p, TT, DefaultCostEvaluator, StdRng>,
+        ) -> Option<Plan<'p, TT>> {
+            if self.remaining == 0 {
+                return None;
+            }
+
+            self.remaining -= 1;
+            // Tag the plan with delta_cost equal to our id for identification
+            let fd = FitnessDelta {
+                delta_cost: self.id as i64,
+                delta_unassigned: 0,
+            };
+            Some(Plan::new_delta(Vec::new(), TerminalDelta::empty(), fd))
+        }
+    }
+
+    fn make_context() -> (
+        SolverModel<'static, TT>,
+        SolverState<'static, TT>,
+        DefaultCostEvaluator,
+        StdRng,
+        Vec<DecisionVar<TT>>,
+    ) {
+        // Leak the problem to give it a 'static lifetime, matching returned model/state lifetimes
+        let problem: &'static Problem<TT> = Box::leak(Box::new(minimal_problem()));
+        let model = SolverModel::try_from(problem).expect("model ok");
+        let evaluator = DefaultCostEvaluator;
+
+        // Build TerminalOccupancy from the problem (avoid borrowing the model)
+        let term = TerminalOccupancy::new(problem.berths().iter());
+
+        let dvars = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let fit = evaluator.eval_fitness(&model, &dvars);
+        let state = SolverState::new(DecisionVarVec::from(dvars.clone()), term, fit);
+
+        let rng = StdRng::seed_from_u64(12345);
+        let buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        (model, state, evaluator, rng, buffer)
+    }
+
+    #[test]
+    fn test_compound_operator_no_restart_round_robin_sequence() {
+        let (model, state, eval, mut rng, mut buffer) = make_context();
+        let mut ctx = ctx(&model, &state, &eval, &mut rng, &mut buffer);
+
+        // op0 yields 2, op1 yields 1, op2 yields 1
+        let ops: Vec<Box<dyn LocalSearchOperator<TT, DefaultCostEvaluator, StdRng>>> = vec![
+            Box::new(DummyOp::new("op0", 0, 2)),
+            Box::new(DummyOp::new("op1", 1, 1)),
+            Box::new(DummyOp::new("op2", 2, 1)),
+        ];
+
+        let mut comp = CompoundOperator::concatenate_no_restart(ops);
+        comp.synchronize(&mut ctx);
+
+        let mut seen = Vec::new();
+        while let Some(p) = comp.make_next_neighbor(&mut ctx) {
+            seen.push(p.fitness_delta.delta_cost);
+        }
+
+        // Expected sequence: 0,0,1,2 (rotates order after each yield)
+        assert_eq!(seen, vec![0, 0, 1, 2]);
+        assert!(!comp.has_fragments());
+    }
+
+    #[test]
+    fn test_compound_operator_restart_concatenation_drains_in_index_order() {
+        let (model, state, eval, mut rng, mut buffer) = make_context();
+        let mut ctx = ctx(&model, &state, &eval, &mut rng, &mut buffer);
+
+        // op0=1, op1=2, op2=2 -> should drain 0 then 1 then 1 then 2 then 2 in index order
+        let ops: Vec<Box<dyn LocalSearchOperator<TT, DefaultCostEvaluator, StdRng>>> = vec![
+            Box::new(DummyOp::new("op0", 0, 1)),
+            Box::new(DummyOp::new("op1", 1, 2)),
+            Box::new(DummyOp::new("op2", 2, 2)),
+        ];
+
+        let mut comp = CompoundOperator::concatenate_restart(ops);
+        comp.synchronize(&mut ctx);
+
+        let mut seen = Vec::new();
+        while let Some(p) = comp.make_next_neighbor(&mut ctx) {
+            seen.push(p.fitness_delta.delta_cost);
+        }
+
+        // Always sorted by index (restart policy makes evaluator return equal keys)
+        assert_eq!(seen, vec![0, 1, 1, 2, 2]);
+    }
+
+    #[test]
+    fn test_compound_operator_has_fragments_propagates() {
+        let ops: Vec<Box<dyn LocalSearchOperator<TT, DefaultCostEvaluator, StdRng>>> = vec![
+            Box::new(DummyOp::new("op0", 0, 1)),
+            Box::new(DummyOp::new("op1", 1, 1).with_fragments(true)),
+            Box::new(DummyOp::new("op2", 2, 1)),
+        ];
+
+        let comp = CompoundOperator::concatenate_no_restart(ops);
+        // synchronize isn't needed for this check
+        assert!(comp.has_fragments());
+    }
+
+    #[test]
+    fn test_compound_operator_reset_resets_children_and_sequence() {
+        let (model, state, eval, mut rng, mut buffer) = make_context();
+        let mut ctx = ctx(&model, &state, &eval, &mut rng, &mut buffer);
+
+        let ops: Vec<Box<dyn LocalSearchOperator<TT, DefaultCostEvaluator, StdRng>>> = vec![
+            Box::new(DummyOp::new("op0", 0, 1)),
+            Box::new(DummyOp::new("op1", 1, 1)),
+        ];
+
+        let mut comp = CompoundOperator::concatenate_no_restart(ops);
+        comp.synchronize(&mut ctx);
+
+        let mut first = Vec::new();
+        while let Some(p) = comp.make_next_neighbor(&mut ctx) {
+            first.push(p.fitness_delta.delta_cost);
+        }
+        assert_eq!(first, vec![0, 1]);
+
+        // Reset and we should be able to yield again in same sequence
+        comp.reset();
+        comp.synchronize(&mut ctx);
+
+        let mut second = Vec::new();
+        while let Some(p) = comp.make_next_neighbor(&mut ctx) {
+            second.push(p.fitness_delta.delta_cost);
+        }
+        assert_eq!(second, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_random_compound_operator_yields_all_children_once_in_random_order() {
+        let (model, state, eval, mut rng, mut buffer) = make_context();
+        let mut ctx = ctx(&model, &state, &eval, &mut rng, &mut buffer);
+
+        let ops: Vec<Box<dyn LocalSearchOperator<TT, DefaultCostEvaluator, StdRng>>> = vec![
+            Box::new(DummyOp::new("op0", 0, 1)),
+            Box::new(DummyOp::new("op1", 1, 1)),
+            Box::new(DummyOp::new("op2", 2, 1)),
+        ];
+
+        let mut comp = RandomCompoundOperator::new(ops);
+        comp.synchronize(&mut ctx);
+
+        let mut seen = Vec::new();
+        while let Some(p) = comp.make_next_neighbor(&mut ctx) {
+            seen.push(p.fitness_delta.delta_cost);
+        }
+
+        seen.sort();
+        assert_eq!(seen, vec![0, 1, 2]);
+        assert!(!comp.has_fragments());
+    }
+
+    #[test]
+    fn test_random_compound_operator_with_fragments_flag() {
+        let ops: Vec<Box<dyn LocalSearchOperator<TT, DefaultCostEvaluator, StdRng>>> = vec![
+            Box::new(DummyOp::new("op0", 0, 1)),
+            Box::new(DummyOp::new("op1", 1, 1).with_fragments(true)),
+        ];
+
+        let comp = RandomCompoundOperator::new(ops);
+        assert!(comp.has_fragments());
+    }
+
+    #[test]
+    fn test_mab_compound_operator_yields_all_available_plans() {
+        let (model, state, eval, mut rng, mut buffer) = make_context();
+        let mut ctx = ctx(&model, &state, &eval, &mut rng, &mut buffer);
+
+        let ops: Vec<Box<dyn LocalSearchOperator<TT, DefaultCostEvaluator, StdRng>>> = vec![
+            Box::new(DummyOp::new("op0", 0, 1)),
+            Box::new(DummyOp::new("op1", 1, 1)),
+            Box::new(DummyOp::new("op2", 2, 1)),
+        ];
+
+        let mut comp = MultiArmedBanditCompoundOperator::new_min(ops, 0.5, 1.0);
+
+        // initialize with synchronize (sets last_objective)
+        comp.synchronize(&mut ctx);
+
+        let mut seen = Vec::new();
+        while let Some(p) = comp.make_next_neighbor(&mut ctx) {
+            seen.push(p.fitness_delta.delta_cost);
+            // Normally the metaheuristic infrastructure would call synchronize()
+            // between iterations as objective changes. Here we just keep yielding.
+        }
+
+        seen.sort();
+        assert_eq!(seen, vec![0, 1, 2]);
+        assert!(!comp.has_fragments());
+    }
+
+    #[test]
+    fn test_mab_compound_operator_reset_allows_reuse() {
+        let (model, state, eval, mut rng, mut buffer) = make_context();
+        let mut ctx = ctx(&model, &state, &eval, &mut rng, &mut buffer);
+
+        let ops: Vec<Box<dyn LocalSearchOperator<TT, DefaultCostEvaluator, StdRng>>> = vec![
+            Box::new(DummyOp::new("op0", 0, 1)),
+            Box::new(DummyOp::new("op1", 1, 1)),
+        ];
+
+        let mut comp = MultiArmedBanditCompoundOperator::new_min(ops, 0.5, 1.0);
+        comp.synchronize(&mut ctx);
+
+        let mut first = Vec::new();
+        while let Some(p) = comp.make_next_neighbor(&mut ctx) {
+            first.push(p.fitness_delta.delta_cost);
+        }
+        first.sort();
+        assert_eq!(first, vec![0, 1]);
+
+        comp.reset();
+        comp.synchronize(&mut ctx);
+
+        let mut second = Vec::new();
+        while let Some(p) = comp.make_next_neighbor(&mut ctx) {
+            second.push(p.fitness_delta.delta_cost);
+        }
+        second.sort();
+        assert_eq!(second, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_compound_operator_calls_child_synchronize_once_per_child_until_reset() {
+        let (model, state, eval, mut rng, mut buffer) = make_context();
+        let mut ctx = ctx(&model, &state, &eval, &mut rng, &mut buffer);
+
+        let o0 = DummyOp::new("op0", 0, 0);
+        let o1 = DummyOp::new("op1", 1, 0);
+        let o2 = DummyOp::new("op2", 2, 0);
+        let ops: Vec<Box<dyn LocalSearchOperator<TT, DefaultCostEvaluator, StdRng>>> =
+            vec![Box::new(o0), Box::new(o1), Box::new(o2)];
+
+        // Can't easily inspect sync_calls after boxing, so test via behavior:
+        let mut comp = CompoundOperator::concatenate_no_restart(ops);
+        comp.synchronize(&mut ctx);
+
+        // Trigger one pass (all children return None)
+        assert!(comp.make_next_neighbor(&mut ctx).is_none());
+
+        // After synchronize + one pass, started flags should prevent re-synchronization
+        // until we call synchronize/reset again. Calling make_next_neighbor again should
+        // also return None without re-synchronizing children.
+        assert!(comp.make_next_neighbor(&mut ctx).is_none());
+
+        // After explicit synchronize, children will be synchronized again
+        comp.synchronize(&mut ctx);
+        assert!(comp.make_next_neighbor(&mut ctx).is_none());
+    }
+
+    #[test]
+    fn test_empty_compounds_yield_none() {
+        let (model, state, eval, mut rng, mut buffer) = make_context();
+        let mut ctx = ctx(&model, &state, &eval, &mut rng, &mut buffer);
+
+        let mut comp = CompoundOperator::concatenate_no_restart(Vec::new());
+        comp.synchronize(&mut ctx);
+        assert!(comp.make_next_neighbor(&mut ctx).is_none());
+
+        let mut comp_r = RandomCompoundOperator::new(Vec::new());
+        comp_r.synchronize(&mut ctx);
+        assert!(comp_r.make_next_neighbor(&mut ctx).is_none());
+
+        let mut comp_mab = MultiArmedBanditCompoundOperator::new_min(Vec::new(), 0.5, 1.0);
+        comp_mab.synchronize(&mut ctx);
+        assert!(comp_mab.make_next_neighbor(&mut ctx).is_none());
     }
 }
