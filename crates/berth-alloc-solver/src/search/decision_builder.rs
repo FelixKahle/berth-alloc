@@ -21,13 +21,12 @@
 
 use crate::{
     model::solver_model::SolverModel,
-    monitor::termination::Termination,
     search::eval::CostEvaluator,
     state::{decisionvar::DecisionVar, fitness::Fitness, plan::Plan, solver_state::SolverState},
 };
 
 #[derive(Debug)]
-pub struct SearchContext<'b, 't, 'c, 's, 'm, 'p, T, C, R>
+pub struct SearchContext<'b, 'c, 's, 'm, 'p, T, C, R>
 where
     T: Copy + Ord,
     C: CostEvaluator<T>,
@@ -39,10 +38,9 @@ where
     pub rng: &'b mut R,
     pub work_buf: &'b mut [DecisionVar<T>],
     pub current_fitness: Fitness,
-    pub term: &'t mut Termination,
 }
 
-impl<'b, 't, 'c, 's, 'm, 'p, T, C, R> SearchContext<'b, 't, 'c, 's, 'm, 'p, T, C, R>
+impl<'b, 'c, 's, 'm, 'p, T, C, R> SearchContext<'b, 'c, 's, 'm, 'p, T, C, R>
 where
     T: Copy + Ord,
     C: CostEvaluator<T>,
@@ -56,8 +54,7 @@ where
         rng: &'b mut R,
         work_buf: &'b mut [DecisionVar<T>],
         current_fitness: Fitness,
-        term: &'t mut Termination,
-    ) -> SearchContext<'b, 't, 'c, 's, 'm, 'p, T, C, R> {
+    ) -> SearchContext<'b, 'c, 's, 'm, 'p, T, C, R> {
         SearchContext {
             model,
             state,
@@ -65,7 +62,6 @@ where
             rng,
             work_buf,
             current_fitness,
-            term,
         }
     }
 
@@ -108,9 +104,9 @@ where
 {
     fn name(&self) -> &str;
 
-    fn next<'b, 't, 'c, 's, 'm, 'p>(
+    fn next<'b, 'c, 's, 'm, 'p>(
         &mut self,
-        context: &mut SearchContext<'b, 't, 'c, 's, 'm, 'p, T, C, R>,
+        context: &mut SearchContext<'b, 'c, 's, 'm, 'p, T, C, R>,
     ) -> Option<Plan<'p, T>>;
 }
 

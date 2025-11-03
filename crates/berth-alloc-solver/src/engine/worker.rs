@@ -23,22 +23,19 @@ use crate::{
     core::numeric::SolveNumeric,
     engine::shared_incumbent::SharedIncumbent,
     model::solver_model::SolverModel,
-    monitor::{controller::GlobalController, observer::SearchObserver, termination::Termination},
     search::{
         decision_builder::{DecisionBuilder, SearchContext},
         eval::CostEvaluator,
     },
     state::{decisionvar::DecisionVar, solver_state::SolverState},
 };
-use std::sync::Arc;
 use std::thread;
 
-pub struct SearchWorker<'e, 'm, 'p, T, C, R, Obs>
+pub struct SearchWorker<'e, 'm, 'p, T, C, R>
 where
     T: Copy + Ord + Send + 'p,
     C: CostEvaluator<T> + Send + Sync + 'static,
     R: rand::Rng + Send + 'static,
-    Obs: SearchObserver,
 {
     id: usize,
     model: &'m SolverModel<'p, T>,
@@ -47,15 +44,12 @@ where
     state: SolverState<'p, T>,
     decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send>,
     rng: R,
-    ctrl: Arc<GlobalController>,
-    observer: Obs,
 }
-impl<'e, 'm, 'p, T, C, R, Obs> SearchWorker<'e, 'm, 'p, T, C, R, Obs>
+impl<'e, 'm, 'p, T, C, R> SearchWorker<'e, 'm, 'p, T, C, R>
 where
     T: SolveNumeric,
     C: CostEvaluator<T> + Send + Sync,
     R: rand::Rng + Send,
-    Obs: SearchObserver,
 {
     #[allow(clippy::too_many_arguments)]
     #[inline]
@@ -67,8 +61,6 @@ where
         initial_state: SolverState<'p, T>,
         db: Box<dyn DecisionBuilder<T, C, R> + Send>,
         rng: R,
-        ctrl: Arc<GlobalController>,
-        observer: Obs,
     ) -> Self {
         /* assign fields */
         Self {
@@ -79,8 +71,6 @@ where
             state: initial_state,
             decision_builder: db,
             rng,
-            ctrl,
-            observer,
         }
     }
 
@@ -90,18 +80,8 @@ where
 
     pub fn run(mut self) {
         let mut work_buf = vec![DecisionVar::unassigned(); self.model.flexible_requests_len()];
-        let mut iter_id: u64 = 0;
-        self.observer.on_search_start();
-
-        // Build one termination policy per worker.
-        let mut term = Termination::from_controller(self.ctrl.clone());
 
         loop {
-            // Very cheap check (iter budget, sampling, external stop)
-            if term.tick_iteration() {
-                break;
-            }
-
             let current_fitness = *self.state.fitness();
             let mut ctx = SearchContext::new(
                 self.model,
@@ -110,53 +90,37 @@ where
                 &mut self.rng,
                 &mut work_buf,
                 current_fitness,
-                &mut term,
             );
 
             match self.decision_builder.next(&mut ctx) {
                 Some(plan) => {
-                    let old_cost = self.state.fitness().cost;
                     self.state.apply_plan(plan);
-                    let new_cost = self.state.fitness().cost;
-
-                    // Rare atomics (accepted, maybe incumbent)
-                    self.ctrl.on_accepted();
-                    if self.shared_incumbent.try_update(&self.state, self.model) {
-                        self.ctrl.on_incumbent_improvement();
-                        self.observer.on_new_incumbent(iter_id, new_cost);
-                    }
-                    self.observer
-                        .on_iteration_accepted(iter_id, new_cost, old_cost);
-                    iter_id += 1;
+                    let _ = self.shared_incumbent.try_update(&self.state, self.model);
                     continue;
                 }
                 None => break,
             }
         }
-
-        self.observer.on_search_end();
     }
 }
 
-pub struct SearchPool<'e, 'm, 'p, T, C, R, Obs>
+pub struct SearchPool<'e, 'm, 'p, T, C, R>
 where
     T: Copy + Ord + Send + Sync + 'p,
     C: CostEvaluator<T> + Send + Sync + 'static,
     R: rand::Rng + Send + 'static,
-    Obs: SearchObserver + Send + 'static,
 {
-    workers: Vec<SearchWorker<'e, 'm, 'p, T, C, R, Obs>>,
+    workers: Vec<SearchWorker<'e, 'm, 'p, T, C, R>>,
 }
 
-impl<'e, 'm, 'p, T, C, R, Obs> SearchPool<'e, 'm, 'p, T, C, R, Obs>
+impl<'e, 'm, 'p, T, C, R> SearchPool<'e, 'm, 'p, T, C, R>
 where
     T: SolveNumeric,
     C: CostEvaluator<T> + Send + Sync,
     R: rand::Rng + Send,
-    Obs: SearchObserver + Send,
 {
     #[inline]
-    pub fn new(workers: Vec<SearchWorker<'e, 'm, 'p, T, C, R, Obs>>) -> Self {
+    pub fn new(workers: Vec<SearchWorker<'e, 'm, 'p, T, C, R>>) -> Self {
         Self { workers }
     }
 

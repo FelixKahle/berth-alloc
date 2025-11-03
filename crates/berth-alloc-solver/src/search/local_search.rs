@@ -74,9 +74,9 @@ where
         "MetaheuristicLocalSearch"
     }
 
-    fn next<'b, 't, 'c, 's, 'm, 'p>(
+    fn next<'b, 'c, 's, 'm, 'p>(
         &mut self,
-        context: &mut SearchContext<'b, 't, 'c, 's, 'm, 'p, T, C, R>,
+        context: &mut SearchContext<'b, 'c, 's, 'm, 'p, T, C, R>,
     ) -> Option<Plan<'p, T>> {
         let model = context.model;
         let state = context.state;
@@ -98,10 +98,6 @@ where
 
         loop {
             while let Some(plan) = self.local_search_operator.make_next_neighbor(&mut op_ctx) {
-                if context.term.tick_neighbor() {
-                    return None;
-                }
-
                 if !self
                     .filter_stack
                     .accept(FilterContext::new(model, state), &plan)
@@ -133,10 +129,6 @@ mod tests {
     use super::*;
     use crate::{
         model::solver_model::SolverModel,
-        monitor::{
-            controller::{GlobalController, SearchLimits},
-            termination::Termination,
-        },
         search::eval::DefaultCostEvaluator,
         state::{
             decisionvar::{DecisionVar, DecisionVarVec},
@@ -459,9 +451,6 @@ mod tests {
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
 
-        let ctrl = GlobalController::new(SearchLimits::default_fast());
-        let mut term = Termination::from_controller(ctrl);
-
         let mut ctx = SearchContext::new(
             &model,
             &state,
@@ -469,7 +458,6 @@ mod tests {
             &mut rng,
             &mut work_buf,
             current_fitness,
-            &mut term,
         );
 
         let op = Box::new(CountingOperator::new(vec![3])); // would yield neighbors, but shouldn't be called
@@ -490,9 +478,6 @@ mod tests {
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
 
-        let ctrl = GlobalController::new(SearchLimits::default_fast());
-        let mut term = Termination::from_controller(ctrl);
-
         let mut ctx = SearchContext::new(
             &model,
             &state,
@@ -500,7 +485,6 @@ mod tests {
             &mut rng,
             &mut work_buf,
             current_fitness,
-            &mut term,
         );
 
         // One round with 2 neighbors; MH accepts first.
@@ -523,9 +507,6 @@ mod tests {
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
 
-        let ctrl = GlobalController::new(SearchLimits::default_fast());
-        let mut term = Termination::from_controller(ctrl);
-
         let mut ctx = SearchContext::new(
             &model,
             &state,
@@ -533,7 +514,6 @@ mod tests {
             &mut rng,
             &mut work_buf,
             current_fitness,
-            &mut term,
         );
 
         let op = Box::new(CountingOperator::new(vec![3]));
@@ -557,9 +537,6 @@ mod tests {
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
 
-        let ctrl = GlobalController::new(SearchLimits::default_fast());
-        let mut term = Termination::from_controller(ctrl);
-
         let mut ctx = SearchContext::new(
             &model,
             &state,
@@ -567,7 +544,6 @@ mod tests {
             &mut rng,
             &mut work_buf,
             current_fitness,
-            &mut term,
         );
 
         // Round 0: 0 neighbors; Round 1: 1 neighbor (accepted).
@@ -621,9 +597,6 @@ mod tests {
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
 
-        let ctrl = GlobalController::new(SearchLimits::default_fast());
-        let mut term = Termination::from_controller(ctrl);
-
         let mut ctx = SearchContext::new(
             &model,
             &state,
@@ -631,7 +604,6 @@ mod tests {
             &mut rng,
             &mut work_buf,
             current_fitness,
-            &mut term,
         );
 
         // Operator yields two neighbors in the only round; MH rejects all and then stops.
@@ -652,9 +624,6 @@ mod tests {
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
 
-        let ctrl = GlobalController::new(SearchLimits::default_fast());
-        let mut term = Termination::from_controller(ctrl);
-
         let mut ctx = SearchContext::new(
             &model,
             &state,
@@ -662,7 +631,6 @@ mod tests {
             &mut rng,
             &mut work_buf,
             current_fitness,
-            &mut term,
         );
 
         // Three rounds, all with zero neighbors; MH allows exactly three rounds.
@@ -686,9 +654,6 @@ mod tests {
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = Fitness::new(123, 456);
 
-        let ctrl = GlobalController::new(SearchLimits::default_fast());
-        let mut term = Termination::from_controller(ctrl);
-
         let mut ctx = SearchContext::new(
             &model,
             &state,
@@ -696,7 +661,6 @@ mod tests {
             &mut rng,
             &mut work_buf,
             current_fitness,
-            &mut term,
         );
 
         // Accessors return the same references
@@ -713,9 +677,6 @@ mod tests {
 
         // Current fitness is what we passed in
         assert_eq!(ctx.current_fitness(), current_fitness);
-
-        // Termination fast-path should be false initially
-        assert!(!ctx.term.should_stop_fast());
     }
 
     #[test]
