@@ -23,6 +23,7 @@ use crate::{
     core::numeric::SolveNumeric,
     engine::shared_incumbent::SharedIncumbent,
     model::solver_model::SolverModel,
+    monitor::search_monitor::SearchMonitor,
     search::{
         decision_builder::{DecisionBuilder, SearchContext},
         eval::CostEvaluator,
@@ -44,6 +45,7 @@ where
     state: SolverState<'p, T>,
     decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send>,
     rng: R,
+    monitor: Box<dyn SearchMonitor<T> + Send>,
 }
 impl<'e, 'm, 'p, T, C, R> SearchWorker<'e, 'm, 'p, T, C, R>
 where
@@ -61,8 +63,8 @@ where
         initial_state: SolverState<'p, T>,
         db: Box<dyn DecisionBuilder<T, C, R> + Send>,
         rng: R,
+        monitor: Box<dyn SearchMonitor<T> + Send>,
     ) -> Self {
-        /* assign fields */
         Self {
             id,
             model,
@@ -71,6 +73,7 @@ where
             state: initial_state,
             decision_builder: db,
             rng,
+            monitor,
         }
     }
 
@@ -81,7 +84,13 @@ where
     pub fn run(mut self) {
         let mut work_buf = vec![DecisionVar::unassigned(); self.model.flexible_requests_len()];
 
+        self.monitor.on_search_start();
+
         loop {
+            if self.monitor.should_terminate_search() {
+                break;
+            }
+
             let current_fitness = *self.state.fitness();
             let mut ctx = SearchContext::new(
                 self.model,
@@ -90,6 +99,7 @@ where
                 &mut self.rng,
                 &mut work_buf,
                 current_fitness,
+                self.monitor.as_mut(),
             );
 
             match self.decision_builder.next(&mut ctx) {
@@ -101,6 +111,8 @@ where
                 None => break,
             }
         }
+
+        self.monitor.on_search_end();
     }
 }
 

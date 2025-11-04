@@ -20,6 +20,7 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::{
+    monitor::search_monitor::PlanEventMonitor,
     search::{
         decision_builder::{DecisionBuilder, SearchContext},
         eval::CostEvaluator,
@@ -74,15 +75,21 @@ where
         "MetaheuristicLocalSearch"
     }
 
-    fn next<'b, 'c, 's, 'm, 'p>(
+    #[tracing::instrument(skip(self, context), level = "debug")]
+    fn next<'b, 'sm, 'c, 's, 'm, 'p>(
         &mut self,
-        context: &mut SearchContext<'b, 'c, 's, 'm, 'p, T, C, R>,
+        context: &mut SearchContext<'b, 'sm, 'c, 's, 'm, 'p, T, C, R>,
     ) -> Option<Plan<'p, T>> {
         let model = context.model;
         let state = context.state;
         let evaluator = context.evaluator;
         let rng: &mut R = context.rng;
         let work_buf: &mut [DecisionVar<T>] = context.work_buf;
+        let monitor: &mut dyn PlanEventMonitor<T> = context.monitor;
+
+        if monitor.should_terminate_search() {
+            return None;
+        }
 
         let mut op_ctx = OperatorContext::new(model, state, evaluator, rng, work_buf);
 
@@ -97,17 +104,34 @@ where
         self.local_search_operator.synchronize(&mut op_ctx);
 
         loop {
+            if monitor.should_terminate_search() {
+                return None;
+            }
+
             while let Some(plan) = self.local_search_operator.make_next_neighbor(&mut op_ctx) {
+                monitor.on_plan_generated(&plan);
+
                 if !self
                     .filter_stack
                     .accept(FilterContext::new(model, state), &plan)
                 {
+                    monitor.on_plan_rejected(&plan);
+                    if monitor.should_terminate_search() {
+                        return None;
+                    }
                     continue;
                 }
 
                 let mh_ctx = MetaheuristicContext::new(model, state, evaluator);
                 if self.metaheuristic.accept_plan(mh_ctx, &plan) {
+                    monitor.on_plan_accepted(&plan);
                     return Some(plan);
+                } else {
+                    monitor.on_plan_rejected(&plan);
+                }
+
+                if monitor.should_terminate_search() {
+                    return None;
                 }
             }
 
@@ -127,8 +151,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::search_monitor::{
+        LifecycleMonitor, PlanEventMonitor, SearchMonitor, TerminationCheck,
+    };
     use crate::{
         model::solver_model::SolverModel,
+        monitor::search_monitor::NullSearchMonitor,
         search::eval::DefaultCostEvaluator,
         state::{
             decisionvar::{DecisionVar, DecisionVarVec},
@@ -450,6 +478,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(0);
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
+        let mut search_monitor = NullSearchMonitor::default();
 
         let mut ctx = SearchContext::new(
             &model,
@@ -458,6 +487,7 @@ mod tests {
             &mut rng,
             &mut work_buf,
             current_fitness,
+            &mut search_monitor,
         );
 
         let op = Box::new(CountingOperator::new(vec![3])); // would yield neighbors, but shouldn't be called
@@ -477,6 +507,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(1);
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
+        let mut search_monitor = NullSearchMonitor::default();
 
         let mut ctx = SearchContext::new(
             &model,
@@ -485,6 +516,7 @@ mod tests {
             &mut rng,
             &mut work_buf,
             current_fitness,
+            &mut search_monitor,
         );
 
         // One round with 2 neighbors; MH accepts first.
@@ -506,6 +538,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(11);
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
+        let mut search_monitor = NullSearchMonitor::default();
 
         let mut ctx = SearchContext::new(
             &model,
@@ -514,6 +547,7 @@ mod tests {
             &mut rng,
             &mut work_buf,
             current_fitness,
+            &mut search_monitor,
         );
 
         let op = Box::new(CountingOperator::new(vec![3]));
@@ -536,6 +570,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(2);
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
+        let mut search_monitor = NullSearchMonitor::default();
 
         let mut ctx = SearchContext::new(
             &model,
@@ -544,6 +579,7 @@ mod tests {
             &mut rng,
             &mut work_buf,
             current_fitness,
+            &mut search_monitor,
         );
 
         // Round 0: 0 neighbors; Round 1: 1 neighbor (accepted).
@@ -596,6 +632,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(3);
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
+        let mut search_monitor = NullSearchMonitor::default();
 
         let mut ctx = SearchContext::new(
             &model,
@@ -604,6 +641,7 @@ mod tests {
             &mut rng,
             &mut work_buf,
             current_fitness,
+            &mut search_monitor,
         );
 
         // Operator yields two neighbors in the only round; MH rejects all and then stops.
@@ -623,6 +661,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(12);
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
+        let mut search_monitor = NullSearchMonitor::default();
 
         let mut ctx = SearchContext::new(
             &model,
@@ -631,6 +670,7 @@ mod tests {
             &mut rng,
             &mut work_buf,
             current_fitness,
+            &mut search_monitor,
         );
 
         // Three rounds, all with zero neighbors; MH allows exactly three rounds.
@@ -653,6 +693,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(4);
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = Fitness::new(123, 456);
+        let mut search_monitor = NullSearchMonitor::default();
 
         let mut ctx = SearchContext::new(
             &model,
@@ -661,6 +702,7 @@ mod tests {
             &mut rng,
             &mut work_buf,
             current_fitness,
+            &mut search_monitor,
         );
 
         // Accessors return the same references
@@ -696,5 +738,215 @@ mod tests {
             format!("{}", ls),
             "DecisionBuilder(MetaheuristicLocalSearch)"
         );
+    }
+
+    // A simple test monitor that counts plan events and can request early termination
+    #[derive(Debug, Default)]
+    struct CountingMonitor {
+        generated: usize,
+        rej: usize,
+        acc: usize,
+        terminate_after_gen: Option<usize>,
+        terminated: bool,
+        started: usize,
+        ended: usize,
+        name: &'static str,
+    }
+
+    impl CountingMonitor {
+        fn new() -> Self {
+            Self {
+                name: "CountingMonitor",
+                ..Default::default()
+            }
+        }
+        fn with_terminate_after(steps: usize) -> Self {
+            Self {
+                terminate_after_gen: Some(steps),
+                name: "CountingMonitor",
+                ..Default::default()
+            }
+        }
+    }
+
+    impl TerminationCheck for CountingMonitor {
+        fn should_terminate_search(&self) -> bool {
+            self.terminated
+        }
+    }
+
+    impl PlanEventMonitor<i64> for CountingMonitor {
+        fn on_plan_generated<'p>(&mut self, _plan: &Plan<'p, i64>) {
+            self.generated += 1;
+            if let Some(limit) = self.terminate_after_gen {
+                if self.generated >= limit {
+                    self.terminated = true;
+                }
+            }
+        }
+        fn on_plan_rejected<'p>(&mut self, _plan: &Plan<'p, i64>) {
+            self.rej += 1;
+        }
+        fn on_plan_accepted<'p>(&mut self, _plan: &Plan<'p, i64>) {
+            self.acc += 1;
+        }
+    }
+
+    impl LifecycleMonitor for CountingMonitor {
+        fn on_search_start(&mut self) {
+            self.started += 1;
+        }
+        fn on_search_end(&mut self) {
+            self.ended += 1;
+        }
+    }
+
+    impl SearchMonitor<i64> for CountingMonitor {
+        fn name(&self) -> &str {
+            self.name
+        }
+    }
+
+    #[test]
+    fn test_monitor_counts_first_accept() {
+        let problem = problem_one_berth_two_flex();
+        let (model, state, eval) = make_state(&problem);
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let current_fitness = *state.fitness();
+
+        // Operator yields multiple neighbors; MH accepts first.
+        let op = Box::new(CountingOperator::new(vec![3]));
+        let filter_stack = default_filter_stack();
+        let mh = AcceptFirstMH::new();
+        let mut search = MetaheuristicLocalSearch::new(op, filter_stack, mh);
+
+        let mut mon = CountingMonitor::new();
+        let mut ctx = SearchContext::new(
+            &model,
+            &state,
+            &eval,
+            &mut rng,
+            &mut work_buf,
+            current_fitness,
+            &mut mon,
+        );
+
+        let res = search.next(&mut ctx);
+        assert!(res.is_some(), "expected Some(plan)");
+        assert_eq!(
+            mon.generated, 1,
+            "should generate exactly one before accepting"
+        );
+        assert_eq!(mon.rej, 0, "no rejections when accepting first");
+        assert_eq!(mon.acc, 1, "one accepted plan");
+    }
+
+    #[test]
+    fn test_monitor_counts_second_accept() {
+        let problem = problem_one_berth_two_flex();
+        let (model, state, eval) = make_state(&problem);
+        let mut rng = StdRng::seed_from_u64(43);
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let current_fitness = *state.fitness();
+
+        // Operator yields multiple neighbors; MH accepts second.
+        let op = Box::new(CountingOperator::new(vec![3]));
+        let filter_stack = default_filter_stack();
+        let mh = AcceptSecondMH::new();
+        let mut search = MetaheuristicLocalSearch::new(op, filter_stack, mh);
+
+        let mut mon = CountingMonitor::new();
+        let mut ctx = SearchContext::new(
+            &model,
+            &state,
+            &eval,
+            &mut rng,
+            &mut work_buf,
+            current_fitness,
+            &mut mon,
+        );
+
+        let res = search.next(&mut ctx);
+        assert!(res.is_some(), "expected Some(plan)");
+        assert_eq!(
+            mon.generated, 2,
+            "should generate two candidates to accept the second"
+        );
+        assert_eq!(mon.rej, 1, "first is rejected");
+        assert_eq!(mon.acc, 1, "second is accepted");
+    }
+
+    #[test]
+    fn test_monitor_all_rejected_counts() {
+        let problem = problem_one_berth_two_flex();
+        let (model, state, eval) = make_state(&problem);
+        let mut rng = StdRng::seed_from_u64(44);
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let current_fitness = *state.fitness();
+
+        // One round, 3 neighbors; MH rejects all.
+        let op = Box::new(CountingOperator::new(vec![3]));
+        let filter_stack = default_filter_stack();
+        let mh = RejectAllMH::new();
+        let mut search = MetaheuristicLocalSearch::new(op, filter_stack, mh);
+
+        let mut mon = CountingMonitor::new();
+        let mut ctx = SearchContext::new(
+            &model,
+            &state,
+            &eval,
+            &mut rng,
+            &mut work_buf,
+            current_fitness,
+            &mut mon,
+        );
+
+        let res = search.next(&mut ctx);
+        assert!(res.is_none(), "expected None when all are rejected");
+        assert_eq!(mon.generated, 3, "generated all neighbors");
+        assert_eq!(mon.rej, 3, "all neighbors rejected");
+        assert_eq!(mon.acc, 0, "no acceptance");
+    }
+
+    #[test]
+    fn test_monitor_respects_termination_after_n_generated() {
+        let problem = problem_one_berth_two_flex();
+        let (model, state, eval) = make_state(&problem);
+        let mut rng = StdRng::seed_from_u64(45);
+        let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let current_fitness = *state.fitness();
+
+        // Many neighbors available; MH rejects all; monitor will request termination after 2 generated.
+        let op = Box::new(CountingOperator::new(vec![10]));
+        let filter_stack = default_filter_stack();
+        let mh = ContinueWithBudgetMH::new(5);
+        let mut search = MetaheuristicLocalSearch::new(op, filter_stack, mh);
+
+        let mut mon = CountingMonitor::with_terminate_after(2);
+        let mut ctx = SearchContext::new(
+            &model,
+            &state,
+            &eval,
+            &mut rng,
+            &mut work_buf,
+            current_fitness,
+            &mut mon,
+        );
+
+        let res = search.next(&mut ctx);
+        assert!(
+            res.is_none(),
+            "builder should stop when monitor requests termination"
+        );
+        assert_eq!(
+            mon.generated, 2,
+            "should generate only up to termination threshold"
+        );
+        assert_eq!(
+            mon.rej, 2,
+            "each generated was rejected prior to termination"
+        );
+        assert_eq!(mon.acc, 0, "no acceptance when terminating early");
     }
 }
