@@ -23,7 +23,7 @@ use crate::{
     model::index::{BerthIndex, RequestIndex},
     search::{
         eval::CostEvaluator,
-        lns::{RuinOutcome, RuinProcedure, RuinProcedureContext},
+        lns::{RuinOutcome, RuinProcedure, RuinProcedureContext}, neighboors::NeighborFn,
     },
     state::{
         decisionvar::{Decision, DecisionVar},
@@ -34,8 +34,11 @@ use crate::{
 use berth_alloc_core::prelude::{Cost, TimePoint};
 use num_traits::{CheckedAdd, CheckedSub};
 use rand::Rng;
-use std::cmp::{max, min};
-use std::ops::Mul;
+use std::{
+    cmp::{max, min},
+    collections::HashSet,
+};
+use std::{collections::VecDeque, ops::Mul};
 
 // A compact record of an assigned request in the current state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +69,7 @@ fn collect_assigned<'p, T: Copy + Ord>(state: &SolverState<'p, T>) -> Vec<Assign
     out
 }
 
+#[inline(always)]
 fn build_unassign_plan<'b, 'r, 'c, 's, 'm, 'p, T, C, R>(
     ctx: &mut RuinProcedureContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
     victims: &[RequestIndex],
@@ -97,7 +101,7 @@ impl RandomSubsetRuin {
 }
 
 // Floyd’s algorithm to sample k distinct indices from 0..n in expected O(k)
-#[inline]
+#[inline(always)]
 fn sample_k_distinct<R: Rng>(rng: &mut R, n: usize, k: usize) -> Vec<usize> {
     use std::collections::HashSet;
     let k = k.min(n);
@@ -385,6 +389,92 @@ where
     }
 }
 
+/// Ruin procedure that removes a cluster of "related" requests.
+///
+/// It starts from a single random, assigned request and performs a
+/// Breadth-First Search (BFS) using the provided `NeighborFn` to find
+/// a cluster of other *assigned* requests. It stops after finding `k`
+/// victims or exhausting the connected component.
+pub struct RelatedRuin<'a> {
+    k: usize,
+    neighbor_fn: NeighborFn<'a>,
+}
+
+impl<'a> RelatedRuin<'a> {
+    #[inline]
+    pub fn new(k: usize, neighbor_fn: NeighborFn<'a>) -> Self {
+        Self {
+            k: max(1, k),
+            neighbor_fn,
+        }
+    }
+}
+
+impl<'a, T, C, R> RuinProcedure<T, C, R> for RelatedRuin<'a>
+where
+    T: Copy + Ord + std::fmt::Debug + CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+    'a: 'static, // The NeighborFn must be 'static to be held in a 'static struct
+{
+    fn name(&self) -> &str {
+        "RelatedRuin"
+    }
+
+    #[tracing::instrument(skip(self, ctx), level = "debug")]
+    fn ruin<'b, 'r, 'c, 's, 'm, 'p>(
+        &mut self,
+        ctx: &mut RuinProcedureContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
+    ) -> RuinOutcome<'p, T> {
+        let all_assigned = collect_assigned(ctx.state());
+        let assigned_set: HashSet<RequestIndex> = all_assigned.iter().map(|rec| rec.r).collect();
+
+        if assigned_set.is_empty() {
+            return build_unassign_plan(ctx, &[]);
+        }
+
+        let seed_rec = all_assigned[ctx.rng().random_range(0..all_assigned.len())];
+        let mut victims: Vec<RequestIndex> = Vec::with_capacity(self.k);
+        let mut queue: VecDeque<RequestIndex> = VecDeque::new();
+        let mut visited: HashSet<RequestIndex> = HashSet::new();
+
+        queue.push_back(seed_rec.r);
+        visited.insert(seed_rec.r);
+
+        while victims.len() < self.k {
+            let Some(current_r) = queue.pop_front() else {
+                break; // Cluster is exhausted
+            };
+
+            victims.push(current_r);
+            let add_neighbors =
+                |neighbors: &[RequestIndex],
+                 queue: &mut VecDeque<RequestIndex>,
+                 visited: &mut HashSet<RequestIndex>| {
+                    for &neighbor_r in neighbors {
+                        if !visited.contains(&neighbor_r) && assigned_set.contains(&neighbor_r) {
+                            visited.insert(neighbor_r);
+                            queue.push_back(neighbor_r);
+                        }
+                    }
+                };
+
+            match &self.neighbor_fn {
+                NeighborFn::Vec(f) => {
+                    let neighbors = f(current_r); // This creates a new Vec
+                    add_neighbors(&neighbors, &mut queue, &mut visited);
+                }
+                NeighborFn::Slice(f) => {
+                    let neighbors = f(current_r); // This is just a slice
+                    add_neighbors(neighbors, &mut queue, &mut visited);
+                }
+            }
+        }
+
+        build_unassign_plan(ctx, &victims)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,9 +485,13 @@ mod tests {
     };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
     use berth_alloc_model::{prelude::*, problem::builder::ProblemBuilder};
+    use once_cell::sync::Lazy;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng as StdRng;
-    use std::collections::BTreeMap;
+    use std::{
+        collections::{BTreeMap, HashMap},
+        sync::Arc,
+    };
 
     #[inline]
     fn tp(v: i64) -> TimePoint<i64> {
@@ -506,6 +600,118 @@ mod tests {
         buf: &'b mut [DecisionVar<i64>],
     ) -> RuinProcedureContext<'b, 'r, 'c, 's, 'm, 'p, i64, DefaultCostEvaluator, StdRng> {
         RuinProcedureContext::new(model, state, eval, rng, buf)
+    }
+
+    // Helper to create a state with r1, r3 assigned and r2, r4 unassigned
+    fn make_partially_assigned_state() -> (
+        SolverModel<'static, i64>,
+        SolverState<'static, i64>,
+        DefaultCostEvaluator,
+    ) {
+        // ... (setup is identical to make_assigned_state) ...
+        let b1 = berth(1, 0, 200);
+        let b2 = berth(2, 0, 200);
+        let r1 = flex_req(1, (0, 200), &[(1, 20), (2, 20)], 1);
+        let r2 = flex_req(2, (0, 200), &[(1, 15), (2, 15)], 1);
+        let r3 = flex_req(3, (0, 200), &[(1, 25), (2, 25)], 1);
+        let r4 = flex_req(4, (0, 200), &[(1, 10), (2, 10)], 1);
+        let mut pb = ProblemBuilder::new();
+        pb.add_berth(b1);
+        pb.add_berth(b2);
+        pb.add_flexible(r1);
+        pb.add_flexible(r2);
+        pb.add_flexible(r3);
+        pb.add_flexible(r4);
+        let problem: &'static Problem<i64> = Box::leak(Box::new(pb.build().unwrap()));
+        let model = SolverModel::try_from(problem).unwrap();
+        let eval = DefaultCostEvaluator;
+        let im = model.index_manager();
+
+        // --- Dvars ---
+        // r1, r3 assigned; r2, r4 unassigned
+        let r1_ix = im.request_index(rid(1)).unwrap();
+        let _r2_ix = im.request_index(rid(2)).unwrap();
+        let r3_ix = im.request_index(rid(3)).unwrap();
+        let _r4_ix = im.request_index(rid(4)).unwrap();
+        let b1_ix = im.berth_index(bid(1)).unwrap();
+        let b2_ix = im.berth_index(bid(2)).unwrap();
+
+        let mut dvars = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        dvars[r1_ix.get()] = DecisionVar::assigned(b1_ix, tp(0));
+        dvars[r3_ix.get()] = DecisionVar::assigned(b2_ix, tp(0));
+
+        // --- Terminal ---
+        use crate::state::terminal::terminalocc::TerminalOccupancy;
+        let mut term = TerminalOccupancy::new(problem.berths().iter());
+        for (r, (b, s)) in [(r1_ix, (b1_ix, tp(0))), (r3_ix, (b2_ix, tp(0)))] {
+            let iv = model.interval(r, b, s).unwrap();
+            term.occupy(b, iv).unwrap();
+        }
+
+        let fitness = eval.eval_fitness(&model, &dvars);
+        let state = SolverState::new(DecisionVarVec::from(dvars), term, fitness);
+        (model, state, eval)
+    }
+
+    // Helper to create a state with no requests assigned
+    fn make_unassigned_state() -> (
+        SolverModel<'static, i64>,
+        SolverState<'static, i64>,
+        DefaultCostEvaluator,
+    ) {
+        // ... (setup is identical to make_assigned_state) ...
+        let b1 = berth(1, 0, 200);
+        let b2 = berth(2, 0, 200);
+        let r1 = flex_req(1, (0, 200), &[(1, 20), (2, 20)], 1);
+        let r2 = flex_req(2, (0, 200), &[(1, 15), (2, 15)], 1);
+        let mut pb = ProblemBuilder::new();
+        pb.add_berth(b1);
+        pb.add_berth(b2);
+        pb.add_flexible(r1);
+        pb.add_flexible(r2);
+        let problem: &'static Problem<i64> = Box::leak(Box::new(pb.build().unwrap()));
+        let model = SolverModel::try_from(problem).unwrap();
+        let eval = DefaultCostEvaluator;
+
+        // --- Dvars (all unassigned) ---
+        let dvars = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+
+        // --- Terminal (empty) ---
+        use crate::state::terminal::terminalocc::TerminalOccupancy;
+        let term = TerminalOccupancy::new(problem.berths().iter());
+
+        let fitness = eval.eval_fitness(&model, &dvars);
+        let state = SolverState::new(DecisionVarVec::from(dvars), term, fitness);
+        (model, state, eval)
+    }
+
+    // A static neighbor graph for testing.
+    // r1 <-> r2 <-> r3 <-> r4
+    static TEST_NEIGHBORS: Lazy<HashMap<RequestIndex, Vec<RequestIndex>>> = Lazy::new(|| {
+        let mut m = HashMap::new();
+        let r1 = RequestIndex::new(0);
+        let r2 = RequestIndex::new(1);
+        let r3 = RequestIndex::new(2);
+        let r4 = RequestIndex::new(3);
+        m.insert(r1, vec![r2]);
+        m.insert(r2, vec![r1, r3]);
+        m.insert(r3, vec![r2, r4]);
+        m.insert(r4, vec![r3]);
+        m
+    });
+
+    // Helper to create a NeighborFn::Vec
+    fn create_neighbor_fn_vec() -> NeighborFn<'static> {
+        NeighborFn::Vec(Arc::new(|r| {
+            TEST_NEIGHBORS.get(&r).cloned().unwrap_or_default()
+        }))
+    }
+
+    // Helper to create a NeighborFn::Slice
+    fn create_neighbor_fn_slice() -> NeighborFn<'static> {
+        NeighborFn::Slice(Arc::new(|r| {
+            TEST_NEIGHBORS.get(&r).map_or(&[], |v| v.as_slice())
+        }))
     }
 
     #[test]
@@ -692,6 +898,78 @@ mod tests {
         assert!(
             !out.ruined_plan.terminal_delta.is_empty(),
             "terminal delta should reflect releases"
+        );
+    }
+
+    #[test]
+    fn related_ruin_on_empty_state_returns_empty() {
+        let (model, state, eval) = make_unassigned_state();
+        let mut rng = StdRng::seed_from_u64(30);
+        let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut ctx = ruin_ctx(&model, &state, &eval, &mut rng, &mut buffer);
+
+        let mut ruin = RelatedRuin::new(5, create_neighbor_fn_vec());
+        let out = ruin.ruin(&mut ctx);
+
+        assert!(
+            out.ruined.is_empty(),
+            "victim list should be empty when state is empty"
+        );
+        assert!(
+            out.ruined_plan.is_empty(),
+            "plan should be empty when state is empty"
+        );
+    }
+
+    #[test]
+    fn related_ruin_vec_respects_k_limit() {
+        let (model, state, eval) = make_assigned_state(); // All 4 requests are assigned
+        let mut rng = StdRng::seed_from_u64(31);
+        let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut ctx = ruin_ctx(&model, &state, &eval, &mut rng, &mut buffer);
+
+        // Graph is r1-r2-r3-r4 (all assigned). Cluster size is 4.
+        // We request k=3.
+        let mut ruin = RelatedRuin::new(3, create_neighbor_fn_vec());
+        let out = ruin.ruin(&mut ctx);
+
+        assert_eq!(
+            out.ruined.len(),
+            3,
+            "should remove exactly k=3 victims when cluster is larger"
+        );
+        assert_eq!(
+            out.ruined_plan.decision_var_patches.len(),
+            3,
+            "plan should match victim count"
+        );
+    }
+
+    #[test]
+    fn related_ruin_slice_stops_at_unassigned_and_exhausts_cluster() {
+        // This state has r1, r3 assigned and r2, r4 unassigned.
+        let (model, state, eval) = make_partially_assigned_state();
+        let mut rng = StdRng::seed_from_u64(32);
+        let mut buffer = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
+        let mut ctx = ruin_ctx(&model, &state, &eval, &mut rng, &mut buffer);
+
+        let im = model.index_manager();
+        let r1_ix = im.request_index(rid(1)).unwrap(); // Assigned
+        let r3_ix = im.request_index(rid(3)).unwrap(); // Assigned
+
+        // Graph is r1-r2-r3-r4.
+        // We request k=5 (larger than any possible cluster).
+        // The BFS should get stuck at the unassigned requests (r2, r4).
+        // The two valid, disjoint clusters are {r1} and {r3}.
+        let mut ruin = RelatedRuin::new(5, create_neighbor_fn_slice());
+        let out = ruin.ruin(&mut ctx);
+
+        // The seed must be either r1 or r3. In either case, the cluster size is 1.
+        assert_eq!(out.ruined.len(), 1, "should only find a cluster of size 1");
+        let victim = out.ruined[0];
+        assert!(
+            victim == r1_ix || victim == r3_ix,
+            "victim must be one of the two assigned requests"
         );
     }
 }

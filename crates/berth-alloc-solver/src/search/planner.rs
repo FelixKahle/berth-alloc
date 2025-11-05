@@ -169,6 +169,11 @@ where
     }
 
     #[inline]
+    pub fn model(&self) -> &SolverModel<'p, T> {
+        self.solver_model
+    }
+
+    #[inline]
     pub fn prime_from_plan(&mut self, baseline: Plan<'p, T>) -> Result<(), BerthApplyError<T>> {
         self.sandbox.apply_delta(baseline.terminal_delta)?;
         for p in &baseline.decision_var_patches {
@@ -1736,10 +1741,7 @@ mod tests {
 
         // Still one net assignment (unassigned delta unchanged)
         assert_eq!(pb.delta_unassigned(), -1);
-        assert!(
-            pb.delta_cost() != 0.into(),
-            "cost should reflect reassignment"
-        );
+        assert!(pb.delta_cost() != 0, "cost should reflect reassignment");
     }
 
     #[test]

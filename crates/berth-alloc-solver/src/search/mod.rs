@@ -29,6 +29,7 @@ pub mod lns_library;
 pub mod local_search;
 pub mod metaheuristic;
 pub mod metaheuristic_library;
+pub mod neighboors;
 pub mod operator;
 pub mod operator_library;
 pub mod planner;

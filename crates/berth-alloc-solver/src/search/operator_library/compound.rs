@@ -279,7 +279,7 @@ where
     C: CostEvaluator<T>,
     R: rand::Rng,
 {
-    pub fn new_min(
+    pub fn new(
         ops: Vec<Box<dyn LocalSearchOperator<T, C, R> + 'n>>,
         memory_coeff: f64,
         exploration_coeff: f64,
@@ -742,7 +742,7 @@ mod tests {
             Box::new(DummyOp::new("op2", 2, 1)),
         ];
 
-        let mut comp = MultiArmedBanditCompoundOperator::new_min(ops, 0.5, 1.0);
+        let mut comp = MultiArmedBanditCompoundOperator::new(ops, 0.5, 1.0);
 
         // initialize with synchronize (sets last_objective)
         comp.synchronize(&mut ctx);
@@ -769,7 +769,7 @@ mod tests {
             Box::new(DummyOp::new("op1", 1, 1)),
         ];
 
-        let mut comp = MultiArmedBanditCompoundOperator::new_min(ops, 0.5, 1.0);
+        let mut comp = MultiArmedBanditCompoundOperator::new(ops, 0.5, 1.0);
         comp.synchronize(&mut ctx);
 
         let mut first = Vec::new();
@@ -831,7 +831,7 @@ mod tests {
         comp_r.synchronize(&mut ctx);
         assert!(comp_r.make_next_neighbor(&mut ctx).is_none());
 
-        let mut comp_mab = MultiArmedBanditCompoundOperator::new_min(Vec::new(), 0.5, 1.0);
+        let mut comp_mab = MultiArmedBanditCompoundOperator::new(Vec::new(), 0.5, 1.0);
         comp_mab.synchronize(&mut ctx);
         assert!(comp_mab.make_next_neighbor(&mut ctx).is_none());
     }

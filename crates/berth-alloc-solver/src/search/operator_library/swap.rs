@@ -23,7 +23,8 @@ use crate::{
     model::index::RequestIndex,
     search::{
         eval::CostEvaluator,
-        operator::{LocalSearchOperator, NeighborFn, OperatorContext},
+        neighboors::NeighborFn,
+        operator::{LocalSearchOperator, OperatorContext},
     },
     state::{
         decisionvar::{Decision, DecisionVar},
@@ -701,9 +702,11 @@ mod tests {
         let slice1: &'static [RequestIndex] =
             Box::leak(Vec::<RequestIndex>::new().into_boxed_slice());
 
-        let neigh = crate::search::operator::NeighborFn::Slice(Arc::new(move |i| {
-            if i.get() == 0 { slice0 } else { slice1 }
-        }));
+        let neigh = NeighborFn::Slice(Arc::new(
+            move |i| {
+                if i.get() == 0 { slice0 } else { slice1 }
+            },
+        ));
 
         let mut op = SwapSlotOp::with_neighbors(neigh);
 

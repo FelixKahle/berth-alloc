@@ -20,7 +20,7 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    model::{index::RequestIndex, solver_model::SolverModel},
+    model::solver_model::SolverModel,
     search::{eval::CostEvaluator, planner::PlanBuilder},
     state::{
         decisionvar::DecisionVar,
@@ -30,15 +30,7 @@ use crate::{
 };
 use berth_alloc_core::{no_op, prelude::Cost};
 use num_traits::{CheckedAdd, CheckedSub};
-use std::{ops::Mul, sync::Arc};
-
-pub type NeighborFnVec = dyn Fn(RequestIndex) -> Vec<RequestIndex> + Send + Sync;
-pub type NeighborFnSlice<'a> = dyn Fn(RequestIndex) -> &'a [RequestIndex] + Send + Sync + 'a;
-
-pub enum NeighborFn<'a> {
-    Vec(Arc<NeighborFnVec>),
-    Slice(Arc<NeighborFnSlice<'a>>),
-}
+use std::ops::Mul;
 
 #[derive(Debug, PartialEq)]
 pub struct OperatorContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>

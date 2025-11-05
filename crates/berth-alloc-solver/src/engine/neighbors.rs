@@ -25,7 +25,7 @@ use crate::{
         neighborhood::ProximityMap,
         view::NeighborView,
     },
-    search::operator::{NeighborFn, NeighborFnSlice},
+    search::neighboors::{NeighborFn, NeighborFnSlice},
 };
 use std::sync::Arc;
 
@@ -47,7 +47,7 @@ pub fn same_berth<'a>(pm: &'a ProximityMap) -> NeighborFn<'a> {
 }
 
 #[inline]
-pub fn overlap_tw<'a>(pm: &'a ProximityMap) -> NeighborFn<'a> {
+pub fn overlap_time_window<'a>(pm: &'a ProximityMap) -> NeighborFn<'a> {
     // Method name in ProximityMap is overlap_time_window()
     from_view(pm.overlap_time_window())
 }
@@ -183,7 +183,7 @@ mod tests {
         }
 
         // overlap_tw (overlap_time_window)
-        match overlap_tw(pm) {
+        match overlap_time_window(pm) {
             NeighborFn::Slice(f) => {
                 assert_eq!(
                     f(r0),
