@@ -18,8 +18,6 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use num_traits::{CheckedAdd, CheckedSub};
-
 use crate::{
     core::numeric::SolveNumeric,
     engine::shared_incumbent::SharedIncumbent,
@@ -31,6 +29,7 @@ use crate::{
     },
     state::{decisionvar::DecisionVar, solver_state::SolverState},
 };
+use num_traits::{CheckedAdd, CheckedSub};
 
 pub struct StrategyContext<'e, 'm, 'p, T: Copy + Ord> {
     model: &'m SolverModel<'p, T>,

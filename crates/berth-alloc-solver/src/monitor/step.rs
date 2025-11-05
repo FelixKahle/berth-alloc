@@ -26,10 +26,20 @@ use crate::{
     state::plan::Plan,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct PlanLimitMonitor {
     plan_limit: u64,
     plans_generated: u64,
+}
+
+impl std::fmt::Display for PlanLimitMonitor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PlanLimitMonitor {{ plan_limit: {}, plans_generated: {} }}",
+            self.plan_limit, self.plans_generated
+        )
+    }
 }
 
 impl PlanLimitMonitor {
@@ -100,6 +110,58 @@ where
     #[inline]
     fn name(&self) -> &str {
         "PlanLimitMonitor"
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct StagnationMonitor {
+    generated_since_accept: usize,
+    budget: usize,
+}
+
+impl std::fmt::Display for StagnationMonitor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "StagnationMonitor {{ generated_since_accept: {}, budget: {} }}",
+            self.generated_since_accept, self.budget
+        )
+    }
+}
+
+impl StagnationMonitor {
+    pub fn new(budget_without_accept: usize) -> Self {
+        Self {
+            generated_since_accept: 0,
+            budget: budget_without_accept,
+        }
+    }
+}
+
+impl TerminationCheck for StagnationMonitor {
+    fn should_terminate_search(&self) -> bool {
+        self.generated_since_accept >= self.budget
+    }
+}
+
+impl<T: Copy + Ord> PlanEventMonitor<T> for StagnationMonitor {
+    fn on_plan_generated<'p>(&mut self, _plan: &crate::state::plan::Plan<'p, T>) {
+        self.generated_since_accept = self.generated_since_accept.saturating_add(1);
+    }
+    fn on_plan_rejected<'p>(&mut self, _plan: &crate::state::plan::Plan<'p, T>) {}
+    fn on_plan_accepted<'p>(&mut self, _plan: &crate::state::plan::Plan<'p, T>) {
+        self.generated_since_accept = 0;
+    }
+}
+
+impl LifecycleMonitor for StagnationMonitor {
+    fn on_search_start(&mut self) {}
+    fn on_search_end(&mut self) {}
+}
+
+impl<T: Copy + Ord> SearchMonitor<T> for StagnationMonitor {
+    fn name(&self) -> &str {
+        "StagnationMonitor"
     }
 }
 

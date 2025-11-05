@@ -29,7 +29,7 @@ use crate::{
 };
 use std::thread;
 
-pub struct SearchWorker<'e, 'm, 'p, T>
+pub struct SolverWorker<'e, 'm, 'p, T>
 where
     T: Copy + Ord + Send,
 {
@@ -40,7 +40,7 @@ where
     monitor: Box<dyn SearchMonitor<T> + Send>,
 }
 
-impl<'e, 'm, 'p, T> SearchWorker<'e, 'm, 'p, T>
+impl<'e, 'm, 'p, T> SolverWorker<'e, 'm, 'p, T>
 where
     T: SolveNumeric,
 {
@@ -61,10 +61,12 @@ where
         }
     }
 
+    #[inline]
     pub fn id(&self) -> usize {
         self.id
     }
 
+    #[inline]
     pub fn run(mut self) {
         let mut ctx =
             StrategyContext::new(self.model, self.shared_incumbent, self.monitor.as_mut());
@@ -72,19 +74,19 @@ where
     }
 }
 
-pub struct SearchPool<'e, 'm, 'p, T>
+pub struct WorkerPool<'e, 'm, 'p, T>
 where
     T: Copy + Ord + Send + Sync + 'p,
 {
-    workers: Vec<SearchWorker<'e, 'm, 'p, T>>,
+    workers: Vec<SolverWorker<'e, 'm, 'p, T>>,
 }
 
-impl<'e, 'm, 'p, T> SearchPool<'e, 'm, 'p, T>
+impl<'e, 'm, 'p, T> WorkerPool<'e, 'm, 'p, T>
 where
     T: SolveNumeric,
 {
     #[inline]
-    pub fn new(workers: Vec<SearchWorker<'e, 'm, 'p, T>>) -> Self {
+    pub fn new(workers: Vec<SolverWorker<'e, 'm, 'p, T>>) -> Self {
         Self { workers }
     }
 
@@ -123,10 +125,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    // ----------------------------
-    // Helpers
-    // ----------------------------
 
     #[inline]
     fn tp(v: i64) -> TimePoint<i64> {
@@ -269,7 +267,7 @@ mod tests {
         let strategy = Box::new(DummyStrategy::new(ran.clone(), "DummyStrategy"));
         let monitor = Box::new(CountingMonitor::new(started.clone(), ended.clone()));
 
-        let worker = super::SearchWorker::new(7, &model, &incumbent, strategy, monitor);
+        let worker = super::SolverWorker::new(7, &model, &incumbent, strategy, monitor);
         worker.run();
 
         assert_eq!(
@@ -297,7 +295,7 @@ mod tests {
         let strategy = Box::new(DummyStrategy::new(ran, "Dummy"));
         let monitor = Box::new(NullSearchMonitor::default());
 
-        let worker = super::SearchWorker::new(42, &model, &incumbent, strategy, monitor);
+        let worker = super::SolverWorker::new(42, &model, &incumbent, strategy, monitor);
         assert_eq!(worker.id(), 42, "worker.id() must return the configured id");
         // do not run; this test only checks id
     }
@@ -318,12 +316,12 @@ mod tests {
             let strategy = Box::new(DummyStrategy::new(ran.clone(), "PoolStrategy"));
             let monitor = Box::new(CountingMonitor::new(started.clone(), ended.clone()));
 
-            let worker = super::SearchWorker::new(i, &model, &incumbent, strategy, monitor);
+            let worker = super::SolverWorker::new(i, &model, &incumbent, strategy, monitor);
             workers.push(worker);
             counters.push((ran, started, ended));
         }
 
-        let pool = super::SearchPool::new(workers);
+        let pool = super::WorkerPool::new(workers);
         pool.run_scoped();
 
         for (idx, (ran, started, ended)) in counters.into_iter().enumerate() {
