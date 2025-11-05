@@ -35,6 +35,7 @@ pub struct StrategyContext<'e, 'm, 'p, T: Copy + Ord> {
     model: &'m SolverModel<'p, T>,
     shared_incumbent: &'e SharedIncumbent<'p, T>,
     monitor: &'e mut dyn SearchMonitor<T>,
+    state: &'e SolverState<'p, T>,
 }
 
 impl<'e, 'm, 'p, T: Copy + Ord> StrategyContext<'e, 'm, 'p, T> {
@@ -43,11 +44,13 @@ impl<'e, 'm, 'p, T: Copy + Ord> StrategyContext<'e, 'm, 'p, T> {
         model: &'m SolverModel<'p, T>,
         shared_incumbent: &'e SharedIncumbent<'p, T>,
         monitor: &'e mut dyn SearchMonitor<T>,
+        state: &'e SolverState<'p, T>,
     ) -> Self {
         Self {
             model,
             shared_incumbent,
             monitor,
+            state,
         }
     }
 
@@ -67,19 +70,19 @@ impl<'e, 'm, 'p, T: Copy + Ord> StrategyContext<'e, 'm, 'p, T> {
     }
 }
 
-pub trait Strategy<'p, T>
+pub trait Strategy<T>
 where
     T: Copy + Ord,
 {
     fn name(&self) -> &str;
 
-    fn run<'e, 'm>(
+    fn run<'p, 'e, 'm>(
         &mut self,
         context: &mut StrategyContext<'e, 'm, 'p, T>,
     ) -> Option<SolverState<'p, T>>;
 }
 
-impl<'a, 'p, T> std::fmt::Debug for dyn Strategy<'p, T> + 'a
+impl<'a, T> std::fmt::Debug for dyn Strategy<T> + 'a
 where
     T: Copy + Ord,
 {
@@ -88,7 +91,7 @@ where
     }
 }
 
-impl<'a, 'p, T> std::fmt::Display for dyn Strategy<'p, T> + 'a
+impl<'a, T> std::fmt::Display for dyn Strategy<T> + 'a
 where
     T: Copy + Ord,
 {
@@ -97,19 +100,18 @@ where
     }
 }
 
-pub struct ImprovingStrategy<'p, T, C, R>
+pub struct ImprovingStrategy<T, C, R>
 where
     T: Copy + Ord,
     R: rand::Rng,
 {
-    state: SolverState<'p, T>,
     evaluator: C,
     rng: R,
     decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send>,
     name: String,
 }
 
-impl<'p, T, C, R> ImprovingStrategy<'p, T, C, R>
+impl<T, C, R> ImprovingStrategy<T, C, R>
 where
     T: Copy + Ord,
     C: CostEvaluator<T> + Send + Sync,
@@ -117,14 +119,12 @@ where
 {
     #[inline]
     pub fn new(
-        initial_state: SolverState<'p, T>,
         evaluator: C,
         rng: R,
         decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send>,
     ) -> Self {
         let name = format!("ImprovingStrategy<{}>", decision_builder.name());
         Self {
-            state: initial_state,
             evaluator,
             rng,
             decision_builder,
@@ -133,7 +133,7 @@ where
     }
 
     #[inline(always)]
-    fn allocate_work_buffer(&self, context: &StrategyContext<'_, '_, 'p, T>) -> Vec<DecisionVar<T>>
+    fn allocate_work_buffer(&self, context: &StrategyContext<'_, '_, '_, T>) -> Vec<DecisionVar<T>>
     where
         T: CheckedAdd + CheckedSub,
     {
@@ -141,7 +141,7 @@ where
     }
 }
 
-impl<'p, T, C, R> Strategy<'p, T> for ImprovingStrategy<'p, T, C, R>
+impl<T, C, R> Strategy<T> for ImprovingStrategy<T, C, R>
 where
     T: SolveNumeric,
     C: CostEvaluator<T> + Send + Sync,
@@ -152,27 +152,28 @@ where
     }
 
     #[tracing::instrument(skip(self, context))]
-    fn run<'e, 'm>(
+    fn run<'e, 'm, 'p>(
         &mut self,
         context: &mut StrategyContext<'e, 'm, 'p, T>,
     ) -> Option<SolverState<'p, T>> {
-        let mut work_buf = self.allocate_work_buffer(context);
-
         context.monitor().on_search_start();
+
+        let mut work_buf = self.allocate_work_buffer(context);
+        let mut state = context.state.clone();
 
         loop {
             if context.monitor().should_terminate_search() {
                 break;
             }
 
-            let current_fitness = *self.state.fitness();
+            let current_fitness = *state.fitness();
             let model = context.model();
 
             let next_plan = {
                 let monitor = context.monitor();
                 let mut ctx = SearchContext::new(
                     model,
-                    &self.state,
+                    &state,
                     &self.evaluator,
                     &mut self.rng,
                     &mut work_buf,
@@ -184,8 +185,8 @@ where
 
             match next_plan {
                 Some(plan) => {
-                    self.state.apply_plan(plan);
-                    let _ = context.shared_incumbent().try_update(&self.state, model);
+                    state.apply_plan(plan);
+                    let _ = context.shared_incumbent().try_update(&state, model);
                 }
                 None => break,
             }
@@ -193,6 +194,48 @@ where
 
         context.monitor().on_search_end();
         None
+    }
+}
+
+pub trait StrategyFactory<T>: Send + Sync
+where
+    T: Copy + Ord,
+{
+    fn make<'p>(&self, model: &SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send>;
+}
+
+pub struct FnStrategyFactory<T, F>(F, std::marker::PhantomData<T>);
+
+impl<T, F> FnStrategyFactory<T, F>
+where
+    T: Copy + Ord,
+    F: for<'p> Fn(&SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send> + Send + Sync,
+{
+    #[inline]
+    pub fn new(func: F) -> Self {
+        Self(func, std::marker::PhantomData)
+    }
+}
+
+impl<T, F> StrategyFactory<T> for FnStrategyFactory<T, F>
+where
+    T: Copy + Ord + Send + Sync,
+    F: for<'p> Fn(&SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send> + Send + Sync,
+{
+    #[inline]
+    fn make<'p>(&self, model: &SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send> {
+        (self.0)(model)
+    }
+}
+
+impl<T, F> StrategyFactory<T> for F
+where
+    T: Copy + Ord,
+    F: for<'p> Fn(&SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send> + Send + Sync,
+{
+    #[inline]
+    fn make<'p>(&self, model: &SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send> {
+        (self)(model)
     }
 }
 
@@ -214,7 +257,7 @@ mod tests {
         state::{
             decisionvar::{DecisionVar, DecisionVarVec},
             fitness::Fitness,
-            solver_state::{SolverState, SolverStateView},
+            solver_state::SolverState,
             terminal::terminalocc::TerminalOccupancy,
         },
     };
@@ -411,15 +454,15 @@ mod tests {
     #[test]
     fn test_strategy_name_includes_builder_name() {
         let problem = problem_one_berth_two_flex();
-        let (_, state, eval) = make_model_state_eval(&problem);
+        let (_, _, eval) = make_model_state_eval(&problem);
 
         let rng = StdRng::seed_from_u64(0);
         let builder = Box::new(DummyBuilder::new(0, "DummyDB"));
 
-        let strategy = ImprovingStrategy::new(state, eval, rng, builder);
+        let strategy = ImprovingStrategy::new(eval, rng, builder);
         assert_eq!(strategy.name(), "ImprovingStrategy<DummyDB>");
         // Ensure trait object printing goes through our Strategy::name impl
-        let trait_obj: &dyn Strategy<'_, i64> = &strategy;
+        let trait_obj: &dyn Strategy<i64> = &strategy;
         assert_eq!(format!("{}", trait_obj), "ImprovingStrategy<DummyDB>");
     }
 
@@ -434,10 +477,10 @@ mod tests {
         // Builder will yield two plans (empty) then stop.
         let builder = Box::new(DummyBuilder::new(2, "Dummy"));
         let rng = StdRng::seed_from_u64(1);
-        let mut strategy = ImprovingStrategy::new(state, eval, rng, builder);
+        let mut strategy = ImprovingStrategy::new(eval, rng, builder);
 
         let mut monitor = CountingMonitor::new();
-        let mut ctx = StrategyContext::new(&model, &shared, &mut monitor);
+        let mut ctx = StrategyContext::new(&model, &shared, &mut monitor, &state);
 
         let res = strategy.run(&mut ctx);
         assert!(res.is_none(), "strategy returns None when search ends");
@@ -445,14 +488,6 @@ mod tests {
         // Lifecycle calls
         assert_eq!(monitor.started, 1, "search should start exactly once");
         assert_eq!(monitor.ended, 1, "search should end exactly once");
-
-        // Every Plan::empty() increments the state version.
-        // After two plans, version should be 2.
-        assert_eq!(
-            strategy.state.version().value(),
-            2,
-            "two plans should have been applied"
-        );
     }
 
     #[test]
@@ -464,11 +499,11 @@ mod tests {
         // Builder emits a generated event on each plan.
         let builder = Box::new(DummyBuilder::new(10, "Dummy").with_monitor());
         let rng = StdRng::seed_from_u64(2);
-        let mut strategy = ImprovingStrategy::new(state, eval, rng, builder);
+        let mut strategy = ImprovingStrategy::new(eval, rng, builder);
 
         // Monitor terminates after the first generated plan.
         let mut monitor = CountingMonitor::with_terminate_after(1);
-        let mut ctx = StrategyContext::new(&model, &shared, &mut monitor);
+        let mut ctx = StrategyContext::new(&model, &shared, &mut monitor, &state);
 
         let res = strategy.run(&mut ctx);
         assert!(res.is_none());
@@ -477,9 +512,6 @@ mod tests {
         assert_eq!(monitor.ended, 1);
         assert_eq!(monitor.generated, 1, "should generate exactly one plan");
         assert!(monitor.terminated, "monitor should request termination");
-
-        // Only one plan should have been applied due to early termination.
-        assert_eq!(strategy.state.version().value(), 1);
     }
 
     #[test]
@@ -490,14 +522,13 @@ mod tests {
 
         let builder = Box::new(DummyBuilder::new(0, "NoneBuilder")); // returns None immediately
         let rng = StdRng::seed_from_u64(3);
-        let mut strategy = ImprovingStrategy::new(state, eval, rng, builder);
+        let mut strategy = ImprovingStrategy::new(eval, rng, builder);
 
         let mut monitor = NullSearchMonitor::default();
-        let mut ctx = StrategyContext::new(&model, &shared, &mut monitor);
+        let mut ctx = StrategyContext::new(&model, &shared, &mut monitor, &state);
 
         let res = strategy.run(&mut ctx);
         assert!(res.is_none(), "no candidates => immediate end");
-        assert_eq!(strategy.state.version().value(), 0, "no plan applied");
     }
 
     // A DecisionBuilder that emits exactly one improving plan: assigns the first request and
@@ -633,10 +664,10 @@ mod tests {
 
         let builder = Box::new(ImproveOneBuilder::new("ImproveOne"));
         let rng = StdRng::seed_from_u64(123);
-        let mut strategy = ImprovingStrategy::new(state, eval, rng, builder);
+        let mut strategy = ImprovingStrategy::new(eval, rng, builder);
 
         let mut monitor = NullSearchMonitor::default();
-        let mut ctx = StrategyContext::new(&model, &shared, &mut monitor);
+        let mut ctx = StrategyContext::new(&model, &shared, &mut monitor, &state);
 
         // Before: unassigned = 2
         let before = shared.peek();
@@ -650,7 +681,6 @@ mod tests {
             after.unassigned_requests, 1,
             "incumbent should reflect improved unassigned"
         );
-        assert_eq!(strategy.state.version().value(), 1, "one plan applied");
     }
 
     #[test]
@@ -662,19 +692,12 @@ mod tests {
         // If builder is called, it would return a plan and increment version.
         let builder = Box::new(DummyBuilder::new(1, "WouldRun"));
         let rng = StdRng::seed_from_u64(999);
-        let mut strategy = ImprovingStrategy::new(state, eval, rng, builder);
+        let mut strategy = ImprovingStrategy::new(eval, rng, builder);
 
         let mut monitor = ImmediateTerminateMonitor::default();
-        let mut ctx = StrategyContext::new(&model, &shared, &mut monitor);
+        let mut ctx = StrategyContext::new(&model, &shared, &mut monitor, &state);
 
         let _ = strategy.run(&mut ctx);
-
-        // Since monitor requested termination immediately, no plan applied.
-        assert_eq!(
-            strategy.state.version().value(),
-            0,
-            "builder should not be called"
-        );
         assert_eq!(monitor.started, 1, "lifecycle start called");
         assert_eq!(monitor.ended, 1, "lifecycle end called");
     }
@@ -688,13 +711,11 @@ mod tests {
         // Builder asserts context invariants and returns None (no plan applied).
         let builder = Box::new(ContextAssertingBuilder::new(&model));
         let rng = StdRng::seed_from_u64(42);
-        let mut strategy = ImprovingStrategy::new(state, eval, rng, builder);
+        let mut strategy = ImprovingStrategy::new(eval, rng, builder);
 
         let mut monitor = NullSearchMonitor::default();
-        let mut ctx = StrategyContext::new(&model, &shared, &mut monitor);
+        let mut ctx = StrategyContext::new(&model, &shared, &mut monitor, &state);
 
         let _ = strategy.run(&mut ctx);
-
-        assert_eq!(strategy.state.version().value(), 0, "no plan applied");
     }
 }

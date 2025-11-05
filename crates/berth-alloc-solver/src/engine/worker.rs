@@ -26,6 +26,7 @@ use crate::{
     },
     model::solver_model::SolverModel,
     monitor::search_monitor::SearchMonitor,
+    state::solver_state::SolverState,
 };
 use std::thread;
 
@@ -36,7 +37,7 @@ where
     id: usize,
     model: &'m SolverModel<'p, T>,
     shared_incumbent: &'e SharedIncumbent<'p, T>,
-    strategy: Box<dyn Strategy<'p, T> + Send>,
+    strategy: Box<dyn Strategy<T> + Send>,
     monitor: Box<dyn SearchMonitor<T> + Send>,
 }
 
@@ -49,7 +50,7 @@ where
         id: usize,
         model: &'m SolverModel<'p, T>,
         shared_incumbent: &'e SharedIncumbent<'p, T>,
-        strategy: Box<dyn Strategy<'p, T> + Send>,
+        strategy: Box<dyn Strategy<T> + Send>,
         monitor: Box<dyn SearchMonitor<T> + Send>,
     ) -> Self {
         Self {
@@ -67,9 +68,13 @@ where
     }
 
     #[inline]
-    pub fn run(mut self) {
-        let mut ctx =
-            StrategyContext::new(self.model, self.shared_incumbent, self.monitor.as_mut());
+    pub fn run(mut self, initial_state: &SolverState<'p, T>) {
+        let mut ctx = StrategyContext::new(
+            self.model,
+            self.shared_incumbent,
+            self.monitor.as_mut(),
+            initial_state,
+        );
         let _ = self.strategy.run(&mut ctx);
     }
 }
@@ -91,10 +96,10 @@ where
     }
 
     #[inline]
-    pub fn run_scoped(self) {
+    pub fn run_scoped(self, initial_state: &SolverState<'p, T>) {
         thread::scope(|scope| {
             for w in self.workers {
-                scope.spawn(move || w.run());
+                scope.spawn(move || w.run(initial_state));
             }
         });
     }
@@ -240,12 +245,12 @@ mod tests {
         }
     }
 
-    impl<'p> Strategy<'p, i64> for DummyStrategy {
+    impl Strategy<i64> for DummyStrategy {
         fn name(&self) -> &str {
             self.name
         }
 
-        fn run<'e, 'm>(
+        fn run<'e, 'm, 'p>(
             &mut self,
             context: &mut StrategyContext<'e, 'm, 'p, i64>,
         ) -> Option<SolverState<'p, i64>> {
@@ -268,7 +273,8 @@ mod tests {
         let monitor = Box::new(CountingMonitor::new(started.clone(), ended.clone()));
 
         let worker = super::SolverWorker::new(7, &model, &incumbent, strategy, monitor);
-        worker.run();
+        let initial_state = incumbent.snapshot();
+        worker.run(&initial_state);
 
         assert_eq!(
             ran.load(Ordering::SeqCst),
@@ -322,7 +328,8 @@ mod tests {
         }
 
         let pool = super::WorkerPool::new(workers);
-        pool.run_scoped();
+        let initial_state = incumbent.snapshot();
+        pool.run_scoped(&initial_state);
 
         for (idx, (ran, started, ended)) in counters.into_iter().enumerate() {
             assert_eq!(

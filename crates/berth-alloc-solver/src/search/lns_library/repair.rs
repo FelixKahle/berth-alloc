@@ -24,15 +24,14 @@ use crate::{
     search::{
         eval::CostEvaluator,
         lns::{RepairProcedure, RepairProcedureContext, RuinOutcome},
+        planner::PlanBuilder,
     },
-    state::plan::Plan,
-    state::terminal::terminalocc::FreeBerth,
+    state::{plan::Plan, terminal::terminalocc::FreeBerth},
 };
 use berth_alloc_core::prelude::{Cost, TimeDelta, TimeInterval, TimePoint};
 use num_traits::{CheckedAdd, CheckedSub};
 use std::ops::Mul;
 
-// Local type aliases to reduce noise.
 type TP<T> = TimePoint<T>;
 type TD<T> = TimeDelta<T>;
 type FB<T> = FreeBerth<T>;
@@ -43,8 +42,9 @@ type Cand<T> = (Cost, TP<T>, FB<T>);
 ///
 /// We consider earliest-start placement within each free interval, and only keep
 /// intervals whose length is >= processing time for the request on that berth.
+#[inline]
 fn candidates_for_request<'a, 'b, 'c, 't, 'm, 'p, T, C>(
-    pb: &'a crate::search::planner::PlanBuilder<'b, 'c, 't, 'm, 'p, T, C>,
+    pb: &'a PlanBuilder<'b, 'c, 't, 'm, 'p, T, C>,
     req: RequestIndex,
 ) -> impl Iterator<Item = (TP<T>, FB<T>)> + 'a
 where

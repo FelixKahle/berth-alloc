@@ -19,9 +19,6 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use berth_alloc_core::prelude::Cost;
-use num_traits::{CheckedAdd, CheckedSub};
-
 use crate::{
     model::{index::RequestIndex, solver_model::SolverModel},
     search::{
@@ -33,6 +30,8 @@ use crate::{
         solver_state::{SolverState, SolverStateView},
     },
 };
+use berth_alloc_core::prelude::Cost;
+use num_traits::{CheckedAdd, CheckedSub};
 
 pub trait CoolingSchedule: Send {
     fn name(&self) -> &str;
@@ -143,6 +142,37 @@ pub struct EnergyParams {
     pub step: i64,
     pub t0: f64,
     pub allow_infeasible_uphill: bool,
+}
+
+impl std::fmt::Display for EnergyParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "EnergyParams {{ lambda_unassigned: {}, step: {}, t0: {}, allow_infeasible_uphill: {} }}",
+            self.lambda_unassigned, self.step, self.t0, self.allow_infeasible_uphill
+        )
+    }
+}
+
+impl EnergyParams {
+    #[inline]
+    pub fn with_default_lambda<T>(
+        model: &SolverModel<'_, T>,
+        step: i64,
+        t0: f64,
+        allow_infeasible_uphill: bool,
+    ) -> Self
+    where
+        T: Copy + Ord + CheckedAdd + CheckedSub + Into<Cost>,
+    {
+        let lambda = default_lambda_unassigned(model);
+        Self {
+            lambda_unassigned: lambda,
+            step,
+            t0,
+            allow_infeasible_uphill,
+        }
+    }
 }
 
 pub struct SimulatedAnnealing<T, C, S, R>

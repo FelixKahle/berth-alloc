@@ -18,16 +18,11 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use berth_alloc_model::{
-    prelude::{Problem, SolutionRef},
-    solution::SolutionError,
-};
-
 use crate::{
     core::numeric::SolveNumeric,
     engine::{
         shared_incumbent::SharedIncumbent,
-        strategy::Strategy,
+        strategy::{Strategy, StrategyFactory},
         worker::{SolverWorker, WorkerPool},
     },
     model::{err::SolverModelBuildError, solver_model::SolverModel},
@@ -38,6 +33,10 @@ use crate::{
     },
     opening::{greedy::GreedyOpening, opening_strategy::OpeningStrategy},
     state::solver_state::{SolverState, SolverStateView},
+};
+use berth_alloc_model::{
+    prelude::{Problem, SolutionRef},
+    solution::SolutionError,
 };
 
 #[derive(Copy, Clone, Debug)]
@@ -123,14 +122,13 @@ where
     }
 }
 
-/// Builder-style solver that orchestrates workers, strategies and engine-managed monitors.
 pub struct Solver<'p, T>
 where
     T: Copy + Ord,
 {
     initial_state: SolverState<'p, T>,
     config: SolverConfig,
-    strategies: Vec<Box<dyn Strategy<'p, T> + Send>>,
+    strategy_factories: Vec<Box<dyn StrategyFactory<T> + Send>>,
 }
 
 impl<'p, T> Solver<'p, T>
@@ -142,7 +140,7 @@ where
         Self {
             initial_state,
             config: SolverConfig::default(),
-            strategies: Vec::new(),
+            strategy_factories: Vec::new(),
         }
     }
 
@@ -152,35 +150,39 @@ where
         self
     }
 
-    /// Add a single strategy. One worker will be spawned per strategy.
     #[inline]
-    pub fn with_strategy(mut self, strategy: Box<dyn Strategy<'p, T> + Send>) -> Self {
-        self.strategies.push(strategy);
+    pub fn with_strategy(mut self, strategy: Box<dyn StrategyFactory<T> + Send>) -> Self {
+        self.strategy_factories.push(strategy);
         self
     }
 
-    /// Add multiple strategies.
     #[inline]
-    pub fn with_strategies(mut self, strategies: Vec<Box<dyn Strategy<'p, T> + Send>>) -> Self {
-        self.strategies.extend(strategies);
+    pub fn with_strategy_fn<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&SolverModel<T>) -> Box<dyn Strategy<T> + Send> + Send + Sync + 'static,
+    {
+        self.strategy_factories.push(Box::new(f));
         self
     }
 
-    /// Convenience: set the time limit.
+    #[inline]
+    pub fn with_strategies(mut self, strategies: Vec<Box<dyn StrategyFactory<T> + Send>>) -> Self {
+        self.strategy_factories.extend(strategies);
+        self
+    }
+
     #[inline]
     pub fn with_time_limit(mut self, time_limit: std::time::Duration) -> Self {
         self.config.time_limit = time_limit;
         self
     }
 
-    /// Convenience: set stagnation budget (terminate after this many generated without acceptance).
     #[inline]
     pub fn with_stagnation_budget(mut self, budget_without_accept: usize) -> Self {
         self.config.stagnation_generated_without_accept = Some(budget_without_accept);
         self
     }
 
-    /// Build an engine-managed composite monitor for a worker.
     fn build_engine_monitor(&self) -> Box<dyn SearchMonitor<T> + Send> {
         let mut comp: CompositeSearchMonitor<T> = CompositeSearchMonitor::new();
         comp.add_monitor(Box::new(TimeLimitMonitor::new(self.config.time_limit)));
@@ -197,34 +199,35 @@ where
     where
         T: std::fmt::Display + std::fmt::Debug,
     {
-        // Build model
         let model: SolverModel<'p, T> = SolverModel::try_from(problem)?;
+        let mut strategies: Vec<Box<dyn Strategy<T> + Send>> =
+            Vec::with_capacity(self.strategy_factories.len());
+        for factory in &self.strategy_factories {
+            strategies.push(factory.make(&model));
+        }
 
-        if self.strategies.is_empty() {
+        if strategies.is_empty() {
             return Err(EngineError::NoStrategies);
         }
 
+        // Install the state from the opening strategy as initial incumbent
         let incumbent = SharedIncumbent::new(self.initial_state.clone());
 
-        // Drain strategies and create workers
-        let strategies = std::mem::take(&mut self.strategies);
         let mut workers = Vec::with_capacity(strategies.len());
         for (i, strat) in strategies.into_iter().enumerate() {
             let mon = self.build_engine_monitor();
             let worker = SolverWorker::new(i, &model, &incumbent, strat, mon);
             workers.push(worker);
         }
+
         let pool = WorkerPool::new(workers);
-        pool.run_scoped();
+        pool.run_scoped(&self.initial_state);
 
         let best_state = incumbent.snapshot();
-
-        // If infeasible, do not try to convert to SolutionRef; return None gracefully.
         if !best_state.is_feasible() {
             return Ok(None);
         }
 
-        // Try to convert the best state into a SolutionRef
         match best_state.into_solution(&model) {
             Ok(sol) => Ok(Some(sol)),
             Err(err) => Err(EngineError::from(err)),
@@ -235,6 +238,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::strategy::FnStrategyFactory;
     use crate::model::index::{BerthIndex, RequestIndex};
     use crate::search::eval::CostEvaluator;
     use crate::{
@@ -316,11 +320,11 @@ mod tests {
     // No changes to the incumbent; ensures infeasible -> Ok(None).
     #[derive(Debug)]
     struct IdleStrategy;
-    impl<'p> Strategy<'p, i64> for IdleStrategy {
+    impl Strategy<i64> for IdleStrategy {
         fn name(&self) -> &str {
             "IdleStrategy"
         }
-        fn run<'e, 'm>(
+        fn run<'e, 'm, 'p>(
             &mut self,
             ctx: &mut StrategyContext<'e, 'm, 'p, i64>,
         ) -> Option<SolverState<'p, i64>> {
@@ -333,11 +337,11 @@ mod tests {
     // Assign only one request (partial feasible) -> still infeasible; Ok(None).
     #[derive(Debug)]
     struct AssignOne;
-    impl<'p> Strategy<'p, i64> for AssignOne {
+    impl Strategy<i64> for AssignOne {
         fn name(&self) -> &str {
             "AssignOne"
         }
-        fn run<'e, 'm>(
+        fn run<'e, 'm, 'p>(
             &mut self,
             ctx: &mut StrategyContext<'e, 'm, 'p, i64>,
         ) -> Option<SolverState<'p, i64>> {
@@ -361,11 +365,11 @@ mod tests {
     // Assign both requests; produce a feasible incumbent with consistent fitness.
     #[derive(Debug)]
     struct AssignAll;
-    impl<'p> Strategy<'p, i64> for AssignAll {
+    impl Strategy<i64> for AssignAll {
         fn name(&self) -> &str {
             "AssignAll"
         }
-        fn run<'e, 'm>(
+        fn run<'e, 'm, 'p>(
             &mut self,
             ctx: &mut StrategyContext<'e, 'm, 'p, i64>,
         ) -> Option<SolverState<'p, i64>> {
@@ -419,7 +423,9 @@ mod tests {
 
         let mut solver = super::Solver::new(initial_state)
             .with_time_limit(Duration::from_millis(20))
-            .with_strategy(Box::new(IdleStrategy));
+            .with_strategy(Box::new(FnStrategyFactory::new(|_model| {
+                Box::new(IdleStrategy)
+            })));
 
         let res = solver.solve(&problem).expect("no engine error");
         assert!(res.is_none(), "infeasible incumbent should yield None");
@@ -433,7 +439,9 @@ mod tests {
         let mut solver = super::Solver::new(initial_state)
             .with_time_limit(Duration::from_millis(20))
             .with_stagnation_budget(1000)
-            .with_strategy(Box::new(AssignOne));
+            .with_strategy(Box::new(FnStrategyFactory::new(|_model| {
+                Box::new(AssignOne)
+            })));
 
         let res = solver.solve(&problem).expect("no engine error");
         assert!(res.is_none(), "still infeasible (one unassigned) => None");
@@ -447,7 +455,9 @@ mod tests {
         let mut solver = super::Solver::new(initial_state)
             .with_time_limit(Duration::from_millis(50))
             .with_stagnation_budget(1000)
-            .with_strategy(Box::new(AssignAll));
+            .with_strategy(Box::new(FnStrategyFactory::new(|_model| {
+                Box::new(AssignAll)
+            })));
 
         let res = solver.solve(&problem).expect("solver should not error");
         assert!(

@@ -23,10 +23,12 @@ use crate::{
     model::{
         index::{BerthIndex, RequestIndex},
         neighborhood::ProximityMap,
+        solver_model::SolverModel,
         view::NeighborView,
     },
-    search::neighboors::{NeighborFn, NeighborFnSlice},
+    search::neighboors::{Neighboors, NeighborFn, NeighborFnSlice},
 };
+use num_traits::{CheckedAdd, CheckedSub};
 use std::sync::Arc;
 
 #[inline]
@@ -68,6 +70,29 @@ pub fn per_berth<'a>(pm: &'a ProximityMap, bi: BerthIndex) -> NeighborFn<'a> {
     let f: Arc<NeighborFnSlice<'a>> =
         Arc::new(move |seed: RequestIndex| view.lists().outgoing_for(seed).unwrap_or(&[]));
     NeighborFn::Slice(f)
+}
+
+#[inline]
+pub fn build_neighbors_from_model<'a, T>(model: &'a SolverModel<'a, T>) -> Neighboors<'a>
+where
+    T: Copy + Ord + CheckedAdd + CheckedSub,
+{
+    let pm = model.proximity_map();
+
+    let mut per_berth_vec = Vec::with_capacity(model.berths().len());
+    for b in 0..model.berths().len() {
+        per_berth_vec.push(per_berth(pm, BerthIndex::new(b)));
+    }
+
+    Neighboors::new(
+        generic(pm),
+        same_berth(pm),
+        overlap_time_window(pm),
+        direct_competitors(pm),
+        any(pm),
+        from_view(pm.all()),
+        per_berth_vec,
+    )
 }
 
 #[cfg(test)]
@@ -281,6 +306,170 @@ mod tests {
                 assert_eq!(got1, exp1);
             }
             _ => panic!("per_berth should be Slice variant"),
+        }
+    }
+
+    #[test]
+    fn test_build_neighbors_from_model_wiring_matches_pm() {
+        let model = build_model();
+        let pm = model.proximity_map();
+        let im = model.index_manager();
+
+        let neigh = build_neighbors_from_model(&model);
+
+        let r0 = im.request_index(rid(10)).unwrap();
+        let r1 = im.request_index(rid(20)).unwrap();
+        let r2 = im.request_index(rid(30)).unwrap();
+
+        // neighbors (union = any_feasibleish)
+        match neigh.neighbors {
+            NeighborFn::Slice(f) => {
+                assert_eq!(
+                    f(r0),
+                    pm.any_feasibleish().lists().outgoing_for(r0).unwrap_or(&[])
+                );
+                assert_eq!(
+                    f(r1),
+                    pm.any_feasibleish().lists().outgoing_for(r1).unwrap_or(&[])
+                );
+                assert_eq!(
+                    f(r2),
+                    pm.any_feasibleish().lists().outgoing_for(r2).unwrap_or(&[])
+                );
+            }
+            NeighborFn::Vec(f) => {
+                assert_eq!(
+                    f(r0),
+                    pm.any_feasibleish()
+                        .lists()
+                        .outgoing_for(r0)
+                        .unwrap_or(&[])
+                        .to_vec()
+                );
+                assert_eq!(
+                    f(r1),
+                    pm.any_feasibleish()
+                        .lists()
+                        .outgoing_for(r1)
+                        .unwrap_or(&[])
+                        .to_vec()
+                );
+                assert_eq!(
+                    f(r2),
+                    pm.any_feasibleish()
+                        .lists()
+                        .outgoing_for(r2)
+                        .unwrap_or(&[])
+                        .to_vec()
+                );
+            }
+        }
+
+        // all
+        match neigh.all {
+            NeighborFn::Slice(f) => {
+                assert_eq!(f(r0), pm.all().lists().outgoing_for(r0).unwrap_or(&[]));
+                assert_eq!(f(r1), pm.all().lists().outgoing_for(r1).unwrap_or(&[]));
+                assert_eq!(f(r2), pm.all().lists().outgoing_for(r2).unwrap_or(&[]));
+                // out-of-bounds should be empty
+                assert!(f(RequestIndex::new(999)).is_empty());
+            }
+            NeighborFn::Vec(f) => {
+                assert_eq!(
+                    f(r0),
+                    pm.all().lists().outgoing_for(r0).unwrap_or(&[]).to_vec()
+                );
+                assert_eq!(
+                    f(r1),
+                    pm.all().lists().outgoing_for(r1).unwrap_or(&[]).to_vec()
+                );
+                assert_eq!(
+                    f(r2),
+                    pm.all().lists().outgoing_for(r2).unwrap_or(&[]).to_vec()
+                );
+                assert!(f(RequestIndex::new(999)).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_neighbors_from_model_per_berth_len_and_rows() {
+        let model = build_model();
+        let pm = model.proximity_map();
+        let im = model.index_manager();
+
+        let neigh = build_neighbors_from_model(&model);
+
+        // length matches number of berths
+        assert_eq!(neigh.per_berth.len(), model.berths().len());
+
+        let b1 = im.berth_index(bid(1)).unwrap();
+        let b2 = im.berth_index(bid(2)).unwrap();
+
+        let r0 = im.request_index(rid(10)).unwrap();
+        let r1 = im.request_index(rid(20)).unwrap();
+
+        // B1 rows
+        match &neigh.per_berth[b1.get()] {
+            NeighborFn::Slice(f) => {
+                assert_eq!(
+                    f(r0),
+                    pm.per_berth()[b1.get()]
+                        .lists()
+                        .outgoing_for(r0)
+                        .unwrap_or(&[])
+                );
+                assert_eq!(
+                    f(r1),
+                    pm.per_berth()[b1.get()]
+                        .lists()
+                        .outgoing_for(r1)
+                        .unwrap_or(&[])
+                );
+                assert!(f(RequestIndex::new(999)).is_empty());
+            }
+            NeighborFn::Vec(f) => {
+                assert_eq!(
+                    f(r0),
+                    pm.per_berth()[b1.get()]
+                        .lists()
+                        .outgoing_for(r0)
+                        .unwrap_or(&[])
+                        .to_vec()
+                );
+                assert_eq!(
+                    f(r1),
+                    pm.per_berth()[b1.get()]
+                        .lists()
+                        .outgoing_for(r1)
+                        .unwrap_or(&[])
+                        .to_vec()
+                );
+                assert!(f(RequestIndex::new(999)).is_empty());
+            }
+        }
+
+        // B2 rows
+        match &neigh.per_berth[b2.get()] {
+            NeighborFn::Slice(f) => {
+                assert_eq!(
+                    f(r1),
+                    pm.per_berth()[b2.get()]
+                        .lists()
+                        .outgoing_for(r1)
+                        .unwrap_or(&[])
+                );
+            }
+            NeighborFn::Vec(f) => {
+                assert_eq!(
+                    f(r1),
+                    pm.per_berth()[b2.get()]
+                        .lists()
+                        .outgoing_for(r1)
+                        .unwrap_or(&[])
+                        .to_vec()
+                );
+            }
         }
     }
 }

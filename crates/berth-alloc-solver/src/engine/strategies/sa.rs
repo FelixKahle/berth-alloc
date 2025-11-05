@@ -18,10 +18,3 @@
 // LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-pub mod neighbors;
-pub mod shared_incumbent;
-pub mod solver;
-pub mod strategies;
-pub mod strategy;
-pub mod worker;
