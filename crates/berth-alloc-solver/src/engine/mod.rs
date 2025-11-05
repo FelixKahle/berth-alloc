@@ -21,4 +21,5 @@
 
 pub mod neighbors;
 pub mod shared_incumbent;
+pub mod strategy;
 pub mod worker;
