@@ -31,20 +31,19 @@ use crate::{
     state::{decisionvar::DecisionVar, plan::Plan},
 };
 
-#[derive(Debug)]
-pub struct MetaheuristicLocalSearch<T, C, M, R>
+pub struct MetaheuristicLocalSearch<'n, T, C, M, R>
 where
     T: Copy + Ord,
     C: CostEvaluator<T>,
     M: Metaheuristic<T, C>,
     R: rand::Rng,
 {
-    local_search_operator: Box<dyn LocalSearchOperator<T, C, R>>,
+    local_search_operator: Box<dyn LocalSearchOperator<T, C, R> + 'n>,
     filter_stack: NeighborhoodFilterStack<T>,
     metaheuristic: M,
 }
 
-impl<T, C, M, R> MetaheuristicLocalSearch<T, C, M, R>
+impl<'n, T, C, M, R> MetaheuristicLocalSearch<'n, T, C, M, R>
 where
     T: Copy + Ord,
     C: CostEvaluator<T>,
@@ -52,11 +51,11 @@ where
     R: rand::Rng,
 {
     pub fn new(
-        local_search_operator: Box<dyn LocalSearchOperator<T, C, R>>,
+        local_search_operator: Box<dyn LocalSearchOperator<T, C, R> + 'n>,
         filter_stack: NeighborhoodFilterStack<T>,
         metaheuristic: M,
-    ) -> MetaheuristicLocalSearch<T, C, M, R> {
-        MetaheuristicLocalSearch {
+    ) -> Self {
+        Self {
             local_search_operator,
             filter_stack,
             metaheuristic,
@@ -64,7 +63,7 @@ where
     }
 }
 
-impl<T, C, M, R> DecisionBuilder<T, C, R> for MetaheuristicLocalSearch<T, C, M, R>
+impl<'n, T, C, M, R> DecisionBuilder<T, C, R> for MetaheuristicLocalSearch<'n, T, C, M, R>
 where
     T: Copy + Ord + std::fmt::Debug,
     C: CostEvaluator<T>,

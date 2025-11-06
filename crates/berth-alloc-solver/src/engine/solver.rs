@@ -159,7 +159,10 @@ where
     #[inline]
     pub fn with_strategy_fn<F>(mut self, f: F) -> Self
     where
-        F: Fn(&SolverModel<T>) -> Box<dyn Strategy<T> + Send> + Send + Sync + 'static,
+        F: for<'m, 'pm> Fn(&'m SolverModel<'pm, T>) -> Box<dyn Strategy<T> + Send + 'm>
+            + Send
+            + Sync
+            + 'static,
     {
         self.strategy_factories.push(Box::new(f));
         self

@@ -100,18 +100,18 @@ where
     }
 }
 
-pub struct ImprovingStrategy<T, C, R>
+pub struct ImprovingStrategy<'n, T, C, R>
 where
     T: Copy + Ord,
     R: rand::Rng,
 {
     evaluator: C,
     rng: R,
-    decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send>,
+    decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send + 'n>,
     name: String,
 }
 
-impl<T, C, R> ImprovingStrategy<T, C, R>
+impl<'n, T, C, R> ImprovingStrategy<'n, T, C, R>
 where
     T: Copy + Ord,
     C: CostEvaluator<T> + Send + Sync,
@@ -121,7 +121,7 @@ where
     pub fn new(
         evaluator: C,
         rng: R,
-        decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send>,
+        decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send + 'n>,
     ) -> Self {
         let name = format!("ImprovingStrategy<{}>", decision_builder.name());
         Self {
@@ -141,7 +141,7 @@ where
     }
 }
 
-impl<T, C, R> Strategy<T> for ImprovingStrategy<T, C, R>
+impl<'n, T, C, R> Strategy<T> for ImprovingStrategy<'n, T, C, R>
 where
     T: SolveNumeric,
     C: CostEvaluator<T> + Send + Sync,
@@ -201,7 +201,7 @@ pub trait StrategyFactory<T>: Send + Sync
 where
     T: Copy + Ord,
 {
-    fn make<'p>(&self, model: &SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send>;
+    fn make<'m, 'p>(&self, model: &'m SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send + 'm>;
 }
 
 pub struct FnStrategyFactory<T, F>(F, std::marker::PhantomData<T>);
@@ -209,7 +209,7 @@ pub struct FnStrategyFactory<T, F>(F, std::marker::PhantomData<T>);
 impl<T, F> FnStrategyFactory<T, F>
 where
     T: Copy + Ord,
-    F: for<'p> Fn(&SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send> + Send + Sync,
+    F: for<'m, 'p> Fn(&'m SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send + 'm> + Send + Sync,
 {
     #[inline]
     pub fn new(func: F) -> Self {
@@ -220,10 +220,10 @@ where
 impl<T, F> StrategyFactory<T> for FnStrategyFactory<T, F>
 where
     T: Copy + Ord + Send + Sync,
-    F: for<'p> Fn(&SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send> + Send + Sync,
+    F: for<'m, 'p> Fn(&'m SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send + 'm> + Send + Sync,
 {
     #[inline]
-    fn make<'p>(&self, model: &SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send> {
+    fn make<'m, 'p>(&self, model: &'m SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send + 'm> {
         (self.0)(model)
     }
 }
@@ -231,10 +231,10 @@ where
 impl<T, F> StrategyFactory<T> for F
 where
     T: Copy + Ord,
-    F: for<'p> Fn(&SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send> + Send + Sync,
+    F: for<'m, 'p> Fn(&'m SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send + 'm> + Send + Sync,
 {
     #[inline]
-    fn make<'p>(&self, model: &SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send> {
+    fn make<'m, 'p>(&self, model: &'m SolverModel<'p, T>) -> Box<dyn Strategy<T> + Send + 'm> {
         (self)(model)
     }
 }

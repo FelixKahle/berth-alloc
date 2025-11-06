@@ -176,6 +176,11 @@ impl<T> NeighborhoodFilterStack<T> {
     }
 
     #[inline]
+    pub fn empty() -> Self {
+        Self::new()
+    }
+
+    #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             filters: Vec::with_capacity(capacity),

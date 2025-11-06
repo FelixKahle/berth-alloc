@@ -73,7 +73,7 @@ pub fn per_berth<'a>(pm: &'a ProximityMap, bi: BerthIndex) -> NeighborFn<'a> {
 }
 
 #[inline]
-pub fn build_neighbors_from_model<'a, T>(model: &'a SolverModel<'a, T>) -> Neighboors<'a>
+pub fn build_neighbors_from_model<'a, 'p, T>(model: &'a SolverModel<'p, T>) -> Neighboors<'a>
 where
     T: Copy + Ord + CheckedAdd + CheckedSub,
 {

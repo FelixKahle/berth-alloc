@@ -37,7 +37,7 @@ where
     id: usize,
     model: &'m SolverModel<'p, T>,
     shared_incumbent: &'e SharedIncumbent<'p, T>,
-    strategy: Box<dyn Strategy<T> + Send>,
+    strategy: Box<dyn Strategy<T> + Send + 'm>,
     monitor: Box<dyn SearchMonitor<T> + Send>,
 }
 
@@ -50,7 +50,7 @@ where
         id: usize,
         model: &'m SolverModel<'p, T>,
         shared_incumbent: &'e SharedIncumbent<'p, T>,
-        strategy: Box<dyn Strategy<T> + Send>,
+        strategy: Box<dyn Strategy<T> + Send + 'm>,
         monitor: Box<dyn SearchMonitor<T> + Send>,
     ) -> Self {
         Self {
