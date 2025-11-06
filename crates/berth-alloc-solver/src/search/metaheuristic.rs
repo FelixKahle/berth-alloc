@@ -25,31 +25,36 @@ use crate::{
     state::{plan::Plan, solver_state::SolverState},
 };
 
-pub struct MetaheuristicContext<'e, 's, 'm, 'p, T, C>
+pub struct MetaheuristicContext<'e, 'r, 's, 'm, 'p, T, C, R>
 where
     T: Copy + Ord,
     C: CostEvaluator<T>,
+    R: rand::Rng,
 {
     pub model: &'m SolverModel<'p, T>,
     pub solver_state: &'s SolverState<'p, T>,
     pub evaluator: &'e C,
+    pub rng: &'r mut R,
 }
 
-impl<'e, 's, 'm, 'p, T, C> MetaheuristicContext<'e, 's, 'm, 'p, T, C>
+impl<'e, 'r, 's, 'm, 'p, T, C, R> MetaheuristicContext<'e, 'r, 's, 'm, 'p, T, C, R>
 where
     T: Copy + Ord,
     C: CostEvaluator<T>,
+    R: rand::Rng,
 {
     #[inline]
     pub fn new(
         model: &'m SolverModel<'p, T>,
         solver_state: &'s SolverState<'p, T>,
         evaluator: &'e C,
-    ) -> MetaheuristicContext<'e, 's, 'm, 'p, T, C> {
-        MetaheuristicContext {
+        rng: &'r mut R,
+    ) -> Self {
+        Self {
             model,
             solver_state,
             evaluator,
+            rng,
         }
     }
 
@@ -69,39 +74,42 @@ where
     }
 }
 
-pub trait Metaheuristic<T, C>: Send
+pub trait Metaheuristic<T, C, R>: Send
 where
     T: Copy + Ord,
     C: CostEvaluator<T>,
+    R: rand::Rng,
 {
     fn name(&self) -> &str;
 
-    fn local_optimum_reached<'e, 's, 'm, 'p>(
+    fn local_optimum_reached<'e, 'r, 's, 'm, 'p>(
         &mut self,
-        context: MetaheuristicContext<'e, 's, 'm, 'p, T, C>,
+        context: MetaheuristicContext<'e, 'r, 's, 'm, 'p, T, C, R>,
     ) -> bool;
 
-    fn accept_plan<'e, 's, 'm, 'p>(
+    fn accept_plan<'e, 'r, 's, 'm, 'p>(
         &mut self,
-        context: MetaheuristicContext<'e, 's, 'm, 'p, T, C>,
+        context: MetaheuristicContext<'e, 'r, 's, 'm, 'p, T, C, R>,
         plan: &Plan<'p, T>,
     ) -> bool;
 }
 
-impl<T, C> std::fmt::Debug for dyn Metaheuristic<T, C>
+impl<T, C, R> std::fmt::Debug for dyn Metaheuristic<T, C, R>
 where
     T: Copy + Ord,
     C: CostEvaluator<T>,
+    R: rand::Rng,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Metaheuristic({})", self.name())
     }
 }
 
-impl<T, C> std::fmt::Display for dyn Metaheuristic<T, C>
+impl<T, C, R> std::fmt::Display for dyn Metaheuristic<T, C, R>
 where
     T: Copy + Ord,
     C: CostEvaluator<T>,
+    R: rand::Rng,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Metaheuristic({})", self.name())
@@ -207,22 +215,40 @@ mod tests {
         }
     }
 
-    impl Metaheuristic<i64, DefaultCostEvaluator> for DummyMetaheuristic {
+    impl Metaheuristic<i64, DefaultCostEvaluator, ChaCha8Rng> for DummyMetaheuristic {
         fn name(&self) -> &str {
             self.name
         }
 
-        fn local_optimum_reached<'e, 's, 'm, 'p>(
+        fn local_optimum_reached<'e, 'r, 's, 'm, 'p>(
             &mut self,
-            _context: MetaheuristicContext<'e, 's, 'm, 'p, i64, DefaultCostEvaluator>,
+            _context: MetaheuristicContext<
+                'e,
+                'r,
+                's,
+                'm,
+                'p,
+                i64,
+                DefaultCostEvaluator,
+                ChaCha8Rng,
+            >,
         ) -> bool {
             self.calls_local += 1;
             self.ret_local
         }
 
-        fn accept_plan<'e, 's, 'm, 'p>(
+        fn accept_plan<'e, 'r, 's, 'm, 'p>(
             &mut self,
-            _context: MetaheuristicContext<'e, 's, 'm, 'p, i64, DefaultCostEvaluator>,
+            _context: MetaheuristicContext<
+                'e,
+                'r,
+                's,
+                'm,
+                'p,
+                i64,
+                DefaultCostEvaluator,
+                ChaCha8Rng,
+            >,
             _plan: &Plan<'p, i64>,
         ) -> bool {
             self.calls_accept += 1;
@@ -235,7 +261,8 @@ mod tests {
         let problem = make_basic_problem();
         let (model, state, eval) = make_model_state_eval(&problem);
 
-        let ctx = MetaheuristicContext::new(&model, &state, &eval);
+        let mut rng = ChaCha8Rng::seed_from_u64(123);
+        let ctx = MetaheuristicContext::new(&model, &state, &eval, &mut rng);
 
         assert!(std::ptr::eq(ctx.model(), &model));
         assert!(std::ptr::eq(ctx.solver_state(), &state));
@@ -249,7 +276,8 @@ mod tests {
 
         let mut mh = DummyMetaheuristic::new("DummyMH", true, false);
 
-        let ctx = MetaheuristicContext::new(&model, &state, &eval);
+        let mut rng = ChaCha8Rng::seed_from_u64(123);
+        let ctx = MetaheuristicContext::new(&model, &state, &eval, &mut rng);
         let reached = mh.local_optimum_reached(ctx);
         assert!(reached, "should return configured local optimum value");
 
@@ -260,7 +288,8 @@ mod tests {
             FitnessDelta::zero(),
         );
 
-        let ctx2 = MetaheuristicContext::new(&model, &state, &eval);
+        let mut rng = ChaCha8Rng::seed_from_u64(123);
+        let ctx2 = MetaheuristicContext::new(&model, &state, &eval, &mut rng);
         let accepted = mh.accept_plan(ctx2, &plan);
         assert!(!accepted, "should return configured accept value");
 
@@ -280,8 +309,9 @@ mod tests {
         // Not used by MetaheuristicContext, but ensure typical rng is available together
         let _sample = rng.next_u32();
 
+        let mut rng = ChaCha8Rng::seed_from_u64(123);
         // Just ensure MetaheuristicContext compiles and works in presence of rng.
-        let ctx = MetaheuristicContext::new(&model, &state, &eval);
+        let ctx = MetaheuristicContext::new(&model, &state, &eval, &mut rng);
         let mut mh = DummyMetaheuristic::new("RngCoexist", false, true);
         let _ = mh.local_optimum_reached(ctx);
     }

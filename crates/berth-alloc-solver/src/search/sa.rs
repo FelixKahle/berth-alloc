@@ -184,8 +184,7 @@ where
 {
     params: EnergyParams,
     cooling: S,
-    rng: R,
-    _phantom: std::marker::PhantomData<(T, C)>,
+    _phantom: std::marker::PhantomData<(T, C, R)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -203,11 +202,10 @@ where
     R: rand::Rng,
 {
     #[inline]
-    pub fn new(params: EnergyParams, cooling: S, random: R) -> Self {
+    pub fn new(params: EnergyParams, cooling: S) -> Self {
         Self {
             params,
             cooling,
-            rng: random,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -240,7 +238,7 @@ where
     }
 }
 
-impl<T, C, S, R> Metaheuristic<T, C> for SimulatedAnnealing<T, C, S, R>
+impl<T, C, S, R> Metaheuristic<T, C, R> for SimulatedAnnealing<T, C, S, R>
 where
     T: Copy + Ord + Send,
     C: CostEvaluator<T>,
@@ -253,17 +251,17 @@ where
     }
 
     #[inline]
-    fn local_optimum_reached<'e, 's, 'm, 'p>(
+    fn local_optimum_reached<'e, 'r, 's, 'm, 'p>(
         &mut self,
-        _ctx: MetaheuristicContext<'e, 's, 'm, 'p, T, C>,
+        _ctx: MetaheuristicContext<'e, 'r, 's, 'm, 'p, T, C, R>,
     ) -> bool {
         self.cooling.on_evaluation();
         self.cooling.temperature() > 0.0
     }
 
-    fn accept_plan<'e, 's, 'm, 'p>(
+    fn accept_plan<'e, 'r, 's, 'm, 'p>(
         &mut self,
-        ctx: MetaheuristicContext<'e, 's, 'm, 'p, T, C>,
+        ctx: MetaheuristicContext<'e, 'r, 's, 'm, 'p, T, C, R>,
         plan: &Plan<'p, T>,
     ) -> bool {
         let components = self.energy_components(ctx.model(), ctx.solver_state(), plan);
@@ -289,7 +287,7 @@ where
             return false;
         }
 
-        let u = self.rng.random::<f64>().clamp(1e-12, 1.0 - 1e-12);
+        let u = ctx.rng.random::<f64>().clamp(1e-12, 1.0 - 1e-12);
         let log2u = u.ln() / std::f64::consts::LN_2;
         let bound = (components.e as f64) - (self.params.step as f64) - log2u * t;
         let accept = (components.e2 as f64) <= bound;
@@ -316,6 +314,7 @@ mod tests {
     use berth_alloc_core::prelude::{TimeInterval, TimePoint};
     use berth_alloc_model::prelude::{Berth, BerthIdentifier, Problem};
     use rand::{SeedableRng, rngs::StdRng};
+    use rand_chacha::ChaCha8Rng;
 
     type T = i64;
 
@@ -352,15 +351,17 @@ mod tests {
         crate::state::solver_state::SolverState::new(dv, terminal, fitness)
     }
 
-    fn ctx<'e, 's, 'm, 'p, C>(
+    fn ctx<'e, 'r, 's, 'm, 'p, C, R>(
         model: &'m crate::model::solver_model::SolverModel<'p, T>,
         state: &'s crate::state::solver_state::SolverState<'p, T>,
         evaluator: &'e C,
-    ) -> MetaheuristicContext<'e, 's, 'm, 'p, T, C>
+        rand: &'r mut R,
+    ) -> MetaheuristicContext<'e, 'r, 's, 'm, 'p, T, C, R>
     where
         C: CostEvaluator<T>,
+        R: rand::Rng,
     {
-        MetaheuristicContext::new(model, state, evaluator)
+        MetaheuristicContext::new(model, state, evaluator, rand)
     }
 
     // Helper to build SA with explicit IterReciprocalCooling and RNG.
@@ -369,7 +370,6 @@ mod tests {
         step: i64,
         t0: f64,
         allow_inf: bool,
-        rng: R,
     ) -> SimulatedAnnealing<T, DefaultCostEvaluator, IterReciprocalCooling, R> {
         let params = EnergyParams {
             lambda_unassigned,
@@ -377,14 +377,13 @@ mod tests {
             t0,
             allow_infeasible_uphill: allow_inf,
         };
-        SimulatedAnnealing::new(params, IterReciprocalCooling::new(t0), rng)
+        SimulatedAnnealing::new(params, IterReciprocalCooling::new(t0))
     }
 
     #[test]
     fn test_metaheuristic_display_and_debug_use_name() {
-        let rng = StdRng::seed_from_u64(123);
-        let mh = sa(1, 1, 10.0, false, rng);
-        let obj: &dyn Metaheuristic<T, DefaultCostEvaluator> = &mh;
+        let mh = sa(1, 1, 10.0, false);
+        let obj: &dyn Metaheuristic<T, DefaultCostEvaluator, ChaCha8Rng> = &mh;
 
         assert_eq!(format!("{}", obj), "Metaheuristic(SimulatedAnnealing)");
         assert_eq!(format!("{:?}", obj), "Metaheuristic(SimulatedAnnealing)");
@@ -392,8 +391,8 @@ mod tests {
 
     #[test]
     fn test_local_optimum_reached_increments_iter_and_reports_active_when_t_positive() {
-        let rng = StdRng::seed_from_u64(42);
-        let mut mh = sa(1, 1, 8.0, false, rng);
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut mh = sa(1, 1, 8.0, false);
 
         // Build any valid context; it isn't used in local_optimum_reached
         let problem = make_minimal_problem();
@@ -402,19 +401,19 @@ mod tests {
         let evaluator = DefaultCostEvaluator;
 
         // First call increments iter from 0 to 1, making temperature t0/1 = 8.0 > 0
-        let active = mh.local_optimum_reached(ctx(&model, &state, &evaluator));
+        let active = mh.local_optimum_reached(ctx(&model, &state, &evaluator, &mut rng));
         assert!(active, "SA should be active when t>0 after first increment");
 
         for _ in 0..10 {
-            let ok = mh.local_optimum_reached(ctx(&model, &state, &evaluator));
+            let ok = mh.local_optimum_reached(ctx(&model, &state, &evaluator, &mut rng));
             assert!(ok);
         }
     }
 
     #[test]
     fn test_accept_plan_rejects_if_unassigned_increases_and_not_allowed() {
-        let rng = StdRng::seed_from_u64(7);
-        let mut mh = sa(10, 1, 0.0, false, rng); // T=0 initially
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut mh = sa(10, 1, 0.0, false); // T=0 initially
 
         let problem = make_minimal_problem();
         let model = crate::model::solver_model::SolverModel::try_from(&problem).expect("ok model");
@@ -426,7 +425,7 @@ mod tests {
             FitnessDelta::new(0, 1), // delta_unassigned > 0
         );
 
-        let accepted = mh.accept_plan(ctx(&model, &state, &evaluator), &plan);
+        let accepted = mh.accept_plan(ctx(&model, &state, &evaluator, &mut rng), &plan);
         assert!(
             !accepted,
             "should reject when infeasible uphill is not allowed"
@@ -435,8 +434,8 @@ mod tests {
 
     #[test]
     fn test_accept_plan_accepts_if_unassigned_decreases() {
-        let rng = StdRng::seed_from_u64(8);
-        let mut mh = sa(10, 1, 0.0, false, rng);
+        let mut rng = StdRng::seed_from_u64(8);
+        let mut mh = sa(10, 1, 0.0, false);
 
         let problem = make_minimal_problem();
         let model = crate::model::solver_model::SolverModel::try_from(&problem).expect("ok model");
@@ -448,7 +447,7 @@ mod tests {
             FitnessDelta::new(0, -1), // strictly reduces unassigned
         );
 
-        let accepted = mh.accept_plan(ctx(&model, &state, &evaluator), &plan);
+        let accepted = mh.accept_plan(ctx(&model, &state, &evaluator, &mut rng), &plan);
         assert!(
             accepted,
             "should accept immediately when unassigned decreases"
@@ -457,9 +456,9 @@ mod tests {
 
     #[test]
     fn test_accept_plan_accepts_on_deterministic_step_improvement() {
-        let rng = StdRng::seed_from_u64(9);
+        let mut rng = StdRng::seed_from_u64(9);
         // step=5 means we need e2 <= e - 5 for deterministic accept
-        let mut mh = sa(1, 5, 0.0, true, rng);
+        let mut mh = sa(1, 5, 0.0, true);
 
         // current: cost=100, unassigned=0 => e=100
         // plan: delta_cost = -10 => e2 = 90, which is <= 95 == 100 - step -> accept
@@ -473,7 +472,7 @@ mod tests {
             FitnessDelta::new(-10, 0),
         );
 
-        let accepted = mh.accept_plan(ctx(&model, &state, &evaluator), &plan);
+        let accepted = mh.accept_plan(ctx(&model, &state, &evaluator, &mut rng), &plan);
         assert!(
             accepted,
             "should deterministically accept when e2 <= e - step"
@@ -482,9 +481,9 @@ mod tests {
 
     #[test]
     fn test_accept_plan_rejects_when_t_zero_and_not_step_improvement() {
-        let rng = StdRng::seed_from_u64(10);
+        let mut rng = StdRng::seed_from_u64(10);
         // t0=0 => temperature() == 0 initially, so no probabilistic acceptance
-        let mut mh = sa(1, 2, 0.0, true, rng);
+        let mut mh = sa(1, 2, 0.0, true);
 
         // current: e = cost=100
         // plan: +1 cost => e2=101, not <= e - step (=98), not delta_unassigned<0 -> reject when T=0
@@ -494,15 +493,15 @@ mod tests {
         let evaluator = DefaultCostEvaluator;
         let plan = Plan::new_delta(Vec::new(), TerminalDelta::empty(), FitnessDelta::new(1, 0));
 
-        let accepted = mh.accept_plan(ctx(&model, &state, &evaluator), &plan);
+        let accepted = mh.accept_plan(ctx(&model, &state, &evaluator, &mut rng), &plan);
         assert!(!accepted, "with T=0 and no step improvement, must reject");
     }
 
     #[test]
     fn test_allow_infeasible_uphill_does_not_force_accept() {
-        let rng = StdRng::seed_from_u64(11);
+        let mut rng = StdRng::seed_from_u64(11);
         // allow_infeasible_uphill = true, but T=0 and not a deterministic improvement => reject
-        let mut mh = sa(10, 100, 0.0, true, rng);
+        let mut mh = sa(10, 100, 0.0, true);
 
         let problem = make_minimal_problem();
         let model = crate::model::solver_model::SolverModel::try_from(&problem).expect("ok model");
@@ -514,7 +513,7 @@ mod tests {
             FitnessDelta::new(0, 1), // delta_unassigned > 0, uphill infeasible
         );
 
-        let accepted = mh.accept_plan(ctx(&model, &state, &evaluator), &plan);
+        let accepted = mh.accept_plan(ctx(&model, &state, &evaluator, &mut rng), &plan);
         assert!(
             !accepted,
             "allow_infeasible_uphill only bypasses the early reject; it doesn't force acceptance"

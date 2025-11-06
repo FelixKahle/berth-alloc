@@ -35,7 +35,7 @@ pub struct MetaheuristicLocalSearch<'n, T, C, M, R>
 where
     T: Copy + Ord,
     C: CostEvaluator<T>,
-    M: Metaheuristic<T, C>,
+    M: Metaheuristic<T, C, R>,
     R: rand::Rng,
 {
     local_search_operator: Box<dyn LocalSearchOperator<T, C, R> + 'n>,
@@ -47,7 +47,7 @@ impl<'n, T, C, M, R> MetaheuristicLocalSearch<'n, T, C, M, R>
 where
     T: Copy + Ord,
     C: CostEvaluator<T>,
-    M: Metaheuristic<T, C>,
+    M: Metaheuristic<T, C, R>,
     R: rand::Rng,
 {
     pub fn new(
@@ -67,7 +67,7 @@ impl<'n, T, C, M, R> DecisionBuilder<T, C, R> for MetaheuristicLocalSearch<'n, T
 where
     T: Copy + Ord + std::fmt::Debug,
     C: CostEvaluator<T>,
-    M: Metaheuristic<T, C>,
+    M: Metaheuristic<T, C, R>,
     R: rand::Rng,
 {
     fn name(&self) -> &str {
@@ -90,24 +90,34 @@ where
             return None;
         }
 
-        let mut op_ctx = OperatorContext::new(model, state, evaluator, rng, work_buf);
-
         if !self
             .metaheuristic
-            .local_optimum_reached(MetaheuristicContext::new(model, state, evaluator))
+            .local_optimum_reached(MetaheuristicContext::new(model, state, evaluator, rng))
         {
             return None;
         }
 
+        // Reset + synchronize with a short-lived OperatorContext
         self.local_search_operator.reset();
-        self.local_search_operator.synchronize(&mut op_ctx);
+        {
+            let mut op_ctx = OperatorContext::new(model, state, evaluator, rng, work_buf);
+            self.local_search_operator.synchronize(&mut op_ctx);
+        }
 
         loop {
             if monitor.should_terminate_search() {
                 return None;
             }
 
-            while let Some(plan) = self.local_search_operator.make_next_neighbor(&mut op_ctx) {
+            // Pull neighbors by constructing a short-lived OperatorContext each time
+            loop {
+                let plan_opt = {
+                    let mut op_ctx = OperatorContext::new(model, state, evaluator, rng, work_buf);
+                    self.local_search_operator.make_next_neighbor(&mut op_ctx)
+                };
+
+                let Some(plan) = plan_opt else { break };
+
                 monitor.on_plan_generated(&plan);
 
                 if !self
@@ -121,7 +131,7 @@ where
                     continue;
                 }
 
-                let mh_ctx = MetaheuristicContext::new(model, state, evaluator);
+                let mh_ctx = MetaheuristicContext::new(model, state, evaluator, rng);
                 if self.metaheuristic.accept_plan(mh_ctx, &plan) {
                     monitor.on_plan_accepted(&plan);
                     return Some(plan);
@@ -136,13 +146,17 @@ where
 
             let cont = self
                 .metaheuristic
-                .local_optimum_reached(MetaheuristicContext::new(model, state, evaluator));
+                .local_optimum_reached(MetaheuristicContext::new(model, state, evaluator, rng));
             if !cont {
                 return None;
             }
 
+            // reset + synchronize for the next round (again short-lived OperatorContext)
             self.local_search_operator.reset();
-            self.local_search_operator.synchronize(&mut op_ctx);
+            {
+                let mut op_ctx = OperatorContext::new(model, state, evaluator, rng, work_buf);
+                self.local_search_operator.synchronize(&mut op_ctx);
+            }
         }
     }
 }
@@ -173,6 +187,7 @@ mod tests {
     };
     use rand::RngCore;
     use rand::{SeedableRng, rngs::StdRng};
+    use rand_chacha::ChaCha8Rng;
     use std::collections::BTreeMap;
 
     // Helpers to build a tiny problem/state similar to lns.rs tests
@@ -247,19 +262,19 @@ mod tests {
 
     // Returns false immediately; next() must return None without touching operator.
     struct AlwaysStopMH;
-    impl Metaheuristic<i64, DefaultCostEvaluator> for AlwaysStopMH {
+    impl<R: rand::Rng> Metaheuristic<i64, DefaultCostEvaluator, R> for AlwaysStopMH {
         fn name(&self) -> &str {
             "AlwaysStopMH"
         }
         fn local_optimum_reached(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, '_, i64, DefaultCostEvaluator, R>,
         ) -> bool {
             false
         }
         fn accept_plan(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, '_, i64, DefaultCostEvaluator, R>,
             _plan: &Plan<'_, i64>,
         ) -> bool {
             false
@@ -275,19 +290,19 @@ mod tests {
             Self { accepted: false }
         }
     }
-    impl Metaheuristic<i64, DefaultCostEvaluator> for AcceptFirstMH {
+    impl Metaheuristic<i64, DefaultCostEvaluator, ChaCha8Rng> for AcceptFirstMH {
         fn name(&self) -> &str {
             "AcceptFirstMH"
         }
         fn local_optimum_reached(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, '_, i64, DefaultCostEvaluator, ChaCha8Rng>,
         ) -> bool {
             true
         }
         fn accept_plan(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, '_, i64, DefaultCostEvaluator, ChaCha8Rng>,
             _plan: &Plan<'_, i64>,
         ) -> bool {
             if !self.accepted {
@@ -308,19 +323,19 @@ mod tests {
             Self { seen: 0 }
         }
     }
-    impl Metaheuristic<i64, DefaultCostEvaluator> for AcceptSecondMH {
+    impl Metaheuristic<i64, DefaultCostEvaluator, ChaCha8Rng> for AcceptSecondMH {
         fn name(&self) -> &str {
             "AcceptSecondMH"
         }
         fn local_optimum_reached(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, '_, i64, DefaultCostEvaluator, ChaCha8Rng>,
         ) -> bool {
             true
         }
         fn accept_plan(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, '_, i64, DefaultCostEvaluator, ChaCha8Rng>,
             _plan: &Plan<'_, i64>,
         ) -> bool {
             self.seen += 1;
@@ -337,13 +352,13 @@ mod tests {
             Self { budget: 2 } // initial + one continue
         }
     }
-    impl Metaheuristic<i64, DefaultCostEvaluator> for ContinueOnceAcceptAlwaysMH {
+    impl Metaheuristic<i64, DefaultCostEvaluator, ChaCha8Rng> for ContinueOnceAcceptAlwaysMH {
         fn name(&self) -> &str {
             "ContinueOnceAcceptAlwaysMH"
         }
         fn local_optimum_reached(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, '_, i64, DefaultCostEvaluator, ChaCha8Rng>,
         ) -> bool {
             if self.budget == 0 {
                 return false;
@@ -353,7 +368,7 @@ mod tests {
         }
         fn accept_plan(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, '_, i64, DefaultCostEvaluator, ChaCha8Rng>,
             _plan: &Plan<'_, i64>,
         ) -> bool {
             true
@@ -369,13 +384,13 @@ mod tests {
             Self { budget }
         }
     }
-    impl Metaheuristic<i64, DefaultCostEvaluator> for ContinueWithBudgetMH {
+    impl Metaheuristic<i64, DefaultCostEvaluator, ChaCha8Rng> for ContinueWithBudgetMH {
         fn name(&self) -> &str {
             "ContinueWithBudgetMH"
         }
         fn local_optimum_reached(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, '_, i64, DefaultCostEvaluator, ChaCha8Rng>,
         ) -> bool {
             if self.budget == 0 {
                 return false;
@@ -385,7 +400,7 @@ mod tests {
         }
         fn accept_plan(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, '_, i64, DefaultCostEvaluator, ChaCha8Rng>,
             _plan: &Plan<'_, i64>,
         ) -> bool {
             false
@@ -422,7 +437,7 @@ mod tests {
         }
     }
 
-    impl LocalSearchOperator<i64, DefaultCostEvaluator, StdRng> for CountingOperator {
+    impl<R: rand::Rng> LocalSearchOperator<i64, DefaultCostEvaluator, R> for CountingOperator {
         fn name(&self) -> &str {
             "CountingOperator"
         }
@@ -438,10 +453,9 @@ mod tests {
 
         fn synchronize<'b, 'r, 'c, 's, 'm, 'p>(
             &mut self,
-            _ctx: &mut OperatorContext<'b, 'r, 'c, 's, 'm, 'p, i64, DefaultCostEvaluator, StdRng>,
+            _ctx: &mut OperatorContext<'b, 'r, 'c, 's, 'm, 'p, i64, DefaultCostEvaluator, R>,
         ) {
             self.sync_calls += 1;
-            // First synchronize establishes round 0; subsequent ones advance after a reset.
             if self.round == usize::MAX {
                 self.round = 0;
                 self.advance_round_on_sync = false;
@@ -454,7 +468,7 @@ mod tests {
 
         fn make_next_neighbor<'b, 'r, 'c, 's, 'm, 'p>(
             &mut self,
-            _ctx: &mut OperatorContext<'b, 'r, 'c, 's, 'm, 'p, i64, DefaultCostEvaluator, StdRng>,
+            _ctx: &mut OperatorContext<'b, 'r, 'c, 's, 'm, 'p, i64, DefaultCostEvaluator, R>,
         ) -> Option<Plan<'p, i64>> {
             self.make_calls += 1;
             if self.yielded_in_round < self.current_quota() {
@@ -474,7 +488,7 @@ mod tests {
     fn test_next_returns_none_when_metaheuristic_not_ready() {
         let problem = problem_one_berth_two_flex();
         let (model, state, eval) = make_state(&problem);
-        let mut rng = StdRng::seed_from_u64(0);
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
         let mut search_monitor = NullSearchMonitor::default();
@@ -503,7 +517,7 @@ mod tests {
     fn test_next_returns_first_accepted_neighbor() {
         let problem = problem_one_berth_two_flex();
         let (model, state, eval) = make_state(&problem);
-        let mut rng = StdRng::seed_from_u64(1);
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
         let mut search_monitor = NullSearchMonitor::default();
@@ -534,7 +548,7 @@ mod tests {
     fn test_next_accepts_second_neighbor() {
         let problem = problem_one_berth_two_flex();
         let (model, state, eval) = make_state(&problem);
-        let mut rng = StdRng::seed_from_u64(11);
+        let mut rng = ChaCha8Rng::seed_from_u64(11);
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
         let mut search_monitor = NullSearchMonitor::default();
@@ -566,7 +580,7 @@ mod tests {
     fn test_next_retries_after_reset_when_first_round_has_no_neighbors() {
         let problem = problem_one_berth_two_flex();
         let (model, state, eval) = make_state(&problem);
-        let mut rng = StdRng::seed_from_u64(2);
+        let mut rng = ChaCha8Rng::seed_from_u64(2);
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
         let mut search_monitor = NullSearchMonitor::default();
@@ -601,13 +615,13 @@ mod tests {
             Self { budget: 1 } // allow initial gate, then stop
         }
     }
-    impl Metaheuristic<i64, DefaultCostEvaluator> for RejectAllMH {
+    impl<R: rand::Rng> Metaheuristic<i64, DefaultCostEvaluator, R> for RejectAllMH {
         fn name(&self) -> &str {
             "RejectAllMH"
         }
         fn local_optimum_reached(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, '_, i64, DefaultCostEvaluator, R>,
         ) -> bool {
             if self.budget == 0 {
                 return false;
@@ -617,7 +631,7 @@ mod tests {
         }
         fn accept_plan(
             &mut self,
-            _ctx: MetaheuristicContext<'_, '_, '_, '_, i64, DefaultCostEvaluator>,
+            _ctx: MetaheuristicContext<'_, '_, '_, '_, '_, i64, DefaultCostEvaluator, R>,
             _plan: &Plan<'_, i64>,
         ) -> bool {
             false
@@ -657,7 +671,7 @@ mod tests {
     fn test_next_multiple_empty_rounds_then_none() {
         let problem = problem_one_berth_two_flex();
         let (model, state, eval) = make_state(&problem);
-        let mut rng = StdRng::seed_from_u64(12);
+        let mut rng = ChaCha8Rng::seed_from_u64(12);
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
         let mut search_monitor = NullSearchMonitor::default();
@@ -727,7 +741,7 @@ mod tests {
         let mh = AcceptFirstMH::new();
 
         let search = MetaheuristicLocalSearch::new(op, filter_stack, mh);
-        let ls: &dyn DecisionBuilder<i64, DefaultCostEvaluator, StdRng> = &search;
+        let ls: &dyn DecisionBuilder<i64, DefaultCostEvaluator, ChaCha8Rng> = &search;
 
         assert_eq!(
             format!("{:?}", ls),
@@ -810,7 +824,7 @@ mod tests {
     fn test_monitor_counts_first_accept() {
         let problem = problem_one_berth_two_flex();
         let (model, state, eval) = make_state(&problem);
-        let mut rng = StdRng::seed_from_u64(42);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
 
@@ -845,7 +859,7 @@ mod tests {
     fn test_monitor_counts_second_accept() {
         let problem = problem_one_berth_two_flex();
         let (model, state, eval) = make_state(&problem);
-        let mut rng = StdRng::seed_from_u64(43);
+        let mut rng = ChaCha8Rng::seed_from_u64(43);
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
 
@@ -912,7 +926,7 @@ mod tests {
     fn test_monitor_respects_termination_after_n_generated() {
         let problem = problem_one_berth_two_flex();
         let (model, state, eval) = make_state(&problem);
-        let mut rng = StdRng::seed_from_u64(45);
+        let mut rng = ChaCha8Rng::seed_from_u64(45);
         let mut work_buf = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
         let current_fitness = *state.fitness();
 

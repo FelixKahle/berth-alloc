@@ -115,11 +115,9 @@ where
         config.initial_temperature,
         config.allow_infeasible_uphill,
     );
-    let sa_rng = ChaCha8Rng::seed_from_u64(config.seed.wrapping_add(1));
     let mh = SimulatedAnnealing::new(
         energy_params,
         IterReciprocalCooling::new(config.initial_temperature),
-        sa_rng,
     );
 
     // Decision builder = Local search + filters + metaheuristic
