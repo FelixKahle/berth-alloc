@@ -32,7 +32,7 @@ use crate::{
         time::TimeLimitMonitor,
     },
     opening::{greedy::GreedyOpening, opening_strategy::OpeningStrategy},
-    state::solver_state::{SolverState, SolverStateView},
+    state::solver_state::SolverStateView,
 };
 use berth_alloc_model::{
     prelude::{Problem, SolutionRef},
@@ -122,23 +122,31 @@ where
     }
 }
 
-pub struct Solver<'p, T>
+pub struct Solver<T>
 where
     T: Copy + Ord,
 {
-    initial_state: SolverState<'p, T>,
     config: SolverConfig,
     strategy_factories: Vec<Box<dyn StrategyFactory<T> + Send>>,
 }
 
-impl<'p, T> Solver<'p, T>
+impl<T> Default for Solver<T>
 where
     T: SolveNumeric,
 {
     #[inline]
-    pub fn new(initial_state: SolverState<'p, T>) -> Self {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Solver<T>
+where
+    T: SolveNumeric,
+{
+    #[inline]
+    pub fn new() -> Self {
         Self {
-            initial_state,
             config: SolverConfig::default(),
             strategy_factories: Vec::new(),
         }
@@ -195,7 +203,7 @@ where
         Box::new(comp)
     }
 
-    pub fn solve(
+    pub fn solve<'p>(
         &mut self,
         problem: &'p Problem<T>,
     ) -> Result<Option<SolutionRef<'p, T>>, EngineError<T, GreedyOpening<T>>>
@@ -213,8 +221,13 @@ where
             return Err(EngineError::NoStrategies);
         }
 
+        let opening_strategy = GreedyOpening::new();
+        let initial_state = opening_strategy
+            .build(&model)
+            .map_err(EngineError::OpeningFailed)?;
+
         // Install the state from the opening strategy as initial incumbent
-        let incumbent = SharedIncumbent::new(self.initial_state.clone());
+        let incumbent = SharedIncumbent::new(initial_state.clone());
 
         let mut workers = Vec::with_capacity(strategies.len());
         for (i, strat) in strategies.into_iter().enumerate() {
@@ -224,7 +237,7 @@ where
         }
 
         let pool = WorkerPool::new(workers);
-        pool.run_scoped(&self.initial_state);
+        pool.run_scoped(&initial_state);
 
         let best_state = incumbent.snapshot();
         if !best_state.is_feasible() {
@@ -242,20 +255,11 @@ where
 mod tests {
     use super::*;
     use crate::engine::strategy::FnStrategyFactory;
-    use crate::model::index::{BerthIndex, RequestIndex};
+    use crate::model::index::BerthIndex;
     use crate::search::eval::CostEvaluator;
     use crate::{
         engine::strategy::StrategyContext,
-        model::solver_model::SolverModel,
-        search::eval::DefaultCostEvaluator,
-        state::{
-            decisionvar::{DecisionVar, DecisionVarVec},
-            fitness::FitnessDelta,
-            plan::{DecisionVarPatch, Plan},
-            solver_state::SolverState,
-            terminal::delta::TerminalDelta,
-            terminal::terminalocc::TerminalOccupancy,
-        },
+        state::{decisionvar::DecisionVar, solver_state::SolverState},
     };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
     use berth_alloc_model::{
@@ -307,64 +311,6 @@ mod tests {
         builder.build().expect("valid problem")
     }
 
-    fn make_initial_state_for(
-        problem: &Problem<i64>,
-    ) -> (SolverModel<'_, i64>, SolverState<'_, i64>) {
-        let model = SolverModel::try_from(problem).expect("model ok");
-        let term = TerminalOccupancy::new(problem.berths().iter());
-        let dvars = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let fitness = DefaultCostEvaluator.eval_fitness(&model, &dvars);
-        let state = SolverState::new(DecisionVarVec::from(dvars), term, fitness);
-        (model, state)
-    }
-
-    // Strategies for tests
-
-    // No changes to the incumbent; ensures infeasible -> Ok(None).
-    #[derive(Debug)]
-    struct IdleStrategy;
-    impl Strategy<i64> for IdleStrategy {
-        fn name(&self) -> &str {
-            "IdleStrategy"
-        }
-        fn run<'e, 'm, 'p>(
-            &mut self,
-            ctx: &mut StrategyContext<'e, 'm, 'p, i64>,
-        ) -> Option<SolverState<'p, i64>> {
-            ctx.monitor().on_search_start();
-            ctx.monitor().on_search_end();
-            None
-        }
-    }
-
-    // Assign only one request (partial feasible) -> still infeasible; Ok(None).
-    #[derive(Debug)]
-    struct AssignOne;
-    impl Strategy<i64> for AssignOne {
-        fn name(&self) -> &str {
-            "AssignOne"
-        }
-        fn run<'e, 'm, 'p>(
-            &mut self,
-            ctx: &mut StrategyContext<'e, 'm, 'p, i64>,
-        ) -> Option<SolverState<'p, i64>> {
-            ctx.monitor().on_search_start();
-
-            let mut cand = ctx.shared_incumbent().snapshot();
-            let patch = DecisionVarPatch::new(
-                RequestIndex::new(0),
-                DecisionVar::assigned(BerthIndex::new(0), tp(0)),
-            );
-            // FitnessDelta: +1 cost (keep > 0 in debug), -1 unassigned
-            let delta = FitnessDelta::new(1, -1);
-            cand.apply_plan(Plan::new_delta(vec![patch], TerminalDelta::empty(), delta));
-            let _ = ctx.shared_incumbent().try_update(&cand, ctx.model());
-
-            ctx.monitor().on_search_end();
-            None
-        }
-    }
-
     // Assign both requests; produce a feasible incumbent with consistent fitness.
     #[derive(Debug)]
     struct AssignAll;
@@ -408,10 +354,8 @@ mod tests {
     #[test]
     fn test_solve_no_strategies_returns_error() {
         let problem = make_problem();
-        let (_model, initial_state) = make_initial_state_for(&problem);
 
-        let mut solver =
-            super::Solver::new(initial_state).with_time_limit(Duration::from_millis(20));
+        let mut solver = super::Solver::new().with_time_limit(Duration::from_millis(20));
 
         match solver.solve(&problem) {
             Err(super::EngineError::NoStrategies) => {}
@@ -420,42 +364,10 @@ mod tests {
     }
 
     #[test]
-    fn test_solve_idle_returns_none_when_infeasible() {
-        let problem = make_problem();
-        let (_model, initial_state) = make_initial_state_for(&problem);
-
-        let mut solver = super::Solver::new(initial_state)
-            .with_time_limit(Duration::from_millis(20))
-            .with_strategy(Box::new(FnStrategyFactory::new(|_model| {
-                Box::new(IdleStrategy)
-            })));
-
-        let res = solver.solve(&problem).expect("no engine error");
-        assert!(res.is_none(), "infeasible incumbent should yield None");
-    }
-
-    #[test]
-    fn test_solve_partial_assignment_returns_none() {
-        let problem = make_problem();
-        let (_model, initial_state) = make_initial_state_for(&problem);
-
-        let mut solver = super::Solver::new(initial_state)
-            .with_time_limit(Duration::from_millis(20))
-            .with_stagnation_budget(1000)
-            .with_strategy(Box::new(FnStrategyFactory::new(|_model| {
-                Box::new(AssignOne)
-            })));
-
-        let res = solver.solve(&problem).expect("no engine error");
-        assert!(res.is_none(), "still infeasible (one unassigned) => None");
-    }
-
-    #[test]
     fn test_solve_full_assignment_returns_solution() {
         let problem = make_problem();
-        let (_model, initial_state) = make_initial_state_for(&problem);
 
-        let mut solver = super::Solver::new(initial_state)
+        let mut solver = super::Solver::new()
             .with_time_limit(Duration::from_millis(50))
             .with_stagnation_budget(1000)
             .with_strategy(Box::new(FnStrategyFactory::new(|_model| {

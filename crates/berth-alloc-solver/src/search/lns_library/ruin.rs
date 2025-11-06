@@ -23,7 +23,8 @@ use crate::{
     model::index::{BerthIndex, RequestIndex},
     search::{
         eval::CostEvaluator,
-        lns::{RuinOutcome, RuinProcedure, RuinProcedureContext}, neighboors::NeighborFn,
+        lns::{RuinOutcome, RuinProcedure, RuinProcedureContext},
+        neighboors::NeighborFn,
     },
     state::{
         decisionvar::{Decision, DecisionVar},
@@ -415,7 +416,6 @@ where
     T: Copy + Ord + std::fmt::Debug + CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     C: CostEvaluator<T>,
     R: rand::Rng,
-    'a: 'static, // The NeighborFn must be 'static to be held in a 'static struct
 {
     fn name(&self) -> &str {
         "RelatedRuin"

@@ -411,17 +411,17 @@ where
     }
 }
 
-pub struct RandomRuinRepairPerturbPair<T, C, R>
+pub struct RandomRuinRepairPerturbPair<'n, T, C, R>
 where
     T: Copy + Ord + std::fmt::Debug,
     C: CostEvaluator<T>,
     R: rand::Rng,
 {
-    ruin: Vec<Box<dyn RuinProcedure<T, C, R>>>,
-    repair: Vec<Box<dyn RepairProcedure<T, C, R>>>,
+    ruin: Vec<Box<dyn RuinProcedure<T, C, R> + 'n>>,
+    repair: Vec<Box<dyn RepairProcedure<T, C, R> + 'n>>,
 }
 
-impl<T, C, R> RandomRuinRepairPerturbPair<T, C, R>
+impl<'n, T, C, R> RandomRuinRepairPerturbPair<'n, T, C, R>
 where
     T: Copy + Ord + std::fmt::Debug,
     C: CostEvaluator<T>,
@@ -429,8 +429,8 @@ where
 {
     #[inline]
     pub fn new(
-        ruin: Vec<Box<dyn RuinProcedure<T, C, R>>>,
-        repair: Vec<Box<dyn RepairProcedure<T, C, R>>>,
+        ruin: Vec<Box<dyn RuinProcedure<T, C, R> + 'n>>,
+        repair: Vec<Box<dyn RepairProcedure<T, C, R> + 'n>>,
     ) -> Self {
         Self { ruin, repair }
     }
@@ -455,7 +455,7 @@ where
     }
 }
 
-impl<T, C, R> PerturbationProcedure<T, C, R> for RandomRuinRepairPerturbPair<T, C, R>
+impl<'n, T, C, R> PerturbationProcedure<T, C, R> for RandomRuinRepairPerturbPair<'n, T, C, R>
 where
     T: Copy + Ord + std::fmt::Debug + CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
     C: CostEvaluator<T>,

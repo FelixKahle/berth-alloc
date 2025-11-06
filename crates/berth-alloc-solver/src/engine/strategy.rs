@@ -68,6 +68,11 @@ impl<'e, 'm, 'p, T: Copy + Ord> StrategyContext<'e, 'm, 'p, T> {
     pub fn monitor(&mut self) -> &mut dyn SearchMonitor<T> {
         self.monitor
     }
+
+    #[inline]
+    pub fn state(&self) -> &'e SolverState<'p, T> {
+        self.state
+    }
 }
 
 pub trait Strategy<T>
@@ -193,7 +198,7 @@ where
         }
 
         context.monitor().on_search_end();
-        None
+        Some(state)
     }
 }
 
@@ -483,7 +488,10 @@ mod tests {
         let mut ctx = StrategyContext::new(&model, &shared, &mut monitor, &state);
 
         let res = strategy.run(&mut ctx);
-        assert!(res.is_none(), "strategy returns None when search ends");
+        assert!(
+            res.is_some(),
+            "strategy returns final state when search ends"
+        );
 
         // Lifecycle calls
         assert_eq!(monitor.started, 1, "search should start exactly once");
@@ -506,7 +514,7 @@ mod tests {
         let mut ctx = StrategyContext::new(&model, &shared, &mut monitor, &state);
 
         let res = strategy.run(&mut ctx);
-        assert!(res.is_none());
+        assert!(res.is_some());
 
         assert_eq!(monitor.started, 1);
         assert_eq!(monitor.ended, 1);
@@ -528,7 +536,14 @@ mod tests {
         let mut ctx = StrategyContext::new(&model, &shared, &mut monitor, &state);
 
         let res = strategy.run(&mut ctx);
-        assert!(res.is_none(), "no candidates => immediate end");
+        assert!(
+            res.is_some(),
+            "no candidates => immediate end yields final state"
+        );
+
+        // For a no-op builder the returned state should equal the input state.
+        let final_state = res.unwrap();
+        assert_eq!(final_state, state);
     }
 
     // A DecisionBuilder that emits exactly one improving plan: assigns the first request and
