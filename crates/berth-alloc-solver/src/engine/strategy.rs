@@ -75,7 +75,7 @@ impl<'e, 'm, 'p, T: Copy + Ord> StrategyContext<'e, 'm, 'p, T> {
     }
 }
 
-pub trait Strategy<T>
+pub trait Strategy<T>: Send
 where
     T: Copy + Ord,
 {
@@ -114,6 +114,33 @@ where
     rng: R,
     decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send + 'n>,
     name: String,
+}
+
+impl<'n, T, C, R> std::fmt::Debug for ImprovingStrategy<'n, T, C, R>
+where
+    T: Copy + Ord,
+    C: CostEvaluator<T> + Send + Sync,
+    R: rand::Rng + Send,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ImprovingStrategy {{ name: {}, decision_builder: {} }}",
+            self.name,
+            self.decision_builder.name()
+        )
+    }
+}
+
+impl<'n, T, C, R> std::fmt::Display for ImprovingStrategy<'n, T, C, R>
+where
+    T: Copy + Ord,
+    C: CostEvaluator<T> + Send + Sync,
+    R: rand::Rng + Send,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name)
+    }
 }
 
 impl<'n, T, C, R> ImprovingStrategy<'n, T, C, R>

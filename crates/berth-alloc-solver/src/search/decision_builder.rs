@@ -113,7 +113,7 @@ where
     ) -> Option<Plan<'p, T>>;
 }
 
-impl<T, C, R> std::fmt::Debug for dyn DecisionBuilder<T, C, R>
+impl<'a, T, C, R> std::fmt::Debug for dyn DecisionBuilder<T, C, R> + 'a
 where
     T: Copy + Ord,
     C: CostEvaluator<T>,
@@ -124,7 +124,7 @@ where
     }
 }
 
-impl<T, C, R> std::fmt::Display for dyn DecisionBuilder<T, C, R>
+impl<'a, T, C, R> std::fmt::Display for dyn DecisionBuilder<T, C, R> + 'a
 where
     T: Copy + Ord,
     C: CostEvaluator<T>,
