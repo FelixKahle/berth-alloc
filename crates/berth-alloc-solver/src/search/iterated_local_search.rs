@@ -134,6 +134,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct PerturbationDecisionBuilder<'n, T, C, R>
 where
     T: Copy + Ord,
@@ -186,14 +187,10 @@ where
         &mut self,
         context: &mut SearchContext<'b, 'sm, 'c, 's, 'm, 'p, T, C, R>,
     ) -> Option<Plan<'p, T>> {
-        // Respect external termination requests from the monitor before doing any work.
         if context.monitor.should_terminate_search() {
             return None;
         }
 
-        // Build a perturbation (ruin + repair or other) using the LNS-style context.
-        // We allocate a short-lived PerturbationProcedureContext that borrows the
-        // same RNG/work buffer; this keeps lifetimes narrow and avoids aliasing.
         let plan = {
             let mut pp_ctx = PerturbationProcedureContext::new(
                 context.model,
@@ -205,15 +202,8 @@ where
             self.perturbation_procedure.perturb(&mut pp_ctx)
         };
 
-        // Notify monitor that we generatederated a candidate (even if empty).
         context.monitor.on_plan_generated(&plan);
 
-        if context.monitor.should_terminate_search() {
-            return None;
-        }
-
-        // Empty plans or non-improving plans may be rejected by the acceptance criterion.
-        // Construct an acceptance context (re-borrow RNG mutably after perturbation finished).
         let accepted = {
             let mut ac_ctx = IlsAcceptanceCriterionContext::new(
                 context.model,
@@ -221,7 +211,6 @@ where
                 context.evaluator,
                 context.rng,
             );
-            // If the plan is empty we can short-circuit; otherwise defer to criterion.
             !plan.is_empty() && self.acceptance_criterion.accept(&mut ac_ctx, &plan)
         };
 

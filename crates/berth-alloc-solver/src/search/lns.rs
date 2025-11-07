@@ -161,7 +161,7 @@ where
     ) -> RuinOutcome<'p, T>;
 }
 
-impl<T, C, R> std::fmt::Debug for dyn RuinProcedure<T, C, R>
+impl<'a, T, C, R> std::fmt::Debug for dyn RuinProcedure<T, C, R> + 'a
 where
     T: Copy + Ord + std::fmt::Debug,
     C: CostEvaluator<T>,
@@ -172,7 +172,7 @@ where
     }
 }
 
-impl<T, C, R> std::fmt::Display for dyn RuinProcedure<T, C, R>
+impl<'a, T, C, R> std::fmt::Display for dyn RuinProcedure<T, C, R> + 'a
 where
     T: Copy + Ord + std::fmt::Debug,
     C: CostEvaluator<T>,
@@ -294,7 +294,7 @@ where
     ) -> Plan<'p, T>;
 }
 
-impl<T, C, R> std::fmt::Debug for dyn RepairProcedure<T, C, R>
+impl<'a, T, C, R> std::fmt::Debug for dyn RepairProcedure<T, C, R> + 'a
 where
     T: Copy + Ord + std::fmt::Debug,
     C: CostEvaluator<T>,
@@ -305,7 +305,7 @@ where
     }
 }
 
-impl<T, C, R> std::fmt::Display for dyn RepairProcedure<T, C, R>
+impl<'a, T, C, R> std::fmt::Display for dyn RepairProcedure<T, C, R> + 'a
 where
     T: Copy + Ord + std::fmt::Debug,
     C: CostEvaluator<T>,
@@ -389,7 +389,7 @@ where
     ) -> Plan<'p, T>;
 }
 
-impl<T, C, R> std::fmt::Debug for dyn PerturbationProcedure<T, C, R>
+impl<'a, T, C, R> std::fmt::Debug for dyn PerturbationProcedure<T, C, R> + 'a
 where
     T: Copy + Ord + std::fmt::Debug,
     C: CostEvaluator<T>,
@@ -400,7 +400,7 @@ where
     }
 }
 
-impl<T, C, R> std::fmt::Display for dyn PerturbationProcedure<T, C, R>
+impl<'a, T, C, R> std::fmt::Display for dyn PerturbationProcedure<T, C, R> + 'a
 where
     T: Copy + Ord + std::fmt::Debug,
     C: CostEvaluator<T>,
@@ -411,6 +411,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct RandomRuinRepairPerturbPair<'n, T, C, R>
 where
     T: Copy + Ord + std::fmt::Debug,
