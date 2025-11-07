@@ -70,6 +70,7 @@ pub trait CostEvaluator<T: Copy + Ord>: Send {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DefaultCostEvaluator;
 impl<T> CostEvaluator<T> for DefaultCostEvaluator
 where

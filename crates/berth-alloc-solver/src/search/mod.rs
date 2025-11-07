@@ -23,7 +23,6 @@ pub mod decision_builder;
 pub mod err;
 pub mod eval;
 pub mod filter;
-pub mod iterated_local_search;
 pub mod lns;
 pub mod lns_library;
 pub mod local_search;
