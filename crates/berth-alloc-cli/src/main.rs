@@ -118,16 +118,16 @@ fn main() {
 
         let mut solver = Solver::new()
             .with_time_limit(std::time::Duration::from_secs(20))
-            .with_stagnation_budget(1000)
+            .with_stagnation_budget(10000)
             .with_strategy_fn(|model| {
                 strategies::sa::make_simulated_annealing_strategy(
                     SimulatedAnnealingConfig {
-                        initial_temperature: 1000.0,
+                        initial_temperature: 10000.0,
                         step: 1,
                         allow_infeasible_uphill: true,
-                        seed: 42,
-                        memory_coefficient: 0.6,
-                        exploration_coefficient: 0.4,
+                        seed: 44,
+                        memory_coefficient: 0.8,
+                        exploration_coefficient: 2.0,
                         operator_selection_config: OperatorSelectionConfig::default(),
                     },
                     model,

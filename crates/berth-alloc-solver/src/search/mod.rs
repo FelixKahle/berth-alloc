@@ -32,4 +32,3 @@ pub mod neighboors;
 pub mod operator;
 pub mod operator_library;
 pub mod planner;
-pub mod sa;

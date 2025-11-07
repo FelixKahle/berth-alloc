@@ -147,7 +147,7 @@ where
     }
 }
 
-pub trait RuinProcedure<T, C, R>
+pub trait RuinProcedure<T, C, R>: Send
 where
     T: Copy + Ord + std::fmt::Debug,
     C: CostEvaluator<T>,
@@ -279,7 +279,7 @@ where
     }
 }
 
-pub trait RepairProcedure<T, C, R>
+pub trait RepairProcedure<T, C, R>: Send
 where
     T: Copy + Ord + std::fmt::Debug,
     C: CostEvaluator<T>,
@@ -375,7 +375,7 @@ where
     }
 }
 
-pub trait PerturbationProcedure<T, C, R>
+pub trait PerturbationProcedure<T, C, R>: Send
 where
     T: Copy + Ord + std::fmt::Debug,
     C: CostEvaluator<T>,

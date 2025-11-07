@@ -99,7 +99,7 @@ where
     }
 }
 
-pub trait DecisionBuilder<T, C, R>
+pub trait DecisionBuilder<T, C, R>: Send
 where
     T: Copy + Ord,
     C: CostEvaluator<T>,

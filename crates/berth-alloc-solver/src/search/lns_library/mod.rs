@@ -66,16 +66,16 @@ impl Default for RuinSelectionConfig {
     fn default() -> Self {
         Self {
             use_random_subset: true,
-            use_time_band: false,
-            use_same_berth_block: false,
-            use_random_walk: false,
-            use_related_neighbors: false,
+            use_time_band: true,
+            use_same_berth_block: true,
+            use_random_walk: true,
+            use_related_neighbors: true,
             random_subset_k: 5,
-            time_band_len: 4,
-            same_berth_block_len: 3,
-            random_walk_steps: 5,
+            time_band_len: 30,
+            same_berth_block_len: 10,
+            random_walk_steps: 30,
             random_walk_same_berth_bias: 0.6,
-            related_k: 5,
+            related_k: 10,
         }
     }
 }

@@ -30,8 +30,8 @@ use crate::{
         eval::DefaultCostEvaluator,
         filter::NeighborhoodFilterStack,
         local_search::MetaheuristicLocalSearch,
+        metaheuristic_library::sa::{EnergyParams, IterReciprocalCooling, SimulatedAnnealing},
         operator_library::{self, OperatorSelectionConfig},
-        sa::{EnergyParams, IterReciprocalCooling, SimulatedAnnealing},
     },
 };
 use rand::SeedableRng;
