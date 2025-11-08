@@ -21,7 +21,11 @@
 
 use crate::{
     model::{index::RequestIndex, solver_model::SolverModel},
-    search::{eval::CostEvaluator, planner::PlanBuilder},
+    search::{
+        decision_builder::{DecisionBuilder, SearchContext},
+        eval::CostEvaluator,
+        planner::PlanBuilder,
+    },
     state::{
         decisionvar::DecisionVar,
         plan::Plan,
@@ -489,6 +493,31 @@ where
             context.buffer,
         );
         self.random_repair(&mut repair_ctx, ruined_outcome)
+    }
+}
+
+impl<'a, T, C, R> DecisionBuilder<T, C, R> for RandomRuinRepairPerturbPair<'a, T, C, R>
+where
+    T: Copy + Ord + std::fmt::Debug + CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+{
+    fn name(&self) -> &str {
+        PerturbationProcedure::name(self)
+    }
+
+    fn next<'b, 'sm, 'c, 's, 'm, 'p>(
+        &mut self,
+        context: &mut SearchContext<'b, 'sm, 'c, 's, 'm, 'p, T, C, R>,
+    ) -> Option<Plan<'p, T>> {
+        let mut perturb_ctx = PerturbationProcedureContext::new(
+            context.model,
+            context.state,
+            context.evaluator,
+            context.rng,
+            context.work_buf,
+        );
+        Some(self.perturb(&mut perturb_ctx))
     }
 }
 
@@ -998,5 +1027,44 @@ mod tests {
 
         let pp: &dyn PerturbationProcedure<T, DefaultCostEvaluator, StdRng> = &pair;
         assert_eq!(pp.name(), "RandomRuinRepairPerturbPair");
+    }
+
+    #[test]
+    fn test_decision_builder_name_for_pair() {
+        // Build a pair just like other tests do
+        let pair: RandomRuinRepairPerturbPair<T, DefaultCostEvaluator, StdRng> =
+            RandomRuinRepairPerturbPair::new(
+                vec![Box::new(CountingRuin::new())],
+                vec![Box::new(CountingRepair::new())],
+            );
+
+        // Treat it as a DecisionBuilder dyn ref and verify name dispatch
+        let db: &dyn crate::search::decision_builder::DecisionBuilder<T, DefaultCostEvaluator, StdRng> =
+            &pair;
+
+        assert_eq!(db.name(), "RandomRuinRepairPerturbPair");
+    }
+
+    #[test]
+    fn test_decision_builder_debug_display_for_pair() {
+        let pair: RandomRuinRepairPerturbPair<T, DefaultCostEvaluator, StdRng> =
+            RandomRuinRepairPerturbPair::new(
+                vec![Box::new(CountingRuin::new())],
+                vec![Box::new(CountingRepair::new())],
+            );
+
+        let db: &dyn crate::search::decision_builder::DecisionBuilder<T, DefaultCostEvaluator, StdRng> =
+            &pair;
+
+        // These rely on the Debug/Display impls in decision_builder.rs which
+        // format "DecisionBuilder({name})"
+        assert_eq!(
+            format!("{:?}", db),
+            "DecisionBuilder(RandomRuinRepairPerturbPair)"
+        );
+        assert_eq!(
+            format!("{}", db),
+            "DecisionBuilder(RandomRuinRepairPerturbPair)"
+        );
     }
 }
