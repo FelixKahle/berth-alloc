@@ -483,6 +483,8 @@ where
 
         let mut applied = 0;
 
+        //self.improving_decision_builder.reset();
+
         loop {
             if LocalSearchForwardMonitor::new(context.monitor_mut(), &mut local_search_monitor)
                 .should_terminate_search()
@@ -817,6 +819,10 @@ mod tests {
 
             Some(plan)
         }
+
+        fn reset(&mut self) {
+            todo!()
+        }
     }
 
     // Perturbation builder that unassigns r1 once (worsens unassigned by +1).
@@ -880,6 +886,10 @@ mod tests {
                 }
             }
         }
+
+        fn reset(&mut self) {
+            todo!()
+        }
     }
 
     // No-op builder (never returns a plan).
@@ -903,6 +913,10 @@ mod tests {
             >,
         ) -> Option<Plan<'p, T>> {
             None
+        }
+
+        fn reset(&mut self) {
+            todo!()
         }
     }
 

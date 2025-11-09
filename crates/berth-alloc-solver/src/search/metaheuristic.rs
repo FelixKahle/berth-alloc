@@ -82,6 +82,8 @@ where
 {
     fn name(&self) -> &str;
 
+    fn reset(&mut self);
+
     fn local_optimum_reached<'e, 'r, 's, 'm, 'p>(
         &mut self,
         context: MetaheuristicContext<'e, 'r, 's, 'm, 'p, T, C, R>,
@@ -218,6 +220,11 @@ mod tests {
     impl Metaheuristic<i64, DefaultCostEvaluator, ChaCha8Rng> for DummyMetaheuristic {
         fn name(&self) -> &str {
             self.name
+        }
+
+        fn reset(&mut self) {
+            self.calls_local = 0;
+            self.calls_accept = 0;
         }
 
         fn local_optimum_reached<'e, 'r, 's, 'm, 'p>(

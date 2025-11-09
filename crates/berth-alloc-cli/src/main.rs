@@ -22,10 +22,18 @@
 use berth_alloc_model::prelude::{Problem, SolutionView};
 use berth_alloc_model::problem::loader::ProblemLoader;
 use berth_alloc_solver::engine::solver::Solver;
-use berth_alloc_solver::engine::strategies;
-use berth_alloc_solver::engine::strategies::sa::SimulatedAnnealingConfig;
-use berth_alloc_solver::search::operator_library::OperatorSelectionConfig;
+use berth_alloc_solver::engine::{neighbors, strategies};
+use berth_alloc_solver::search::eval::DefaultCostEvaluator;
+use berth_alloc_solver::search::filter::NeighborhoodFilterStack;
+use berth_alloc_solver::search::lns_library::{self, RepairSelectionConfig, RuinSelectionConfig};
+use berth_alloc_solver::search::local_search::MetaheuristicLocalSearch;
+use berth_alloc_solver::search::metaheuristic_library::sa::{
+    EnergyParams, IterReciprocalCooling, SimulatedAnnealing,
+};
+use berth_alloc_solver::search::operator_library::{self, OperatorSelectionConfig};
 use chrono::{DateTime, Utc};
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 use serde::Serialize;
 use std::fs::File;
 use std::io::Write;
@@ -117,21 +125,54 @@ fn main() {
         let t0 = Instant::now();
 
         let mut solver = Solver::new()
-            .with_time_limit(std::time::Duration::from_secs(20))
-            .with_stagnation_budget(10000)
+            .with_time_limit(std::time::Duration::from_secs(120))
             .with_strategy_fn(|model| {
-                strategies::sa::make_simulated_annealing_strategy(
-                    SimulatedAnnealingConfig {
-                        initial_temperature: 10000.0,
-                        step: 1,
-                        allow_infeasible_uphill: true,
-                        seed: 44,
-                        memory_coefficient: 0.8,
-                        exploration_coefficient: 2.0,
-                        operator_selection_config: OperatorSelectionConfig::default(),
+                let neighboors = neighbors::build_neighbors_from_model(model);
+                let operator = operator_library::make_multi_armed_bandit_compound_operator::<
+                    i64,
+                    DefaultCostEvaluator,
+                    ChaCha8Rng,
+                >(
+                    &OperatorSelectionConfig::default(), &neighboors, 0.8, 2.0
+                );
+
+                // No extra neighborhood filters by default
+                let filter_stack = NeighborhoodFilterStack::empty();
+
+                // SA metaheuristic with reciprocal cooling and its own RNG
+                let energy_params = EnergyParams::with_default_lambda(model, 1, 0.00001, true);
+                let mh = SimulatedAnnealing::new(energy_params, IterReciprocalCooling::new(1000.0));
+
+                // Decision builder = Local search + filters + metaheuristic
+                let improving_db = Box::new(MetaheuristicLocalSearch::new(
+                    Box::new(operator),
+                    filter_stack,
+                    mh,
+                ));
+
+                let pertubation_db = lns_library::make_random_ruin_repair_perturb_pair(
+                    &RuinSelectionConfig::default(),
+                    &RepairSelectionConfig::default(),
+                    &neighboors,
+                );
+
+                // Evaluator and outer RNG owned by the strategy
+                let evaluator = DefaultCostEvaluator;
+                let outer_rng = ChaCha8Rng::seed_from_u64(122);
+
+                Box::new(strategies::ils::IteratedLocalSearchStrategy::new(
+                    strategies::ils::IteratedLocalSearchConfig {
+                        max_local_stagnation_steps: 10000,
+                        max_local_steps: None,
+                        acceptance_criterion: Box::new(
+                            strategies::ils::GreedyDescentAcceptanceCriterion::new(),
+                        ),
+                        improving_decision_builder: improving_db,
+                        perturbing_decision_builder: Box::new(pertubation_db),
+                        evaluator,
+                        rng: outer_rng,
                     },
-                    model,
-                )
+                ))
             });
 
         let outcome = solver.solve(&problem);

@@ -74,6 +74,10 @@ where
         "MetaheuristicLocalSearch"
     }
 
+    fn reset(&mut self) {
+        self.metaheuristic.reset();
+    }
+
     #[tracing::instrument(skip(self, context), level = "debug")]
     fn next<'b, 'sm, 'c, 's, 'm, 'p>(
         &mut self,
@@ -279,6 +283,10 @@ mod tests {
         ) -> bool {
             false
         }
+
+        fn reset(&mut self) {
+            todo!()
+        }
     }
 
     // Allows search to proceed and accepts the first plan it sees.
@@ -312,6 +320,10 @@ mod tests {
                 false
             }
         }
+
+        fn reset(&mut self) {
+            todo!()
+        }
     }
 
     // Accept the second plan encountered (reject the first).
@@ -340,6 +352,10 @@ mod tests {
         ) -> bool {
             self.seen += 1;
             self.seen == 2
+        }
+
+        fn reset(&mut self) {
+            todo!()
         }
     }
 
@@ -373,6 +389,10 @@ mod tests {
         ) -> bool {
             true
         }
+
+        fn reset(&mut self) {
+            todo!()
+        }
     }
 
     // General continuation budget that never accepts.
@@ -404,6 +424,10 @@ mod tests {
             _plan: &Plan<'_, i64>,
         ) -> bool {
             false
+        }
+
+        fn reset(&mut self) {
+            todo!()
         }
     }
 
@@ -615,7 +639,10 @@ mod tests {
             Self { budget: 1 } // allow initial gate, then stop
         }
     }
-    impl<R: rand::Rng> Metaheuristic<i64, DefaultCostEvaluator, R> for RejectAllMH {
+    impl<R> Metaheuristic<i64, DefaultCostEvaluator, R> for RejectAllMH
+    where
+        R: rand::Rng,
+    {
         fn name(&self) -> &str {
             "RejectAllMH"
         }
@@ -635,6 +662,10 @@ mod tests {
             _plan: &Plan<'_, i64>,
         ) -> bool {
             false
+        }
+
+        fn reset(&mut self) {
+            todo!()
         }
     }
 

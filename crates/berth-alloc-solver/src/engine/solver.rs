@@ -59,7 +59,7 @@ impl std::fmt::Display for SolverConfig {
 impl Default for SolverConfig {
     fn default() -> Self {
         Self {
-            num_workers: 2,
+            num_workers: 10,
             time_limit: std::time::Duration::from_secs(60),
             stagnation_generated_without_accept: None,
         }

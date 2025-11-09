@@ -418,6 +418,10 @@ mod tests {
             // Strategy will apply this (no-op) plan and continue the loop.
             Some(crate::state::plan::Plan::empty())
         }
+
+        fn reset(&mut self) {
+            todo!()
+        }
     }
 
     // A simple monitor that counts lifecycle and plan events and can request termination
@@ -628,6 +632,10 @@ mod tests {
 
             Some(Plan::new_delta(vec![patch], TerminalDelta::empty(), delta))
         }
+
+        fn reset(&mut self) {
+            todo!()
+        }
     }
 
     // A monitor that is already terminated before run() starts.
@@ -700,6 +708,10 @@ mod tests {
             );
 
             None
+        }
+
+        fn reset(&mut self) {
+            todo!()
         }
     }
 

@@ -24,16 +24,25 @@ use berth_alloc_core::prelude::Cost;
 use num_traits::{CheckedAdd, CheckedSub};
 use std::ops::Mul;
 
+pub mod assign;
 pub mod compound;
+pub mod or_opt;
+pub mod push;
 pub mod relocate;
 pub mod slide;
 pub mod swap;
+pub mod swap_berth;
+pub mod unassign;
 
 #[derive(Debug, Clone, Copy)]
 pub struct OperatorSelectionConfig {
     pub use_relocate: bool,
     pub use_slide: bool,
     pub use_swap: bool,
+    pub use_push_insert: bool,
+    pub use_assign: bool,
+    pub use_unassign: bool,
+    pub use_or_opt: bool,
 }
 
 impl OperatorSelectionConfig {
@@ -43,12 +52,22 @@ impl OperatorSelectionConfig {
             use_relocate: true,
             use_slide: true,
             use_swap: true,
+            use_push_insert: true,
+            use_assign: true,
+            use_unassign: true,
+            use_or_opt: true,
         }
     }
 
     #[inline]
     pub fn num_enabled(&self) -> usize {
-        (self.use_relocate as usize) + (self.use_slide as usize) + (self.use_swap as usize)
+        (self.use_relocate as usize)
+            + (self.use_slide as usize)
+            + (self.use_swap as usize)
+            + (self.use_push_insert as usize)
+            + (self.use_assign as usize)
+            + (self.use_unassign as usize)
+            + (self.use_or_opt as usize)
     }
 }
 
@@ -93,6 +112,22 @@ where
         operators.push(Box::new(swap::SwapSlotOp::with_neighbors(
             neighboors.neighbors.clone(),
         )));
+    }
+
+    if config.use_push_insert {
+        operators.push(Box::new(push::PushInsertOp::new()));
+    }
+
+    if config.use_assign {
+        operators.push(Box::new(assign::AssignOp::new()));
+    }
+
+    if config.use_unassign {
+        operators.push(Box::new(unassign::UnassignOp::new()));
+    }
+
+    if config.use_or_opt {
+        operators.push(Box::new(or_opt::RelocateAdjacentPairOp::new()));
     }
 
     operators

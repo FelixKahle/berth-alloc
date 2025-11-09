@@ -449,14 +449,18 @@ where
         self.ruin[idx].ruin(context)
     }
 
-    #[inline]
     pub fn random_repair<'b, 'r, 'c, 's, 'm, 'p>(
         &mut self,
         context: &mut RepairProcedureContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
         ruined_outcome: RuinOutcome<'p, T>,
     ) -> Plan<'p, T> {
         let idx = context.rng().random_range(0..self.repair.len());
-        self.repair[idx].repair(context, ruined_outcome)
+        let repair_plan = self.repair[idx].repair(context, ruined_outcome.clone());
+        if repair_plan == ruined_outcome.ruined_plan {
+            repair_plan
+        } else {
+            ruined_outcome.ruined_plan.concat(repair_plan)
+        }
     }
 }
 
@@ -519,6 +523,8 @@ where
         );
         Some(self.perturb(&mut perturb_ctx))
     }
+
+    fn reset(&mut self) {}
 }
 
 #[cfg(test)]

@@ -70,12 +70,12 @@ impl Default for RuinSelectionConfig {
             use_same_berth_block: true,
             use_random_walk: true,
             use_related_neighbors: true,
-            random_subset_k: 5,
-            time_band_len: 30,
-            same_berth_block_len: 10,
-            random_walk_steps: 30,
-            random_walk_same_berth_bias: 0.6,
-            related_k: 10,
+            random_subset_k: 30,
+            time_band_len: 150,
+            same_berth_block_len: 30,
+            random_walk_steps: 40,
+            random_walk_same_berth_bias: 0.8,
+            related_k: 20,
         }
     }
 }

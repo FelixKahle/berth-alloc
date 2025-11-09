@@ -250,6 +250,10 @@ where
         "SimulatedAnnealing"
     }
 
+    fn reset(&mut self) {
+        self.cooling.reset();
+    }
+
     #[inline]
     fn local_optimum_reached<'e, 'r, 's, 'm, 'p>(
         &mut self,

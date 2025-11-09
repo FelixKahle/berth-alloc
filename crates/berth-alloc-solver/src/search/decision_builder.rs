@@ -107,6 +107,8 @@ where
 {
     fn name(&self) -> &str;
 
+    fn reset(&mut self);
+
     fn next<'b, 'sm, 'c, 's, 'm, 'p>(
         &mut self,
         context: &mut SearchContext<'b, 'sm, 'c, 's, 'm, 'p, T, C, R>,

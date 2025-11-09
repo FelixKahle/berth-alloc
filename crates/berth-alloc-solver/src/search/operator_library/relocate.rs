@@ -29,9 +29,10 @@ use crate::{
         decisionvar::{Decision, DecisionVar},
         plan::Plan,
         solver_state::SolverStateView,
+        terminal::terminalocc::FreeBerth,
     },
 };
-use berth_alloc_core::prelude::Cost;
+use berth_alloc_core::prelude::{Cost, TimePoint};
 use num_traits::{CheckedAdd, CheckedSub};
 use std::ops::Mul;
 
@@ -122,6 +123,132 @@ where
                 }
             }
 
+            pb.undo_to(sp);
+        }
+
+        None
+    }
+}
+
+/// Relocates an assigned request to its *best-cost* feasible slot.
+///
+/// This operator iterates through each assigned request `r`.
+/// It unassigns `r`, then scans *all* feasible slots on *all* allowed
+/// berths for `r`. It calculates the cost for each slot and
+/// selects the one with the minimum cost.
+///
+/// It yields a plan to move `r` to this best-cost slot, as long
+/// as it's not the exact same slot it started in.
+#[derive(Debug, Default)]
+pub struct RelocateToBestCostOp {
+    /// The index of the next request to check for relocation.
+    i: usize,
+}
+
+impl RelocateToBestCostOp {
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl<T, C, R> LocalSearchOperator<T, C, R> for RelocateToBestCostOp
+where
+    T: Copy + Ord + std::fmt::Debug + CheckedAdd + CheckedSub + Mul<Output = Cost> + Into<Cost>,
+    C: CostEvaluator<T>,
+    R: rand::Rng,
+{
+    fn name(&self) -> &str {
+        "RelocateToBestCostOp"
+    }
+
+    fn reset(&mut self) {
+        self.i = 0;
+    }
+
+    fn has_fragments(&self) -> bool {
+        false
+    }
+
+    fn make_next_neighbor<'b, 'r, 'c, 's, 'm, 'p>(
+        &mut self,
+        ctx: &mut OperatorContext<'b, 'r, 'c, 's, 'm, 'p, T, C, R>,
+    ) -> Option<Plan<'p, T>> {
+        let dvars = ctx.state().decision_variables();
+        let n = dvars.len();
+        let model = ctx.model();
+
+        while self.i < n {
+            let r = RequestIndex::new(self.i);
+            self.i += 1;
+
+            let (b_old, s_old) = match dvars.get(r.get()).copied() {
+                Some(DecisionVar::Assigned(Decision {
+                    berth_index,
+                    start_time,
+                })) => (berth_index, start_time),
+                _ => continue,
+            };
+
+            // Current cost (kept with leading underscore to silence unused warning)
+            let _cost_old = ctx.cost_evaluator().eval_request(model, r, s_old, b_old)?;
+
+            let mut pb = ctx.builder();
+            let sp = pb.savepoint();
+
+            if pb.propose_unassignment(r).is_err() {
+                pb.undo_to(sp);
+                continue;
+            }
+
+            // Track best slot components separately to avoid move issues.
+            let mut best_slot_cost: Option<Cost> = None;
+            let mut best_slot_start: Option<TimePoint<T>> = None;
+            let mut best_slot_fb: Option<FreeBerth<T>> = None;
+
+            // Iterate over all feasible slots for `r`
+            for fb in pb.iter_free_for(r) {
+                let pt = match model.processing_time(r, fb.berth_index()) {
+                    Some(pt) => pt,
+                    None => continue,
+                };
+
+                let s_start = fb.interval().start();
+                let s_end = match s_start.checked_add(pt) {
+                    Some(end) => end,
+                    None => continue,
+                };
+
+                // Check if it fits in the free interval
+                if s_end <= fb.interval().end() {
+                    // Skip original exact slot
+                    if fb.berth_index() == b_old && s_start == s_old {
+                        continue;
+                    }
+
+                    // Peek the cost of this new assignment
+                    let cost_new = match pb.peek_cost(r, s_start, &fb) {
+                        Some(cost) => cost,
+                        None => continue,
+                    };
+
+                    // Select if better than current best
+                    if best_slot_cost.is_none_or(|c| cost_new < c) {
+                        best_slot_cost = Some(cost_new);
+                        best_slot_start = Some(s_start);
+                        best_slot_fb = Some(fb.clone());
+                    }
+                }
+            }
+
+            // If a best slot was found, attempt assignment
+            if let (Some(_best_cost), Some(best_start), Some(best_fb)) =
+                (best_slot_cost, best_slot_start, best_slot_fb)
+                && pb.propose_assignment(r, best_start, &best_fb).is_ok() {
+                    return Some(pb.finalize());
+                }
+
+            // No alternative slot was found, or assignment failed.
             pb.undo_to(sp);
         }
 
