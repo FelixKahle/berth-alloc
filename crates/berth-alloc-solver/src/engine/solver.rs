@@ -43,7 +43,7 @@ use berth_alloc_model::{
 pub struct SolverConfig {
     pub num_workers: usize,
     pub time_limit: std::time::Duration,
-    pub stagnation_generated_without_accept: Option<usize>,
+    pub stagnation_generated_without_accept: Option<u64>,
 }
 
 impl std::fmt::Display for SolverConfig {
@@ -189,7 +189,7 @@ where
     }
 
     #[inline]
-    pub fn with_stagnation_budget(mut self, budget_without_accept: usize) -> Self {
+    pub fn with_stagnation_budget(mut self, budget_without_accept: u64) -> Self {
         self.config.stagnation_generated_without_accept = Some(budget_without_accept);
         self
     }
@@ -326,7 +326,7 @@ mod tests {
             use crate::state::decisionvar::DecisionVarVec;
             use crate::state::terminal::terminalocc::TerminalOccupancy;
 
-            ctx.monitor().on_search_start();
+            ctx.monitor_mut().on_search_start();
 
             let model = ctx.model();
 
@@ -346,7 +346,7 @@ mod tests {
 
             let _ = ctx.shared_incumbent().try_update(&candidate, model);
 
-            ctx.monitor().on_search_end();
+            ctx.monitor_mut().on_search_end();
             None
         }
     }

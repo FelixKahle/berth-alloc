@@ -65,7 +65,12 @@ impl<'e, 'm, 'p, T: Copy + Ord> StrategyContext<'e, 'm, 'p, T> {
     }
 
     #[inline]
-    pub fn monitor(&mut self) -> &mut dyn SearchMonitor<T> {
+    pub fn monitor(&self) -> &dyn SearchMonitor<T> {
+        self.monitor
+    }
+
+    #[inline]
+    pub fn monitor_mut(&mut self) -> &mut dyn SearchMonitor<T> {
         self.monitor
     }
 
@@ -188,13 +193,13 @@ where
         &mut self,
         context: &mut StrategyContext<'e, 'm, 'p, T>,
     ) -> Option<SolverState<'p, T>> {
-        context.monitor().on_search_start();
+        context.monitor_mut().on_search_start();
 
         let mut work_buf = self.allocate_work_buffer(context);
-        let mut state = context.state.clone();
+        let mut state = context.state().clone();
 
         loop {
-            if context.monitor().should_terminate_search() {
+            if context.monitor_mut().should_terminate_search() {
                 break;
             }
 
@@ -202,7 +207,7 @@ where
             let model = context.model();
 
             let next_plan = {
-                let monitor = context.monitor();
+                let monitor = context.monitor_mut();
                 let mut ctx = SearchContext::new(
                     model,
                     &state,
@@ -224,7 +229,7 @@ where
             }
         }
 
-        context.monitor().on_search_end();
+        context.monitor_mut().on_search_end();
         Some(state)
     }
 }

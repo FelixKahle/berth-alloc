@@ -115,8 +115,8 @@ where
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct StagnationMonitor {
-    generated_since_accept: usize,
-    budget: usize,
+    generated_since_accept: u64,
+    budget: u64,
 }
 
 impl std::fmt::Display for StagnationMonitor {
@@ -130,7 +130,7 @@ impl std::fmt::Display for StagnationMonitor {
 }
 
 impl StagnationMonitor {
-    pub fn new(budget_without_accept: usize) -> Self {
+    pub fn new(budget_without_accept: u64) -> Self {
         Self {
             generated_since_accept: 0,
             budget: budget_without_accept,

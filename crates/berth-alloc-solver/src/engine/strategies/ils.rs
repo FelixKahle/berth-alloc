@@ -23,15 +23,21 @@ use crate::{
     core::numeric::SolveNumeric,
     engine::strategy::{Strategy, StrategyContext},
     model::solver_model::SolverModel,
-    monitor::search_monitor::{
-        LifecycleMonitor, PlanEventMonitor, SearchMonitor, TerminationCheck,
+    monitor::{
+        search_monitor::{LifecycleMonitor, PlanEventMonitor, SearchMonitor, TerminationCheck},
+        step::{PlanLimitMonitor, StagnationMonitor},
     },
     search::{
         decision_builder::{DecisionBuilder, SearchContext},
         eval::CostEvaluator,
     },
-    state::{decisionvar::DecisionVar, plan::Plan, solver_state::SolverState},
+    state::{
+        decisionvar::DecisionVar,
+        plan::Plan,
+        solver_state::{SolverState, SolverStateView},
+    },
 };
+use num_traits::{CheckedAdd, CheckedSub};
 
 #[derive(Debug)]
 pub struct IlsAcceptanceCriterionContext<'e, 'r, 's, 'm, 'p, T, C, R>
@@ -81,7 +87,7 @@ where
     fn accept<'e, 'r, 's, 'm, 'p>(
         &self,
         context: &mut IlsAcceptanceCriterionContext<'e, 'r, 's, 'm, 'p, T, C, R>,
-        plan: &Plan<'p, T>,
+        new_state: &SolverState<'p, T>,
     ) -> bool;
 }
 
@@ -107,8 +113,6 @@ where
     }
 }
 
-/// Greedy descent acceptance: accept only strictly improving moves.
-/// Improvement ordering: fewer unassigned first, then lower cost.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GreedyDescentAcceptanceCriterion<T, C, R>
 where
@@ -157,21 +161,13 @@ where
     #[inline]
     fn accept<'e, 'r, 's, 'm, 'p>(
         &self,
-        _context: &mut IlsAcceptanceCriterionContext<'e, 'r, 's, 'm, 'p, T, C, R>,
-        plan: &Plan<'p, T>,
+        context: &mut IlsAcceptanceCriterionContext<'e, 'r, 's, 'm, 'p, T, C, R>,
+        new_state: &SolverState<'p, T>,
     ) -> bool {
-        let delta = &plan.fitness_delta;
-        if delta.delta_unassigned < 0 {
-            return true;
-        }
-        if delta.delta_unassigned > 0 {
-            return false;
-        }
-        delta.delta_cost < 0
+        new_state.fitness() < context.solver_state.fitness()
     }
 }
 
-/// Trivial acceptance: accept every candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AlwaysAcceptAcceptanceCriterion<T, C, R>
 where
@@ -221,240 +217,20 @@ where
     fn accept<'e, 'r, 's, 'm, 'p>(
         &self,
         _context: &mut IlsAcceptanceCriterionContext<'e, 'r, 's, 'm, 'p, T, C, R>,
-        _plan: &Plan<'p, T>,
+        _new_state: &SolverState<'p, T>,
     ) -> bool {
         true
     }
 }
 
-/// Local step limit monitor: counts accepted steps inside a phase only.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct LocalStepLimitMonitor {
-    accepted: usize,
-    limit: usize,
-}
-
-impl LocalStepLimitMonitor {
-    #[inline]
-    pub fn new(limit: usize) -> Self {
-        Self { accepted: 0, limit }
-    }
-    #[inline]
-    pub fn accepted(&self) -> usize {
-        self.accepted
-    }
-}
-
-impl TerminationCheck for LocalStepLimitMonitor {
-    #[inline]
-    fn should_terminate_search(&self) -> bool {
-        self.accepted >= self.limit
-    }
-}
-
-impl<T: Copy + Ord> PlanEventMonitor<T> for LocalStepLimitMonitor {
-    fn on_plan_generated<'p>(&mut self, _: &Plan<'p, T>) {}
-    fn on_plan_rejected<'p>(&mut self, _: &Plan<'p, T>) {}
-    fn on_plan_accepted<'p>(&mut self, _: &Plan<'p, T>) {
-        self.accepted = self.accepted.saturating_add(1);
-    }
-}
-
-impl LifecycleMonitor for LocalStepLimitMonitor {
-    fn on_search_start(&mut self) {
-        self.accepted = 0;
-    }
-    fn on_search_end(&mut self) {}
-}
-
-impl<T: Copy + Ord> SearchMonitor<T> for LocalStepLimitMonitor {
-    fn name(&self) -> &str {
-        "LocalStepLimitMonitor"
-    }
-}
-
-/// Local stagnation monitor: counts consecutive non-improving accepted moves.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct LocalStagnationMonitor {
-    consecutive_non_improving: usize,
-    budget: usize,
-}
-
-impl LocalStagnationMonitor {
-    pub fn new(budget: usize) -> Self {
-        Self {
-            consecutive_non_improving: 0,
-            budget,
-        }
-    }
-    #[inline]
-    pub fn consecutive_non_improving(&self) -> usize {
-        self.consecutive_non_improving
-    }
-    #[inline]
-    pub fn mark_non_improving(&mut self) {
-        self.consecutive_non_improving = self.consecutive_non_improving.saturating_add(1);
-    }
-    #[inline]
-    pub fn reset(&mut self) {
-        self.consecutive_non_improving = 0;
-    }
-}
-
-impl TerminationCheck for LocalStagnationMonitor {
-    #[inline]
-    fn should_terminate_search(&self) -> bool {
-        self.consecutive_non_improving >= self.budget
-    }
-}
-
-impl<T: Copy + Ord> PlanEventMonitor<T> for LocalStagnationMonitor {
-    fn on_plan_generated<'p>(&mut self, _: &Plan<'p, T>) {}
-    fn on_plan_rejected<'p>(&mut self, _: &Plan<'p, T>) {}
-    fn on_plan_accepted<'p>(&mut self, _: &Plan<'p, T>) {
-        // Strategy decides when to mark/reset explicitly.
-    }
-}
-
-impl LifecycleMonitor for LocalStagnationMonitor {
-    fn on_search_start(&mut self) {
-        self.consecutive_non_improving = 0;
-    }
-    fn on_search_end(&mut self) {}
-}
-
-impl<T: Copy + Ord> SearchMonitor<T> for LocalStagnationMonitor {
-    fn name(&self) -> &str {
-        "LocalStagnationMonitor"
-    }
-}
-
-/// Forwards plan events to base + optional local monitors under a unified borrow.
-struct ForwardingMonitor<'a, T: Copy + Ord> {
-    base: &'a mut dyn SearchMonitor<T>,
-    step: Option<&'a mut LocalStepLimitMonitor>,
-    stag: Option<&'a mut LocalStagnationMonitor>,
-}
-
-impl<'a, T: Copy + Ord> ForwardingMonitor<'a, T> {
-    #[inline]
-    fn new(
-        base: &'a mut dyn SearchMonitor<T>,
-        step: Option<&'a mut LocalStepLimitMonitor>,
-        stag: Option<&'a mut LocalStagnationMonitor>,
-    ) -> Self {
-        Self { base, step, stag }
-    }
-}
-
-impl<'a, T: Copy + Ord> TerminationCheck for ForwardingMonitor<'a, T> {
-    fn should_terminate_search(&self) -> bool {
-        if self.base.should_terminate_search() {
-            return true;
-        }
-        if let Some(s) = &self.step
-            && s.should_terminate_search()
-        {
-            return true;
-        }
-        if let Some(s) = &self.stag
-            && s.should_terminate_search()
-        {
-            return true;
-        }
-        false
-    }
-}
-
-impl<'a, T: Copy + Ord> PlanEventMonitor<T> for ForwardingMonitor<'a, T> {
-    fn on_plan_generated<'p>(&mut self, plan: &Plan<'p, T>) {
-        self.base.on_plan_generated(plan);
-        if let Some(s) = &mut self.step {
-            s.on_plan_generated(plan);
-        }
-        if let Some(s) = &mut self.stag {
-            s.on_plan_generated(plan);
-        }
-    }
-    fn on_plan_rejected<'p>(&mut self, plan: &Plan<'p, T>) {
-        self.base.on_plan_rejected(plan);
-        if let Some(s) = &mut self.step {
-            s.on_plan_rejected(plan);
-        }
-        if let Some(s) = &mut self.stag {
-            s.on_plan_rejected(plan);
-        }
-    }
-    fn on_plan_accepted<'p>(&mut self, plan: &Plan<'p, T>) {
-        self.base.on_plan_accepted(plan);
-        if let Some(s) = &mut self.step {
-            s.on_plan_accepted(plan);
-        }
-        if let Some(s) = &mut self.stag {
-            s.on_plan_accepted(plan);
-        }
-    }
-}
-
-/// Monitor that defers final accept/reject until after the ILS acceptance criterion.
-struct DeferredPlanMonitor<'a, T: Copy + Ord> {
-    inner: &'a mut ForwardingMonitor<'a, T>,
-    pending_accept: bool,
-}
-
-impl<'a, T: Copy + Ord> DeferredPlanMonitor<'a, T> {
-    #[inline]
-    fn new(inner: &'a mut ForwardingMonitor<'a, T>) -> Self {
-        Self {
-            inner,
-            pending_accept: false,
-        }
-    }
-
-    #[inline]
-    fn finalize_plan<'p>(&mut self, plan: &Plan<'p, T>, accepted: bool) {
-        if self.pending_accept {
-            if accepted {
-                self.inner.on_plan_accepted(plan);
-            } else {
-                self.inner.on_plan_rejected(plan);
-            }
-            self.pending_accept = false;
-        } else if accepted {
-            self.inner.on_plan_accepted(plan);
-        } else {
-            self.inner.on_plan_rejected(plan);
-        }
-    }
-}
-
-impl<'a, T: Copy + Ord> TerminationCheck for DeferredPlanMonitor<'a, T> {
-    fn should_terminate_search(&self) -> bool {
-        self.inner.should_terminate_search()
-    }
-}
-
-impl<'a, T: Copy + Ord> PlanEventMonitor<T> for DeferredPlanMonitor<'a, T> {
-    fn on_plan_generated<'p>(&mut self, plan: &Plan<'p, T>) {
-        self.inner.on_plan_generated(plan);
-    }
-    fn on_plan_rejected<'p>(&mut self, plan: &Plan<'p, T>) {
-        self.inner.on_plan_rejected(plan);
-    }
-    fn on_plan_accepted<'p>(&mut self, _plan: &Plan<'p, T>) {
-        self.pending_accept = true;
-    }
-}
-
-/// Configuration for IteratedLocalSearchStrategy.
 pub struct IteratedLocalSearchConfig<'n, T, C, R>
 where
     T: Copy + Ord + Send,
     C: CostEvaluator<T>,
     R: rand::Rng + Send,
 {
-    pub max_local_stagnation_steps: usize,
-    pub max_local_steps: Option<usize>,
+    pub max_local_stagnation_steps: u64,
+    pub max_local_steps: Option<u64>,
     pub acceptance_criterion: Box<dyn IlsAcceptanceCriterion<T, C, R> + Send>,
     pub improving_decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send + 'n>,
     pub perturbing_decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send + 'n>,
@@ -468,10 +244,11 @@ where
     C: CostEvaluator<T>,
     R: rand::Rng + Send,
 {
+    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     pub fn new(
-        max_local_stagnation_steps: usize,
-        max_local_steps: Option<usize>,
+        max_local_stagnation_steps: u64,
+        max_local_steps: Option<u64>,
         acceptance_criterion: Box<dyn IlsAcceptanceCriterion<T, C, R> + Send>,
         improving_decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send + 'n>,
         perturbing_decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send + 'n>,
@@ -490,18 +267,176 @@ where
     }
 }
 
-/// Iterated Local Search strategy: repeatedly performs an improvement phase
-/// bounded by local step/stagnation limits, then a perturbation phase to escape
-/// local minima. Global termination is governed exclusively by the composite
-/// search monitor provided in the strategy context.
+pub struct LocalSearchMonitor {
+    stagnation_monitor: StagnationMonitor,
+    plan_generation_monitor: Option<PlanLimitMonitor>,
+}
+
+impl LocalSearchMonitor {
+    #[inline(always)]
+    pub fn new(stagnation_budget: u64, plan_generation_limit: Option<u64>) -> Self {
+        Self {
+            stagnation_monitor: StagnationMonitor::new(stagnation_budget),
+            plan_generation_monitor: plan_generation_limit.map(PlanLimitMonitor::new),
+        }
+    }
+}
+
+impl TerminationCheck for LocalSearchMonitor {
+    fn should_terminate_search(&self) -> bool {
+        if self.stagnation_monitor.should_terminate_search() {
+            return true;
+        }
+        if let Some(plan_limit_monitor) = &self.plan_generation_monitor
+            && plan_limit_monitor.should_terminate_search()
+        {
+            return true;
+        }
+        false
+    }
+}
+
+impl<T> PlanEventMonitor<T> for LocalSearchMonitor
+where
+    T: Copy + Ord,
+{
+    fn on_plan_generated<'p>(&mut self, plan: &Plan<'p, T>) {
+        self.stagnation_monitor.on_plan_generated(plan);
+        if let Some(plan_limit_monitor) = &mut self.plan_generation_monitor {
+            plan_limit_monitor.on_plan_generated(plan);
+        }
+    }
+
+    fn on_plan_rejected<'p>(&mut self, plan: &Plan<'p, T>) {
+        self.stagnation_monitor.on_plan_rejected(plan);
+        if let Some(plan_limit_monitor) = &mut self.plan_generation_monitor {
+            plan_limit_monitor.on_plan_rejected(plan);
+        }
+    }
+
+    fn on_plan_accepted<'p>(&mut self, plan: &Plan<'p, T>) {
+        self.stagnation_monitor.on_plan_accepted(plan);
+        if let Some(plan_limit_monitor) = &mut self.plan_generation_monitor {
+            plan_limit_monitor.on_plan_accepted(plan);
+        }
+    }
+}
+
+impl LifecycleMonitor for LocalSearchMonitor {
+    fn on_search_start(&mut self) {
+        self.stagnation_monitor.on_search_start();
+        if let Some(plan_limit_monitor) = &mut self.plan_generation_monitor {
+            plan_limit_monitor.on_search_start();
+        }
+    }
+
+    fn on_search_end(&mut self) {
+        self.stagnation_monitor.on_search_end();
+        if let Some(plan_limit_monitor) = &mut self.plan_generation_monitor {
+            plan_limit_monitor.on_search_end();
+        }
+    }
+}
+
+impl<T> SearchMonitor<T> for LocalSearchMonitor
+where
+    T: Copy + Ord,
+{
+    fn name(&self) -> &str {
+        "LocalSearchMonitor"
+    }
+}
+
+pub struct LocalSearchForwardMonitor<'a, T, M>
+where
+    T: Copy + Ord,
+{
+    base_monitor: &'a mut dyn SearchMonitor<T>,
+    local_search_monitor: &'a mut M,
+}
+
+impl<'a, T, M> LocalSearchForwardMonitor<'a, T, M>
+where
+    T: Copy + Ord,
+{
+    #[inline(always)]
+    pub fn new(
+        base_monitor: &'a mut dyn SearchMonitor<T>,
+        local_search_monitor: &'a mut M,
+    ) -> Self {
+        Self {
+            base_monitor,
+            local_search_monitor,
+        }
+    }
+}
+
+impl<'a, T, M> TerminationCheck for LocalSearchForwardMonitor<'a, T, M>
+where
+    T: Copy + Ord,
+    M: TerminationCheck,
+{
+    fn should_terminate_search(&self) -> bool {
+        self.base_monitor.should_terminate_search()
+            || self.local_search_monitor.should_terminate_search()
+    }
+}
+
+impl<'a, T, M> PlanEventMonitor<T> for LocalSearchForwardMonitor<'a, T, M>
+where
+    T: Copy + Ord,
+    M: PlanEventMonitor<T>,
+{
+    fn on_plan_generated<'p>(&mut self, plan: &Plan<'p, T>) {
+        self.base_monitor.on_plan_generated(plan);
+        self.local_search_monitor.on_plan_generated(plan);
+    }
+
+    fn on_plan_rejected<'p>(&mut self, plan: &Plan<'p, T>) {
+        self.base_monitor.on_plan_rejected(plan);
+        self.local_search_monitor.on_plan_rejected(plan);
+    }
+
+    fn on_plan_accepted<'p>(&mut self, plan: &Plan<'p, T>) {
+        self.base_monitor.on_plan_accepted(plan);
+        self.local_search_monitor.on_plan_accepted(plan);
+    }
+}
+
+impl<'a, T, M> LifecycleMonitor for LocalSearchForwardMonitor<'a, T, M>
+where
+    T: Copy + Ord,
+    M: LifecycleMonitor,
+{
+    fn on_search_start(&mut self) {
+        self.base_monitor.on_search_start();
+        self.local_search_monitor.on_search_start();
+    }
+
+    fn on_search_end(&mut self) {
+        self.base_monitor.on_search_end();
+        self.local_search_monitor.on_search_end();
+    }
+}
+
+impl<'a, T, M> SearchMonitor<T> for LocalSearchForwardMonitor<'a, T, M>
+where
+    T: Copy + Ord,
+    M: SearchMonitor<T>,
+{
+    fn name(&self) -> &str {
+        "LocalSearchForwardMonitor"
+    }
+}
+
 pub struct IteratedLocalSearchStrategy<'n, T, C, R>
 where
     T: Copy + Ord + Send,
     C: CostEvaluator<T>,
     R: rand::Rng + Send,
 {
-    max_local_stagnation_steps: usize,
-    max_local_steps: Option<usize>,
+    max_local_stagnation_steps: u64,
+    max_local_steps: Option<u64>,
     acceptance_criterion: Box<dyn IlsAcceptanceCriterion<T, C, R> + Send>,
     improving_decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send + 'n>,
     perturbing_decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send + 'n>,
@@ -528,188 +463,98 @@ where
         }
     }
 
-    /// Run the improvement (descent) phase.
-    /// Returns (stagnated, any_generated).
-    fn run_improvement_phase<'e, 'm, 'p>(
-        &mut self,
-        context: &mut StrategyContext<'e, 'm, 'p, T>,
-        state: &mut SolverState<'p, T>,
-        work_buf: &mut [DecisionVar<T>],
-    ) -> (bool, bool) {
-        let mut step_limit = self.max_local_steps.map(LocalStepLimitMonitor::new);
-        let mut stagnation = Some(LocalStagnationMonitor::new(self.max_local_stagnation_steps));
-        let mut stagnated = false;
-        let mut any_generated = false;
-
-        loop {
-            if context.monitor().should_terminate_search() {
-                break;
-            }
-            if let Some(sl) = &step_limit
-                && sl.should_terminate_search()
-            {
-                break;
-            }
-            if let Some(st) = &stagnation
-                && st.should_terminate_search()
-            {
-                stagnated = true;
-                break;
-            }
-
-            let current_fitness = *state.fitness();
-            let model = context.model();
-
-            let outcome = {
-                let base_monitor = context.monitor();
-                let mut fwd =
-                    ForwardingMonitor::new(base_monitor, step_limit.as_mut(), stagnation.as_mut());
-                let mut deferred = DeferredPlanMonitor::new(&mut fwd);
-
-                let next_plan = {
-                    let mut sc = SearchContext::new(
-                        model,
-                        state,
-                        &self.evaluator,
-                        &mut self.rng,
-                        work_buf,
-                        current_fitness,
-                        &mut deferred,
-                    );
-                    self.improving_decision_builder.next(&mut sc)
-                };
-
-                match next_plan {
-                    Some(plan) => {
-                        any_generated = true;
-
-                        // Notify: a candidate has been generated.
-                        deferred.on_plan_generated(&plan);
-
-                        // Acceptance
-                        let mut acc_ctx = IlsAcceptanceCriterionContext::new(
-                            model,
-                            state,
-                            &self.evaluator,
-                            &mut self.rng,
-                        );
-                        let accepted = self.acceptance_criterion.accept(&mut acc_ctx, &plan);
-
-                        let improved = if accepted {
-                            let d = &plan.fitness_delta;
-                            (d.delta_unassigned < 0)
-                                || (d.delta_unassigned == 0 && d.delta_cost < 0)
-                        } else {
-                            false
-                        };
-
-                        deferred.finalize_plan(&plan, accepted);
-                        if accepted {
-                            state.apply_plan(plan);
-                            let _ = context.shared_incumbent().try_update(state, model);
-                        }
-
-                        Some((accepted, improved))
-                    }
-                    None => None,
-                }
-            };
-
-            let Some((accepted, improved)) = outcome else {
-                break;
-            };
-
-            // Update stagnation monitor only for accepted moves.
-            if let Some(st) = &mut stagnation
-                && accepted
-            {
-                if improved {
-                    st.reset();
-                } else {
-                    st.mark_non_improving();
-                }
-            }
-        }
-
-        (stagnated, any_generated)
-    }
-
-    /// Run the perturbation phase. Returns whether any perturbation was generated.
-    fn run_perturbation_phase<'e, 'm, 'p>(
-        &mut self,
-        context: &mut StrategyContext<'e, 'm, 'p, T>,
-        state: &mut SolverState<'p, T>,
-        work_buf: &mut [DecisionVar<T>],
-    ) -> bool {
-        // Single accepted perturbation move budget.
-        let mut step_limit = LocalStepLimitMonitor::new(1);
-        let mut any_generated = false;
-
-        loop {
-            if step_limit.should_terminate_search() {
-                break;
-            }
-            if context.monitor().should_terminate_search() {
-                break;
-            }
-
-            let current_fitness = *state.fitness();
-            let model = context.model();
-
-            let produced = {
-                let base_monitor = context.monitor();
-                let mut fwd = ForwardingMonitor::new(base_monitor, Some(&mut step_limit), None);
-                let mut deferred = DeferredPlanMonitor::new(&mut fwd);
-
-                let next_plan = {
-                    let mut sc = SearchContext::new(
-                        model,
-                        state,
-                        &self.evaluator,
-                        &mut self.rng,
-                        work_buf,
-                        current_fitness,
-                        &mut deferred,
-                    );
-                    self.perturbing_decision_builder.next(&mut sc)
-                };
-
-                match next_plan {
-                    Some(plan) => {
-                        any_generated = true;
-
-                        // Notify: a candidate has been generated.
-                        deferred.on_plan_generated(&plan);
-
-                        // Unconditional accept for perturbation
-                        deferred.finalize_plan(&plan, true);
-                        state.apply_plan(plan);
-                        let _ = context.shared_incumbent().try_update(state, model);
-                        true
-                    }
-                    None => false,
-                }
-            };
-
-            if !produced {
-                break;
-            }
-        }
-
-        any_generated
-    }
-}
-
-impl<'n, T, C, R> From<IteratedLocalSearchConfig<'n, T, C, R>>
-    for IteratedLocalSearchStrategy<'n, T, C, R>
-where
-    T: SolveNumeric,
-    C: CostEvaluator<T>,
-    R: rand::Rng + Send,
-{
     #[inline(always)]
-    fn from(config: IteratedLocalSearchConfig<'n, T, C, R>) -> Self {
-        IteratedLocalSearchStrategy::new(config)
+    fn allocate_work_buffer(&self, context: &StrategyContext<'_, '_, '_, T>) -> Vec<DecisionVar<T>>
+    where
+        T: CheckedAdd + CheckedSub,
+    {
+        vec![DecisionVar::unassigned(); context.model().flexible_requests_len()]
+    }
+
+    fn run_improving_phase<'e, 'm, 'p>(
+        &mut self,
+        context: &mut StrategyContext<'e, 'm, 'p, T>,
+        state: &mut SolverState<'p, T>,
+        work_buf: &mut [DecisionVar<T>],
+    ) -> u64 {
+        let model = context.model();
+        let mut local_search_monitor =
+            LocalSearchMonitor::new(self.max_local_stagnation_steps, self.max_local_steps);
+
+        let mut applied = 0;
+
+        loop {
+            if LocalSearchForwardMonitor::new(context.monitor_mut(), &mut local_search_monitor)
+                .should_terminate_search()
+            {
+                break;
+            }
+
+            let current_fitness = *state.fitness();
+
+            let next_plan = {
+                let mut forward_monitor = LocalSearchForwardMonitor::new(
+                    context.monitor_mut(),
+                    &mut local_search_monitor,
+                );
+
+                let mut ctx = SearchContext::new(
+                    model,
+                    state,
+                    &self.evaluator,
+                    &mut self.rng,
+                    work_buf,
+                    current_fitness,
+                    &mut forward_monitor,
+                );
+                self.improving_decision_builder.next(&mut ctx)
+            };
+
+            match next_plan {
+                Some(plan) => {
+                    state.apply_plan(plan);
+                    applied += 1;
+                    // Shared incumbent update is optional inside the local phase; keep if desired:
+                    let _ = context.shared_incumbent().try_update(state, model);
+                }
+                None => break,
+            }
+        }
+
+        applied
+    }
+
+    fn run_perturbing_phase<'e, 'm, 'p>(
+        &mut self,
+        context: &mut StrategyContext<'e, 'm, 'p, T>,
+        state: &mut SolverState<'p, T>,
+        work_buf: &mut [DecisionVar<T>],
+    ) -> u64 {
+        let model = context.model();
+        let mut plan_limit_monitor = PlanLimitMonitor::new(1);
+
+        let next_plan = {
+            let mut forward_monitor =
+                LocalSearchForwardMonitor::new(context.monitor_mut(), &mut plan_limit_monitor);
+
+            let mut ctx = SearchContext::new(
+                model,
+                state,
+                &self.evaluator,
+                &mut self.rng,
+                work_buf,
+                *state.fitness(),
+                &mut forward_monitor,
+            );
+            self.perturbing_decision_builder.next(&mut ctx)
+        };
+
+        if let Some(plan) = next_plan {
+            state.apply_plan(plan);
+            1
+        } else {
+            0
+        }
     }
 }
 
@@ -727,32 +572,47 @@ where
         &mut self,
         context: &mut StrategyContext<'e, 'm, 'p, T>,
     ) -> Option<SolverState<'p, T>> {
-        context.monitor().on_search_start();
-
-        let mut work_buf = vec![DecisionVar::unassigned(); context.model().flexible_requests_len()];
+        let mut work_buf = self.allocate_work_buffer(context);
         let mut state = context.state().clone();
+
+        context.monitor_mut().on_search_start();
+
+        // Initial descent to local optimum
+        let _ = self.run_improving_phase(context, &mut state, &mut work_buf);
 
         loop {
             if context.monitor().should_terminate_search() {
                 break;
             }
 
-            let (_stagnated, improved_generated) =
-                self.run_improvement_phase(context, &mut state, &mut work_buf);
+            // Candidate begins as incumbent clone
+            let mut candidate = state.clone();
+
+            let perturb_count = self.run_perturbing_phase(context, &mut candidate, &mut work_buf);
+            let improve_count = self.run_improving_phase(context, &mut candidate, &mut work_buf);
+            let total_progress = perturb_count + improve_count;
+
+            if total_progress == 0 {
+                // No change produced by perturb+improve: terminate outer loop
+                break;
+            }
+
+            // Acceptance only meaningful if candidate changed
+            let model = context.model();
+            let mut ils_ctx =
+                IlsAcceptanceCriterionContext::new(model, &state, &self.evaluator, &mut self.rng);
+
+            if self.acceptance_criterion.accept(&mut ils_ctx, &candidate) {
+                state = candidate;
+                let _ = context.shared_incumbent().try_update(&state, model);
+            }
 
             if context.monitor().should_terminate_search() {
                 break;
             }
-
-            let perturb_generated = self.run_perturbation_phase(context, &mut state, &mut work_buf);
-
-            // Natural completion: if neither phase produced any candidates, we are done.
-            if !improved_generated && !perturb_generated {
-                break;
-            }
         }
 
-        context.monitor().on_search_end();
+        context.monitor_mut().on_search_end();
         Some(state)
     }
 }
@@ -761,458 +621,485 @@ where
 mod tests {
     use super::*;
     use crate::{
-        engine::shared_incumbent::SharedIncumbent,
-        model::{
-            index::{BerthIndex, RequestIndex},
-            solver_model::SolverModel,
-        },
+        engine::{shared_incumbent::SharedIncumbent, strategy::StrategyContext},
         monitor::search_monitor::{
-            LifecycleMonitor, PlanEventMonitor, SearchMonitor, TerminationCheck,
+            CompositeSearchMonitor, PlanEventMonitor, SearchMonitor, TerminationCheck,
         },
-        search::eval::DefaultCostEvaluator,
+        search::eval::{CostEvaluator, DefaultCostEvaluator},
         state::{
             decisionvar::{DecisionVar, DecisionVarVec},
             fitness::{Fitness, FitnessDelta},
             plan::{DecisionVarPatch, Plan},
-            solver_state::{SolverState, SolverStateView},
-            terminal::{delta::TerminalDelta, terminalocc::TerminalOccupancy},
+            solver_state::SolverState,
+            terminal::terminalocc::TerminalOccupancy,
         },
     };
     use berth_alloc_core::prelude::{TimeDelta, TimeInterval, TimePoint};
     use berth_alloc_model::{
         common::FlexibleKind,
-        prelude::{Berth, BerthIdentifier, Problem, Request, RequestIdentifier},
-        problem::builder::ProblemBuilder,
+        prelude::{Berth, BerthIdentifier, Problem, RequestIdentifier},
+        problem::{builder::ProblemBuilder, req::Request},
     };
-    use rand::{SeedableRng, rngs::StdRng};
-    use std::collections::BTreeMap;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
 
-    fn tp(v: i64) -> TimePoint<i64> {
+    type T = i64;
+
+    #[inline]
+    fn tp(v: T) -> TimePoint<T> {
         TimePoint::new(v)
     }
-    fn iv(start: i64, end: i64) -> TimeInterval<i64> {
-        TimeInterval::new(tp(start), tp(end))
+    #[inline]
+    fn iv(a: T, b: T) -> TimeInterval<T> {
+        TimeInterval::new(tp(a), tp(b))
     }
-    fn bid(v: u32) -> BerthIdentifier {
-        BerthIdentifier::new(v)
+    #[inline]
+    fn td(v: T) -> TimeDelta<T> {
+        TimeDelta::new(v)
     }
-    fn rid(v: u32) -> RequestIdentifier {
-        RequestIdentifier::new(v)
+    #[inline]
+    fn bid(n: u32) -> BerthIdentifier {
+        BerthIdentifier::new(n)
+    }
+    #[inline]
+    fn rid(n: u32) -> RequestIdentifier {
+        RequestIdentifier::new(n)
     }
 
-    fn problem_one_berth_three_flex() -> Problem<i64> {
-        let b1 = Berth::from_windows(bid(1), [iv(0, 1000)]);
+    fn make_plan_budget_monitor<T: Copy + Ord>(limit: u64) -> CompositeSearchMonitor<T> {
+        let mut comp: CompositeSearchMonitor<T> = CompositeSearchMonitor::new();
+        comp.add_monitor(Box::new(PlanLimitMonitor::new(limit)));
+        comp
+    }
 
-        let mut pt1 = BTreeMap::new();
-        pt1.insert(bid(1), TimeDelta::new(10));
-        let r1 = Request::<FlexibleKind, i64>::new(rid(1), iv(0, 200), 1, pt1).unwrap();
+    fn problem_one_berth_two_flex() -> Problem<T> {
+        let b1 = Berth::from_windows(bid(1), [iv(0, 100)]);
+        let mut pt1 = std::collections::BTreeMap::new();
+        pt1.insert(bid(1), td(10));
+        let r1 = Request::<FlexibleKind, T>::new(rid(1), iv(0, 100), 1, pt1).unwrap();
 
-        let mut pt2 = BTreeMap::new();
-        pt2.insert(bid(1), TimeDelta::new(5));
-        let r2 = Request::<FlexibleKind, i64>::new(rid(2), iv(0, 200), 1, pt2).unwrap();
-
-        let mut pt3 = BTreeMap::new();
-        pt3.insert(bid(1), TimeDelta::new(2));
-        let r3 = Request::<FlexibleKind, i64>::new(rid(3), iv(0, 200), 1, pt3).unwrap();
+        let mut pt2 = std::collections::BTreeMap::new();
+        pt2.insert(bid(1), td(20));
+        let r2 = Request::<FlexibleKind, T>::new(rid(2), iv(0, 100), 1, pt2).unwrap();
 
         let mut builder = ProblemBuilder::new();
         builder.add_berth(b1);
         builder.add_flexible(r1);
         builder.add_flexible(r2);
-        builder.add_flexible(r3);
-        builder.build().expect("valid problem")
+        builder.build().unwrap()
     }
 
     fn make_model_state_eval(
-        problem: &Problem<i64>,
+        problem: &Problem<T>,
     ) -> (
-        SolverModel<'_, i64>,
-        SolverState<'_, i64>,
+        crate::model::solver_model::SolverModel<'_, T>,
+        SolverState<'_, T>,
         DefaultCostEvaluator,
     ) {
-        let model = SolverModel::try_from(problem).expect("model ok");
+        let model = crate::model::solver_model::SolverModel::try_from(problem).expect("model ok");
         let term = TerminalOccupancy::new(problem.berths().iter());
         let dvars = vec![DecisionVar::unassigned(); model.flexible_requests_len()];
-        let eval = DefaultCostEvaluator;
-
-        let base_fit = eval.eval_fitness(&model, &dvars);
-        let start_cost = if base_fit.cost <= 0 { 1 } else { base_fit.cost };
-        let fitness = Fitness::new(start_cost, base_fit.unassigned_requests);
-
+        // Positive cost (debug assertion safeguard) & max unassigned initially.
+        let fitness = Fitness::new(1, model.flexible_requests_len());
         let state = SolverState::new(DecisionVarVec::from(dvars), term, fitness);
-        (model, state, eval)
+        (model, state, DefaultCostEvaluator)
     }
 
-    #[derive(Debug)]
-    struct SequentialAssignBuilder {
-        next_request: usize,
-        limit: usize,
-        name: &'static str,
-    }
-    impl SequentialAssignBuilder {
-        fn new(limit: usize, name: &'static str) -> Self {
-            Self {
-                next_request: 0,
-                limit,
-                name,
-            }
-        }
-    }
-    impl DecisionBuilder<i64, DefaultCostEvaluator, StdRng> for SequentialAssignBuilder {
-        fn name(&self) -> &str {
-            self.name
-        }
-        fn next<'b, 'sm, 'c, 's, 'm, 'p>(
-            &mut self,
-            _ctx: &mut SearchContext<'b, 'sm, 'c, 's, 'm, 'p, i64, DefaultCostEvaluator, StdRng>,
-        ) -> Option<Plan<'p, i64>> {
-            if self.next_request >= self.limit {
-                return None;
-            }
-            let req_ix = self.next_request;
-            self.next_request += 1;
-            let patch = DecisionVarPatch::new(
-                RequestIndex::new(req_ix),
-                DecisionVar::assigned(BerthIndex::new(0), tp(0)),
-            );
-            let fitness_delta = FitnessDelta::new(0, -1);
-            Some(Plan::new_delta(
-                vec![patch],
-                TerminalDelta::empty(),
-                fitness_delta,
-            ))
-        }
-    }
-
-    #[derive(Debug)]
-    struct NeutralMoveBuilder {
-        remaining: usize,
-        name: &'static str,
-    }
-    impl NeutralMoveBuilder {
-        fn new(remaining: usize, name: &'static str) -> Self {
-            Self { remaining, name }
-        }
-    }
-    impl DecisionBuilder<i64, DefaultCostEvaluator, StdRng> for NeutralMoveBuilder {
-        fn name(&self) -> &str {
-            self.name
-        }
-        fn next<'b, 'sm, 'c, 's, 'm, 'p>(
-            &mut self,
-            _ctx: &mut SearchContext<'b, 'sm, 'c, 's, 'm, 'p, i64, DefaultCostEvaluator, StdRng>,
-        ) -> Option<Plan<'p, i64>> {
-            if self.remaining == 0 {
-                return None;
-            }
-            self.remaining -= 1;
-            let fitness_delta = FitnessDelta::new(0, 0);
-            Some(Plan::new_delta(
-                Vec::new(),
-                TerminalDelta::empty(),
-                fitness_delta,
-            ))
-        }
-    }
-
-    #[derive(Debug)]
-    struct WorseningMoveBuilder {
-        remaining: usize,
-        name: &'static str,
-    }
-    impl WorseningMoveBuilder {
-        fn new(remaining: usize, name: &'static str) -> Self {
-            Self { remaining, name }
-        }
-    }
-    impl DecisionBuilder<i64, DefaultCostEvaluator, StdRng> for WorseningMoveBuilder {
-        fn name(&self) -> &str {
-            self.name
-        }
-        fn next<'b, 'sm, 'c, 's, 'm, 'p>(
-            &mut self,
-            _ctx: &mut SearchContext<'b, 'sm, 'c, 's, 'm, 'p, i64, DefaultCostEvaluator, StdRng>,
-        ) -> Option<Plan<'p, i64>> {
-            if self.remaining == 0 {
-                return None;
-            }
-            self.remaining -= 1;
-            let fitness_delta = FitnessDelta::new(5, 0); // worsening cost
-            Some(Plan::new_delta(
-                Vec::new(),
-                TerminalDelta::empty(),
-                fitness_delta,
-            ))
-        }
-    }
-
-    #[derive(Debug)]
-    struct SinglePerturbBuilder {
-        emitted: bool,
-    }
-    impl SinglePerturbBuilder {
-        fn new() -> Self {
-            Self { emitted: false }
-        }
-    }
-    impl DecisionBuilder<i64, DefaultCostEvaluator, StdRng> for SinglePerturbBuilder {
-        fn name(&self) -> &str {
-            "SinglePerturb"
-        }
-        fn next<'b, 'sm, 'c, 's, 'm, 'p>(
-            &mut self,
-            _ctx: &mut SearchContext<'b, 'sm, 'c, 's, 'm, 'p, i64, DefaultCostEvaluator, StdRng>,
-        ) -> Option<Plan<'p, i64>> {
-            if self.emitted {
-                return None;
-            }
-            self.emitted = true;
-            let fitness_delta = FitnessDelta::new(0, 0);
-            Some(Plan::new_delta(
-                Vec::new(),
-                TerminalDelta::empty(),
-                fitness_delta,
-            ))
-        }
-    }
-
-    #[derive(Default)]
-    struct RecordingMonitor {
-        started: usize,
-        ended: usize,
+    // Monitor controlling outer iterations (like CountingMonitor style).
+    struct IterationStopMonitor {
+        iterations_left: usize,
+        started: bool,
+        ended: bool,
         generated: usize,
         accepted: usize,
         rejected: usize,
-        terminate_after_generated: Option<usize>,
-        terminated: bool,
     }
-    impl RecordingMonitor {
-        fn with_terminate_after(n: usize) -> Self {
+    impl IterationStopMonitor {
+        fn new(iters: usize) -> Self {
             Self {
-                terminate_after_generated: Some(n),
-                ..Default::default()
+                iterations_left: iters,
+                started: false,
+                ended: false,
+                generated: 0,
+                accepted: 0,
+                rejected: 0,
             }
         }
     }
-    impl TerminationCheck for RecordingMonitor {
+    impl TerminationCheck for IterationStopMonitor {
         fn should_terminate_search(&self) -> bool {
-            self.terminated
+            self.iterations_left == 0
         }
     }
-    impl LifecycleMonitor for RecordingMonitor {
-        fn on_search_start(&mut self) {
-            self.started += 1;
-        }
-        fn on_search_end(&mut self) {
-            self.ended += 1;
-        }
-    }
-    impl<T: Copy + Ord> PlanEventMonitor<T> for RecordingMonitor {
-        fn on_plan_generated<'p>(&mut self, _plan: &Plan<'p, T>) {
+    impl<Tv: Copy + Ord> PlanEventMonitor<Tv> for IterationStopMonitor {
+        fn on_plan_generated<'p>(&mut self, _plan: &Plan<'p, Tv>) {
             self.generated += 1;
-            if let Some(limit) = self.terminate_after_generated {
-                if self.generated >= limit {
-                    self.terminated = true;
-                }
-            }
         }
-        fn on_plan_rejected<'p>(&mut self, _plan: &Plan<'p, T>) {
+        fn on_plan_rejected<'p>(&mut self, _plan: &Plan<'p, Tv>) {
             self.rejected += 1;
         }
-        fn on_plan_accepted<'p>(&mut self, _plan: &Plan<'p, T>) {
+        fn on_plan_accepted<'p>(&mut self, _plan: &Plan<'p, Tv>) {
             self.accepted += 1;
         }
     }
-    impl<T: Copy + Ord> SearchMonitor<T> for RecordingMonitor {
+    impl LifecycleMonitor for IterationStopMonitor {
+        fn on_search_start(&mut self) {
+            self.started = true;
+        }
+        fn on_search_end(&mut self) {
+            self.ended = true;
+        }
+    }
+    impl<Tv: Copy + Ord> SearchMonitor<Tv> for IterationStopMonitor {
         fn name(&self) -> &str {
-            "RecordingMonitor"
+            "IterationStopMonitor"
         }
     }
 
-    fn make_shared<'p>(
-        model: &SolverModel<'p, i64>,
-        state: &SolverState<'p, i64>,
-    ) -> SharedIncumbent<'p, i64> {
-        SharedIncumbent::new(state.clone()).tap(|inc| {
-            let _ = inc.try_update(state, model);
-        })
+    // DecisionBuilder that assigns r1 (improves unassigned by -1) exactly once.
+    struct AssignR1Once {
+        done: bool,
     }
-
-    trait Tap: Sized {
-        fn tap<F: FnOnce(&mut Self)>(mut self, f: F) -> Self {
-            f(&mut self);
-            self
+    impl AssignR1Once {
+        fn new() -> Self {
+            Self { done: false }
         }
     }
-    impl<T> Tap for T {}
+    impl<C: CostEvaluator<T>, R: rand::Rng> DecisionBuilder<T, C, R> for AssignR1Once {
+        fn name(&self) -> &str {
+            "AssignR1Once"
+        }
 
-    #[test]
-    fn test_ils_strategy_name() {
-        let problem = problem_one_berth_three_flex();
-        let (_model, _state, eval) = make_model_state_eval(&problem);
-        let improving = Box::new(SequentialAssignBuilder::new(0, "SeqAssign"));
-        let perturb = Box::new(SinglePerturbBuilder::new());
-        let rng = StdRng::seed_from_u64(7);
-        let config = IteratedLocalSearchConfig::new(
-            5,
-            Some(10),
-            Box::new(AlwaysAcceptAcceptanceCriterion::new()),
-            improving,
-            perturb,
-            eval,
-            rng,
-        );
-        let strategy = IteratedLocalSearchStrategy::new(config);
-        assert_eq!(strategy.name(), "IteratedLocalSearchStrategy");
+        fn next<'b, 'sm, 'c, 's, 'm, 'p>(
+            &mut self,
+            context: &mut crate::search::decision_builder::SearchContext<
+                'b,
+                'sm,
+                'c,
+                's,
+                'm,
+                'p,
+                T,
+                C,
+                R,
+            >,
+        ) -> Option<Plan<'p, T>> {
+            if self.done {
+                return None;
+            }
+            self.done = true;
+
+            let model = context.model;
+            let r_ix = model.index_manager().request_index(rid(1)).unwrap();
+            let b_ix = model.index_manager().berth_index(bid(1)).unwrap();
+
+            // Fitness delta via evaluator (note: pass &Decision)
+            let assign_dv = DecisionVar::assigned(b_ix, tp(0));
+            let delta_cost = context
+                .evaluator
+                .eval_decision(model, r_ix, assign_dv.as_assigned().unwrap())
+                .unwrap();
+
+            let fit_delta = FitnessDelta {
+                delta_cost,
+                delta_unassigned: -1,
+            };
+            let patch = DecisionVarPatch::new(r_ix, assign_dv);
+            let plan = Plan::new_delta(
+                vec![patch],
+                crate::state::terminal::delta::TerminalDelta::empty(),
+                fit_delta,
+            );
+
+            // Emit plan events so monitors (PlanLimitMonitor) can terminate the run
+            context.monitor.on_plan_generated(&plan);
+            context.monitor.on_plan_accepted(&plan);
+
+            Some(plan)
+        }
+    }
+
+    // Perturbation builder that unassigns r1 once (worsens unassigned by +1).
+    struct UnassignR1Once {
+        done: bool,
+    }
+    impl UnassignR1Once {
+        fn new() -> Self {
+            Self { done: false }
+        }
+    }
+    impl<C: CostEvaluator<T>, R: rand::Rng> DecisionBuilder<T, C, R> for UnassignR1Once {
+        fn name(&self) -> &str {
+            "UnassignR1Once"
+        }
+
+        fn next<'b, 'sm, 'c, 's, 'm, 'p>(
+            &mut self,
+            context: &mut crate::search::decision_builder::SearchContext<
+                'b,
+                'sm,
+                'c,
+                's,
+                'm,
+                'p,
+                T,
+                C,
+                R,
+            >,
+        ) -> Option<Plan<'p, T>> {
+            if self.done {
+                return None;
+            }
+            self.done = true;
+
+            let model = context.model;
+            let state = context.state;
+            let r_ix = model.index_manager().request_index(rid(1)).unwrap();
+
+            match state.decision_variables()[r_ix.get()] {
+                DecisionVar::Unassigned => None,
+                DecisionVar::Assigned(dec) => {
+                    let prev_cost = context.evaluator.eval_decision(model, r_ix, &dec).unwrap();
+
+                    let fit_delta = FitnessDelta {
+                        delta_cost: -prev_cost,
+                        delta_unassigned: 1,
+                    };
+                    let patch = DecisionVarPatch::new(r_ix, DecisionVar::unassigned());
+                    let plan = Plan::new_delta(
+                        vec![patch],
+                        crate::state::terminal::delta::TerminalDelta::empty(),
+                        fit_delta,
+                    );
+
+                    // Emit plan events so monitors (PlanLimitMonitor) can terminate the run
+                    context.monitor.on_plan_generated(&plan);
+                    context.monitor.on_plan_accepted(&plan);
+
+                    Some(plan)
+                }
+            }
+        }
+    }
+
+    // No-op builder (never returns a plan).
+    struct NoopBuilder;
+    impl<C: CostEvaluator<T>, R: rand::Rng> DecisionBuilder<T, C, R> for NoopBuilder {
+        fn name(&self) -> &str {
+            "NoopBuilder"
+        }
+        fn next<'b, 'sm, 'c, 's, 'm, 'p>(
+            &mut self,
+            _ctx: &mut crate::search::decision_builder::SearchContext<
+                'b,
+                'sm,
+                'c,
+                's,
+                'm,
+                'p,
+                T,
+                C,
+                R,
+            >,
+        ) -> Option<Plan<'p, T>> {
+            None
+        }
+    }
+
+    fn make_context<'e, 'm, 'p>(
+        model: &'m crate::model::solver_model::SolverModel<'p, T>,
+        shared: &'e SharedIncumbent<'p, T>,
+        monitor: &'e mut dyn SearchMonitor<T>,
+        base_state: &'e SolverState<'p, T>,
+    ) -> StrategyContext<'e, 'm, 'p, T> {
+        StrategyContext::new(model, shared, monitor, base_state)
     }
 
     #[test]
-    fn test_improvement_phase_respects_step_limit() {
-        let problem = problem_one_berth_three_flex();
-        let (model, state, eval) = make_model_state_eval(&problem);
-        let shared = make_shared(&model, &state);
-
-        // Improvement builder can produce 3 improving moves.
-        let improving = Box::new(SequentialAssignBuilder::new(3, "SeqAssign"));
-        // Perturb builder (single move).
-        let perturb = Box::new(SinglePerturbBuilder::new());
-
-        let rng = StdRng::seed_from_u64(10);
-        let config = IteratedLocalSearchConfig::new(
-            10,      // large stagnation limit
-            Some(1), // step limit: only 1 improvement accepted per phase
-            Box::new(AlwaysAcceptAcceptanceCriterion::new()),
-            improving,
-            perturb,
-            eval,
-            rng,
-        );
-        let mut strategy = IteratedLocalSearchStrategy::new(config);
-
-        // Use a monitor to globally stop after we see the two plans this test cares about
-        // (one improving candidate + one perturbation candidate).
-        let mut monitor = RecordingMonitor::with_terminate_after(2);
-
-        let mut ctx = StrategyContext::new(&model, &shared, &mut monitor, &state);
-        let final_state = strategy.run(&mut ctx).unwrap();
-
-        assert!(
-            final_state.version().value() >= 2,
-            "expected at least two applied plans (1 improvement + 1 perturbation)"
-        );
-        assert_eq!(monitor.started, 1);
-        assert_eq!(monitor.ended, 1);
-    }
-
-    #[test]
-    fn test_stagnation_limit_stops_improvement() {
-        let problem = problem_one_berth_three_flex();
-        let (model, state, eval) = make_model_state_eval(&problem);
-        let shared = SharedIncumbent::new(state.clone());
-
-        let improving = Box::new(NeutralMoveBuilder::new(8, "Neutral"));
-        let perturb = Box::new(SinglePerturbBuilder::new());
-
-        let rng = StdRng::seed_from_u64(11);
-        let stagnation_budget = 3;
-        let config = IteratedLocalSearchConfig::new(
-            stagnation_budget,
-            None,
-            Box::new(AlwaysAcceptAcceptanceCriterion::new()),
-            improving,
-            perturb,
-            eval,
-            rng,
-        );
-        let mut strategy = IteratedLocalSearchStrategy::new(config);
-
-        let mut monitor = RecordingMonitor::with_terminate_after(10);
-        let mut ctx = StrategyContext::new(&model, &shared, &mut monitor, &state);
-        let final_state = strategy.run(&mut ctx).unwrap();
-
-        assert!(
-            final_state.version().value() >= stagnation_budget as u64 + 1,
-            "expected stagnation budget moves plus perturbation"
-        );
-        let incumbent = shared.peek();
-        assert_eq!(
-            incumbent.unassigned_requests,
-            state.fitness().unassigned_requests,
-            "neutral moves must not change unassigned count"
-        );
-        assert!(monitor.started == 1 && monitor.ended == 1);
-        assert!(monitor.generated <= 10);
-    }
-
-    #[test]
-    fn test_greedy_acceptance_rejects_worsening_moves() {
-        let problem = problem_one_berth_three_flex();
-        let (model, state, eval) = make_model_state_eval(&problem);
-        let shared = SharedIncumbent::new(state.clone());
-
-        let improving = Box::new(WorseningMoveBuilder::new(6, "Worse"));
-        let perturb = Box::new(SinglePerturbBuilder::new());
-
-        let rng = StdRng::seed_from_u64(12);
-        let config = IteratedLocalSearchConfig::new(
-            5,
-            Some(10),
-            Box::new(GreedyDescentAcceptanceCriterion::new()),
-            improving,
-            perturb,
-            eval,
-            rng,
-        );
-        let mut strategy = IteratedLocalSearchStrategy::new(config);
-
-        let mut monitor = RecordingMonitor::with_terminate_after(12);
-        let mut ctx = StrategyContext::new(&model, &shared, &mut monitor, &state);
-        let final_state = strategy.run(&mut ctx).unwrap();
-
-        assert_eq!(
-            final_state.version().value(),
-            state.version().value() + 1,
-            "expected exactly one applied perturbation"
-        );
-        let incumbent = shared.peek();
-        assert_eq!(
-            incumbent.unassigned_requests,
-            state.fitness().unassigned_requests,
-            "unassigned count should remain unchanged"
-        );
-        assert!(monitor.rejected > 0);
-        assert!(monitor.generated <= 12);
-    }
-
-    #[test]
-    fn test_monitor_termination_stops_loop() {
-        let problem = problem_one_berth_three_flex();
-        let (model, state, eval) = make_model_state_eval(&problem);
-        let shared = make_shared(&model, &state);
-
-        let improving = Box::new(SequentialAssignBuilder::new(50, "SeqAssign"));
-        let perturb = Box::new(SinglePerturbBuilder::new());
-        let rng = StdRng::seed_from_u64(13);
-
-        let mut monitor = RecordingMonitor::with_terminate_after(2);
+    fn test_greedy_rejects_worse_candidate() {
+        let problem = problem_one_berth_two_flex();
+        let (model, base_state, eval) = make_model_state_eval(&problem);
+        let rng = rand_chacha::ChaCha8Rng::seed_from_u64(1);
 
         let config = IteratedLocalSearchConfig::new(
             10,
-            Some(100),
-            Box::new(AlwaysAcceptAcceptanceCriterion::new()),
-            improving,
-            perturb,
+            Some(10),
+            Box::new(GreedyDescentAcceptanceCriterion::<T, _, _>::new()),
+            Box::new(AssignR1Once::new()),
+            Box::new(UnassignR1Once::new()),
             eval,
             rng,
         );
         let mut strategy = IteratedLocalSearchStrategy::new(config);
 
-        let mut ctx = StrategyContext::new(&model, &shared, &mut monitor, &state);
-        let _ = strategy.run(&mut ctx);
+        let shared = SharedIncumbent::new(base_state.clone());
+        // Initial improve (1) + perturb (1) => budget 2
+        let mut comp = make_plan_budget_monitor::<T>(2);
+        let mut ctx = make_context(&model, &shared, &mut comp, &base_state);
 
-        assert!(monitor.terminated);
-        assert_eq!(monitor.started, 1);
-        assert_eq!(monitor.ended, 1);
-        assert!(monitor.generated >= 2);
+        let final_state = strategy.run(&mut ctx).unwrap();
+        assert_eq!(final_state.fitness().unassigned_requests, 1);
+    }
+
+    #[test]
+    fn test_always_accept_worse_candidate() {
+        let problem = problem_one_berth_two_flex();
+        let (model, base_state, eval) = make_model_state_eval(&problem);
+        let rng = rand_chacha::ChaCha8Rng::seed_from_u64(2);
+
+        let config = IteratedLocalSearchConfig::new(
+            10,
+            Some(10),
+            Box::new(AlwaysAcceptAcceptanceCriterion::<T, _, _>::new()),
+            Box::new(AssignR1Once::new()),
+            Box::new(UnassignR1Once::new()),
+            eval,
+            rng,
+        );
+        let mut strategy = IteratedLocalSearchStrategy::new(config);
+
+        let shared = SharedIncumbent::new(base_state.clone());
+        // Initial improve (1) + perturb (1) => budget 2
+        let mut comp = make_plan_budget_monitor::<T>(2);
+        let mut ctx = make_context(&model, &shared, &mut comp, &base_state);
+
+        let final_state = strategy.run(&mut ctx).unwrap();
+        assert_eq!(final_state.fitness().unassigned_requests, 2);
+    }
+
+    #[test]
+    fn test_greedy_accepts_better_candidate() {
+        let problem = problem_one_berth_two_flex();
+        let (model, base_state, eval) = make_model_state_eval(&problem);
+        let rng = rand_chacha::ChaCha8Rng::seed_from_u64(3);
+
+        let config = IteratedLocalSearchConfig::new(
+            5,
+            Some(5),
+            Box::new(GreedyDescentAcceptanceCriterion::<T, _, _>::new()),
+            Box::new(AssignR1Once::new()),
+            Box::new(NoopBuilder),
+            eval,
+            rng,
+        );
+        let mut strategy = IteratedLocalSearchStrategy::new(config);
+
+        let shared = SharedIncumbent::new(base_state.clone());
+        // Only initial improvement needed => budget 1
+        let mut comp = make_plan_budget_monitor::<T>(1);
+        let mut ctx = make_context(&model, &shared, &mut comp, &base_state);
+
+        let final_state = strategy.run(&mut ctx).unwrap();
+        assert_eq!(final_state.fitness().unassigned_requests, 1);
+    }
+
+    #[test]
+    fn test_lifecycle_start_end_called() {
+        let problem = problem_one_berth_two_flex();
+        let (model, base_state, eval) = make_model_state_eval(&problem);
+        let rng = ChaCha8Rng::seed_from_u64(4);
+
+        let config = IteratedLocalSearchConfig::new(
+            1,
+            Some(1),
+            Box::new(AlwaysAcceptAcceptanceCriterion::<T, _, _>::new()),
+            Box::new(NoopBuilder),
+            Box::new(NoopBuilder),
+            eval,
+            rng,
+        );
+        let mut strategy = IteratedLocalSearchStrategy::new(config);
+
+        let shared = SharedIncumbent::new(base_state.clone());
+        let mut monitor = IterationStopMonitor::new(0); // terminate immediately after initial improve
+        let mut ctx = make_context(&model, &shared, &mut monitor, &base_state);
+
+        let _ = strategy.run(&mut ctx);
+        assert!(monitor.started, "lifecycle start");
+        assert!(monitor.ended, "lifecycle end");
+    }
+
+    #[test]
+    fn test_ils_terminates_when_no_progress() {
+        // improving = Noop, perturbing = Noop => total_progress == 0 => outer loop breaks
+        let problem = problem_one_berth_two_flex();
+        let (model, base_state, eval) = make_model_state_eval(&problem);
+        let rng = rand_chacha::ChaCha8Rng::seed_from_u64(11);
+
+        let config = IteratedLocalSearchConfig::new(
+            /*max_local_stagnation_steps*/ 5,
+            /*max_local_steps*/ Some(5),
+            Box::new(AlwaysAcceptAcceptanceCriterion::<T, _, _>::new()),
+            Box::new(NoopBuilder),
+            Box::new(NoopBuilder),
+            eval,
+            rng,
+        );
+        let mut strategy = IteratedLocalSearchStrategy::new(config);
+
+        let shared = SharedIncumbent::new(base_state.clone());
+        let mut monitor = crate::monitor::search_monitor::NullSearchMonitor;
+        let mut ctx = make_context(&model, &shared, &mut monitor, &base_state);
+
+        let final_state = strategy.run(&mut ctx).unwrap();
+
+        // No progress => state unchanged (both requests unassigned)
+        assert_eq!(final_state.fitness().unassigned_requests, 2);
+    }
+
+    #[test]
+    fn test_ils_stops_after_initial_improvement_when_no_later_progress() {
+        // Initial run_improving_phase assigns r1 once; subsequent perturb+improve do nothing => total_progress == 0 => break
+        let problem = problem_one_berth_two_flex();
+        let (model, base_state, eval) = make_model_state_eval(&problem);
+        let rng = rand_chacha::ChaCha8Rng::seed_from_u64(12);
+
+        let config = IteratedLocalSearchConfig::new(
+            5,
+            Some(5),
+            Box::new(AlwaysAcceptAcceptanceCriterion::<T, _, _>::new()),
+            Box::new(AssignR1Once::new()), // initial improvement
+            Box::new(NoopBuilder),         // later: no perturbing progress
+            eval,
+            rng,
+        );
+        let mut strategy = IteratedLocalSearchStrategy::new(config);
+
+        let shared = SharedIncumbent::new(base_state.clone());
+        let mut monitor = crate::monitor::search_monitor::NullSearchMonitor;
+        let mut ctx = make_context(&model, &shared, &mut monitor, &base_state);
+
+        let final_state = strategy.run(&mut ctx).unwrap();
+
+        // Initial improvement applied; later 0-progress iteration stops outer loop
+        assert_eq!(final_state.fitness().unassigned_requests, 1);
+    }
+
+    #[test]
+    fn test_ils_accepts_when_only_perturb_makes_progress() {
+        // improving = Noop, perturbing = AssignOnce => total_progress > 0 => acceptance runs (Greedy accepts)
+        let problem = problem_one_berth_two_flex();
+        let (model, base_state, eval) = make_model_state_eval(&problem);
+        let rng = rand_chacha::ChaCha8Rng::seed_from_u64(13);
+
+        let config = IteratedLocalSearchConfig::new(
+            5,
+            Some(5),
+            Box::new(GreedyDescentAcceptanceCriterion::<T, _, _>::new()),
+            Box::new(NoopBuilder),         // improving does nothing
+            Box::new(AssignR1Once::new()), // perturb assigns r1 once
+            eval,
+            rng,
+        );
+        let mut strategy = IteratedLocalSearchStrategy::new(config);
+
+        let shared = SharedIncumbent::new(base_state.clone());
+        let mut monitor = crate::monitor::search_monitor::NullSearchMonitor;
+        let mut ctx = make_context(&model, &shared, &mut monitor, &base_state);
+
+        let final_state = strategy.run(&mut ctx).unwrap();
+
+        // Candidate improved by perturb-only; Greedy accepts since fewer unassigned
+        assert_eq!(final_state.fitness().unassigned_requests, 1);
     }
 }

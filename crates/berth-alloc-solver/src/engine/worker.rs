@@ -254,9 +254,9 @@ mod tests {
             &mut self,
             context: &mut StrategyContext<'e, 'm, 'p, i64>,
         ) -> Option<SolverState<'p, i64>> {
-            context.monitor().on_search_start();
+            context.monitor_mut().on_search_start();
             self.ran.fetch_add(1, Ordering::SeqCst);
-            context.monitor().on_search_end();
+            context.monitor_mut().on_search_end();
             None
         }
     }
