@@ -236,6 +236,10 @@ where
     pub perturbing_decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send + 'n>,
     pub evaluator: C,
     pub rng: R,
+    // New refetch configuration (optional)
+    pub refetch_incumbent_after_outer_stagnation: Option<u64>,
+    pub refetch_incumbent_after_plan_generation: Option<u64>,
+    pub reset_builders_on_refetch: bool,
 }
 
 impl<'n, T, C, R> IteratedLocalSearchConfig<'n, T, C, R>
@@ -263,6 +267,9 @@ where
             perturbing_decision_builder,
             evaluator,
             rng,
+            refetch_incumbent_after_outer_stagnation: None,
+            refetch_incumbent_after_plan_generation: None,
+            reset_builders_on_refetch: false,
         }
     }
 }
@@ -442,6 +449,14 @@ where
     perturbing_decision_builder: Box<dyn DecisionBuilder<T, C, R> + Send + 'n>,
     evaluator: C,
     rng: R,
+    // New refetch config mirrors
+    refetch_incumbent_after_outer_stagnation: Option<u64>,
+    refetch_incumbent_after_plan_generation: Option<u64>,
+    reset_builders_on_refetch: bool,
+    // Counters
+    outer_stagnation_counter: u64,
+    plans_generated_since_refetch: u64,
+    restart_count: u64,
 }
 
 impl<'n, T, C, R> IteratedLocalSearchStrategy<'n, T, C, R>
@@ -460,6 +475,13 @@ where
             perturbing_decision_builder: config.perturbing_decision_builder,
             evaluator: config.evaluator,
             rng: config.rng,
+            refetch_incumbent_after_outer_stagnation: config
+                .refetch_incumbent_after_outer_stagnation,
+            refetch_incumbent_after_plan_generation: config.refetch_incumbent_after_plan_generation,
+            reset_builders_on_refetch: config.reset_builders_on_refetch,
+            outer_stagnation_counter: 0,
+            plans_generated_since_refetch: 0,
+            restart_count: 0,
         }
     }
 
@@ -482,8 +504,6 @@ where
             LocalSearchMonitor::new(self.max_local_stagnation_steps, self.max_local_steps);
 
         let mut applied = 0;
-
-        //self.improving_decision_builder.reset();
 
         loop {
             if LocalSearchForwardMonitor::new(context.monitor_mut(), &mut local_search_monitor)
@@ -516,7 +536,6 @@ where
                 Some(plan) => {
                     state.apply_plan(plan);
                     applied += 1;
-                    // Shared incumbent update is optional inside the local phase; keep if desired:
                     let _ = context.shared_incumbent().try_update(state, model);
                 }
                 None => break,
@@ -557,6 +576,45 @@ where
         } else {
             0
         }
+    }
+
+    #[inline]
+    fn refetch_needed(&self) -> bool {
+        let outer_trigger = self
+            .refetch_incumbent_after_outer_stagnation
+            .map(|th| self.outer_stagnation_counter >= th)
+            .unwrap_or(false);
+        let plan_trigger = self
+            .refetch_incumbent_after_plan_generation
+            .map(|th| self.plans_generated_since_refetch >= th)
+            .unwrap_or(false);
+        outer_trigger || plan_trigger
+    }
+
+    fn perform_refetch<'e, 'm, 'p>(
+        &mut self,
+        context: &mut StrategyContext<'e, 'm, 'p, T>,
+        state: &mut SolverState<'p, T>,
+        work_buf: &mut [DecisionVar<T>],
+    ) where
+        SolverState<'p, T>: Clone,
+    {
+        // Snapshot incumbent
+        *state = context.shared_incumbent().snapshot();
+
+        // Optional decision builder resets (guarded to avoid test panics)
+        if self.reset_builders_on_refetch {
+            self.improving_decision_builder.reset();
+            self.perturbing_decision_builder.reset();
+        }
+
+        // Clear counters
+        self.outer_stagnation_counter = 0;
+        self.plans_generated_since_refetch = 0;
+        self.restart_count = self.restart_count.saturating_add(1);
+
+        // Re-run improving phase from incumbent snapshot to reach a local optimum.
+        let _ = self.run_improving_phase(context, state, work_buf);
     }
 }
 
@@ -599,14 +657,26 @@ where
                 break;
             }
 
-            // Acceptance only meaningful if candidate changed
             let model = context.model();
             let mut ils_ctx =
                 IlsAcceptanceCriterionContext::new(model, &state, &self.evaluator, &mut self.rng);
 
-            if self.acceptance_criterion.accept(&mut ils_ctx, &candidate) {
+            let accepted = self.acceptance_criterion.accept(&mut ils_ctx, &candidate);
+            if accepted {
                 state = candidate;
                 let _ = context.shared_incumbent().try_update(&state, model);
+                self.outer_stagnation_counter = 0; // reset on improvement
+            } else {
+                self.outer_stagnation_counter = self.outer_stagnation_counter.saturating_add(1);
+            }
+
+            self.plans_generated_since_refetch = self
+                .plans_generated_since_refetch
+                .saturating_add(total_progress);
+
+            // Refetch / restart if configured triggers fire
+            if self.refetch_needed() {
+                self.perform_refetch(context, &mut state, &mut work_buf);
             }
 
             if context.monitor().should_terminate_search() {
